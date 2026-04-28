@@ -122,6 +122,10 @@ class ComponentItem(QGraphicsItem):
 
     def _rebuild(self):
         """Re-render GDS polygons and rebuild port items."""
+        # Notify Qt that the bounding rect is about to change so it can
+        # fully repaint the old area — prevents ghost rendering on rotation.
+        self.prepareGeometryChange()
+
         # Remove old port items from scene
         for pi in self._port_items:
             if pi.scene():
@@ -432,6 +436,24 @@ class GDSScene(QGraphicsScene):
             for item in self.selectedItems():
                 if isinstance(item, ComponentItem):
                     self.remove_component(item.inst.inst_id)
+        elif event.key() == Qt.Key.Key_R:
+            # R → rotate 90° clockwise
+            for item in self.selectedItems():
+                if isinstance(item, ComponentItem):
+                    item.inst.rotate_cw()
+                    item._rebuild()
+                    self.component_moved.emit(item.inst.inst_id)
+                    self.selection_changed_signal.emit(item.inst.inst_id)
+                    self.status_message.emit(f"Rotated CW → {item.inst.rotation}°")
+        elif event.key() == Qt.Key.Key_E:
+            # E → rotate 90° counter-clockwise
+            for item in self.selectedItems():
+                if isinstance(item, ComponentItem):
+                    item.inst.rotate_ccw()
+                    item._rebuild()
+                    self.component_moved.emit(item.inst.inst_id)
+                    self.selection_changed_signal.emit(item.inst.inst_id)
+                    self.status_message.emit(f"Rotated CCW → {item.inst.rotation}°")
         super().keyPressEvent(event)
 
 

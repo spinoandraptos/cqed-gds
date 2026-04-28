@@ -145,18 +145,40 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
 
 # ── Component instance ────────────────────────────────────────────────────────
 
+# ── Rotation helpers ──────────────────────────────────────────────────────────
+
+def _rotate_dir(direction: str, steps: int) -> str:
+    """Rotate a cardinal direction by `steps` × 90° CCW."""
+    cycle = ["+x", "+y", "-x", "-y"]
+    return cycle[(cycle.index(direction) + steps) % 4]
+
+
+def _rotate_pt(x: float, y: float, steps: int) -> tuple[float, float]:
+    """Rotate point (x,y) around origin by steps × 90° CCW."""
+    for _ in range(steps % 4):
+        x, y = -y, x
+    return x, y
+
+
+def _rotate_polygon(pts: list[tuple[float, float]],
+                    steps: int) -> list[tuple[float, float]]:
+    """Rotate a list of (x,y) points around origin by steps × 90° CCW."""
+    return [_rotate_pt(x, y, steps) for x, y in pts]
+
+
 class ComponentInstance:
     """One placed component on the canvas."""
 
     _id_counter = 0
 
     def __init__(self, type_id: str, x: float = 0.0, y: float = 0.0,
-                 params: dict | None = None):
+                 params: dict | None = None, rotation: int = 0):
         ComponentInstance._id_counter += 1
-        self.inst_id = ComponentInstance._id_counter
-        self.type_id = type_id
-        self.x = x          # canvas position in µm
-        self.y = y
+        self.inst_id  = ComponentInstance._id_counter
+        self.type_id  = type_id
+        self.x        = x
+        self.y        = y
+        self.rotation = rotation % 360   # 0 | 90 | 180 | 270 (CCW degrees)
         ctype = COMPONENT_TYPES[type_id]
         self.params: dict[str, Any] = copy.deepcopy(ctype.params)
         if params:
@@ -166,34 +188,55 @@ class ComponentInstance:
         self.connections: dict[str, tuple[int, str]] = {}
 
     @property
+    def rotation_steps(self) -> int:
+        """Rotation in units of 90° CCW steps (0–3)."""
+        return (self.rotation // 90) % 4
+
+    def rotate_cw(self) -> None:
+        """Rotate 90° clockwise."""
+        self.rotation = (self.rotation + 270) % 360
+
+    def rotate_ccw(self) -> None:
+        """Rotate 90° counter-clockwise."""
+        self.rotation = (self.rotation + 90) % 360
+
+    @property
     def label(self) -> str:
-        return f"{COMPONENT_TYPES[self.type_id].name} #{self.inst_id}"
+        rot = f" {self.rotation}°" if self.rotation else ""
+        return f"{COMPONENT_TYPES[self.type_id].name} #{self.inst_id}{rot}"
 
     def get_ports(self, cfg: Config) -> list[Port]:
-        """Return ports in component-local coordinates."""
+        """Return ports in component-local coordinates (rotation applied)."""
+        steps = self.rotation_steps
         if self.type_id == "square_node":
-            return _make_square_ports(self.params, cfg)
+            raw = _make_square_ports(self.params, cfg)
         elif self.type_id == "manhattan_jj":
-            return _make_jj_ports(self.params, cfg)
+            raw = _make_jj_ports(self.params, cfg)
         elif self.type_id == "taper_pad":
-            return _make_taper_ports(self.params, cfg)
+            raw = _make_taper_ports(self.params, cfg)
         elif self.type_id == "wire":
             d = self.params.get("direction", "+x")
             L = self.params.get("length", 5.0)
             ends = {"+x": (L, 0), "-x": (-L, 0), "+y": (0, L), "-y": (0, -L)}
             ex, ey = ends[d]
             opp = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
-            return [Port("start", 0, 0, opp[d]), Port("end", ex, ey, d)]
+            raw = [Port("start", 0, 0, opp[d]), Port("end", ex, ey, d)]
         else:
-            # Generic: single origin port
-            return [Port("origin", 0, 0, "+x")]
+            raw = [Port("origin", 0, 0, "+x")]
+
+        if steps == 0:
+            return raw
+        return [
+            Port(p.name, *_rotate_pt(p.x, p.y, steps), _rotate_dir(p.direction, steps))
+            for p in raw
+        ]
 
     def world_ports(self, cfg: Config) -> list[Port]:
         """Ports in world coordinates."""
-        result = []
-        for p in self.get_ports(cfg):
-            result.append(Port(p.name, self.x + p.x, self.y + p.y, p.direction))
-        return result
+        return [
+            Port(p.name, self.x + p.x, self.y + p.y, p.direction)
+            for p in self.get_ports(cfg)
+        ]
 
 
 # ── GDS polygon renderer ──────────────────────────────────────────────────────
@@ -227,6 +270,12 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     """
     Call the underlying gdspy functions for this instance and return
     a list of (layer, polygon_points) ready for the canvas to draw.
+
+    Rotation is applied by:
+      1. Rendering at origin (inst.x, inst.y) with rotation=0
+      2. Translating each polygon point to be relative to the origin
+      3. Rotating that local point by inst.rotation_steps × 90° CCW
+      4. Translating back to world coords
     """
     from primitives import add_rect, add_square, add_taper_pad, smooth_taper
     from undercuts import (add_top_caps, add_side_caps,
@@ -238,17 +287,17 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     x, y = inst.x, inst.y
 
     if inst.type_id == "square_node":
-        cap_style      = inst.params.get("cap_style", "top")
-        undercut_style = inst.params.get("undercut_style", "right")
-        add_square_node(parts, x, y, cap_style, undercut_style, cfg)
+        add_square_node(parts, x, y,
+                        inst.params.get("cap_style", "top"),
+                        inst.params.get("undercut_style", "right"), cfg)
 
     elif inst.type_id == "manhattan_jj":
         add_manhattan_junction(parts, x, y, cfg)
 
     elif inst.type_id == "taper_pad":
-        direction = inst.params.get("direction", "+x")
-        layer     = inst.params.get("layer", cfg.LAYER_BRANCH)
-        add_taper_pad(parts, x, y, direction, layer, cfg)
+        add_taper_pad(parts, x, y,
+                      inst.params.get("direction", "+x"),
+                      inst.params.get("layer", cfg.LAYER_BRANCH), cfg)
 
     elif inst.type_id == "top_branch":
         add_top_branch(parts, (x, y), cfg)
@@ -271,7 +320,22 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
         elif direction == "-y":
             add_rect(parts, (x - hw, y - length), (x + hw, y), layer)
 
-    return _collect_polygons(parts)
+    raw = _collect_polygons(parts)
+
+    # Apply rotation around the instance origin (x, y)
+    steps = inst.rotation_steps
+    if steps == 0:
+        return raw
+
+    rotated: PolyData = []
+    for layer, pts in raw:
+        new_pts = []
+        for px, py in pts:
+            lx, ly = px - x, py - y          # to local
+            rx, ry = _rotate_pt(lx, ly, steps)   # rotate
+            new_pts.append((rx + x, ry + y))  # back to world
+        rotated.append((layer, new_pts))
+    return rotated
 
 
 def export_to_gds(instances: list[ComponentInstance], cfg: Config,

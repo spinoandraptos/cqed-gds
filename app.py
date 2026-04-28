@@ -438,6 +438,14 @@ class MainWindow(QMainWindow):
         tb.addAction(act_delete)
         tb.addSeparator()
 
+        act_rot_cw  = QAction("Rotate CW  [R]", self)
+        act_rot_ccw = QAction("Rotate CCW  [E]", self)
+        act_rot_cw.triggered.connect(self._rotate_selected_cw)
+        act_rot_ccw.triggered.connect(self._rotate_selected_ccw)
+        tb.addAction(act_rot_cw)
+        tb.addAction(act_rot_ccw)
+        tb.addSeparator()
+
         act_export = QAction("Export GDS…", self)
         act_export.triggered.connect(self._export_gds)
         tb.addAction(act_export)
@@ -539,6 +547,33 @@ class MainWindow(QMainWindow):
                 if self._selected_id == iid:
                     self._selected_id = None
                     self._props.load(None)
+
+    # ── Rotate ────────────────────────────────────────────────────────────────
+
+    def _rotate_selected_cw(self):
+        self._rotate_selected(cw=True)
+
+    def _rotate_selected_ccw(self):
+        self._rotate_selected(cw=False)
+
+    def _rotate_selected(self, cw: bool):
+        from canvas import ComponentItem
+        rotated = []
+        for item in self.scene.selectedItems():
+            if isinstance(item, ComponentItem):
+                if cw:
+                    item.inst.rotate_cw()
+                else:
+                    item.inst.rotate_ccw()
+                item._rebuild()
+                rotated.append(item.inst)
+
+        if rotated:
+            direction = "CW" if cw else "CCW"
+            deg = rotated[-1].rotation
+            self._status.showMessage(f"Rotated {direction} → {deg}°")
+            if self._selected_id in {i.inst_id for i in rotated}:
+                self._props.load(self._instances.get(self._selected_id))
 
     # ── Export ────────────────────────────────────────────────────────────────
 
