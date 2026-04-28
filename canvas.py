@@ -32,7 +32,7 @@ if TYPE_CHECKING:
 
 PIXELS_PER_UM = 20.0        # initial scale: 20 px = 1 µm
 GRID_UM       = 0.5         # major grid spacing in µm
-SNAP_UM       = 0.05         # snap grid in µm
+SNAP_UM       = 0.005         # snap grid in µm
 PORT_SNAP_UM  = 0.8         # distance to snap to a port (µm)
 PORT_RADIUS   = 4           # visual port dot radius (px)
 

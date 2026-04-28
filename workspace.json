@@ -6794,116 +6794,7 @@
       "y": 12.875,
       "rotation": 0,
       "params": {
-        "source_labels": "Branch segment #127, Branch segment #125 270\u00b0, Taper segment #122 270\u00b0, Taper segment #124 270\u00b0, Snake route #184, Turn (90\u00b0) #126 270\u00b0, Branch segment #129 270\u00b0, Turn (90\u00b0) #128",
-        "_source_instances": [
-          {
-            "version": 1,
-            "inst_id": 127,
-            "type_id": "branch_segment",
-            "x": -26.35,
-            "y": -8.3,
-            "rotation": 0,
-            "params": {
-              "direction": "+x",
-              "length": 22.75
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 125,
-            "type_id": "branch_segment",
-            "x": -29.35,
-            "y": -4.3,
-            "rotation": 270,
-            "params": {
-              "direction": "+x",
-              "length": 1.0
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 122,
-            "type_id": "taper_segment",
-            "x": -0.6000000000000001,
-            "y": 13.15,
-            "rotation": 270,
-            "params": {
-              "direction": "+x",
-              "length": 6.1,
-              "narrow_end": "start",
-              "narrow_width": 0.2,
-              "narrow_undercut": false
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 124,
-            "type_id": "taper_segment",
-            "x": -29.35,
-            "y": 1.8,
-            "rotation": 270,
-            "params": {
-              "direction": "+x",
-              "length": 6.1,
-              "narrow_end": "start",
-              "narrow_width": 0.3,
-              "narrow_undercut": false
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 184,
-            "type_id": "snake_route",
-            "x": -0.6000000000000001,
-            "y": 7.050000000000001,
-            "rotation": 0,
-            "params": {},
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 126,
-            "type_id": "turn",
-            "x": -29.35,
-            "y": -5.300000000000001,
-            "rotation": 270,
-            "params": {
-              "entry_dir": "+x",
-              "turn_dir": "l"
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 129,
-            "type_id": "branch_segment",
-            "x": -0.6000000000000001,
-            "y": 7.050000000000001,
-            "rotation": 270,
-            "params": {
-              "direction": "+x",
-              "length": 12.35
-            },
-            "connections": {}
-          },
-          {
-            "version": 1,
-            "inst_id": 128,
-            "type_id": "turn",
-            "x": -3.6,
-            "y": -8.3,
-            "rotation": 0,
-            "params": {
-              "entry_dir": "+x",
-              "turn_dir": "l"
-            },
-            "connections": {}
-          }
-        ]
+        "source_labels": "Branch segment #127, Branch segment #125 270\u00b0, Taper segment #122 270\u00b0, Taper segment #124 270\u00b0, Snake route #184, Turn (90\u00b0) #126 270\u00b0, Branch segment #129 270\u00b0, Turn (90\u00b0) #128"
       },
       "connections": {},
       "_merged": true,
@@ -10124,8 +10015,8 @@
       "version": 1,
       "inst_id": 422,
       "type_id": "undercut_ring",
-      "x": 6.025000000000002,
-      "y": 12.874999999999998,
+      "x": 6.025,
+      "y": 12.875,
       "rotation": 0,
       "params": {
         "bbox_x0": -2.0,
