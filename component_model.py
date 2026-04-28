@@ -274,7 +274,7 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         name="Taper segment",
         type_id="taper_segment",
         params={"direction": "+x", "length": 6.1, "narrow_end": "start",
-                "narrow_width": 0.3},
+                "narrow_width": 0.3, "narrow_undercut": False},
         port_defs=[],
         description="Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
     ),
@@ -817,6 +817,83 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
                           inst.params.get("length",       6.1),
                           inst.params.get("narrow_end",   "start"), cfg,
                           narrow_width=inst.params.get("narrow_width", None))
+
+        # ── Narrow-end undercut (layer 2) ─────────────────────────────────
+        # Duplicate all taper polygons (L1 + L11), offset them 0.8 µm toward
+        # the narrow tip, subtract the original shape, assign to layer 2.
+        if inst.params.get("narrow_undercut", False):
+            direction  = inst.params.get("direction",  "+x")
+            narrow_end = inst.params.get("narrow_end", "start")
+
+            # The narrow tip points OPPOSITE to direction when narrow_end="start",
+            # and IN direction when narrow_end="end".
+            _offset_sign = {"+x": 1, "-x": -1, "+y": 1, "-y": -1}
+            _axis = 0 if direction in ("+x", "-x") else 1
+            _sign = _offset_sign[direction] * (-1 if narrow_end == "start" else 1)
+            UNDERCUT_OFFSET = 0.8   # µm
+
+            # Collect the taper polygons just appended to parts
+            taper_raw = _collect_polygons(parts)
+            if taper_raw:
+                # Original gdspy polygons (for subtraction)
+                orig_polys = [gdspy.Polygon(pts) for _, pts in taper_raw if len(pts) >= 3]
+                orig_union = gdspy.boolean(orig_polys, None, "or", precision=1e-5)
+
+                # Shifted copies
+                shift = [0.0, 0.0]
+                shift[_axis] = _sign * UNDERCUT_OFFSET
+                shifted_polys = []
+                for _, pts in taper_raw:
+                    if len(pts) >= 3:
+                        shifted = [(px + shift[0], py + shift[1]) for px, py in pts]
+                        shifted_polys.append(gdspy.Polygon(shifted))
+                shifted_union = gdspy.boolean(shifted_polys, None, "or", precision=1e-5)
+
+                if shifted_union is not None and orig_union is not None:
+                    undercut = gdspy.boolean(
+                        shifted_union, orig_union, "not",
+                        layer=UNDERCUT_RING_LAYER, precision=1e-5,
+                    )
+                    if undercut is not None:
+                        # ── Punch out a rectangle at the narrow tip ───────
+                        # Width (perpendicular to travel) = narrow_width.
+                        # Depth (along shift direction)   = UNDERCUT_OFFSET.
+                        # Positioned at the narrow tip, centred on the
+                        # taper centreline, extending into the undercut.
+                        nw = inst.params.get("narrow_width", cfg.WIRE_WIDTH) or cfg.WIRE_WIDTH
+
+                        # World coords of the narrow tip centre
+                        _dirs = {"+x": (1,0), "-x": (-1,0),
+                                 "+y": (0,1), "-y": (0,-1)}
+                        dx, dy = _dirs[direction]
+                        length = inst.params.get("length", 6.1)
+                        if narrow_end == "start":
+                            tip_x, tip_y = x, y
+                        else:
+                            tip_x = x + dx * length
+                            tip_y = y + dy * length
+
+                        # Perpendicular half-width
+                        hw = nw / 2
+                        sd = _sign * UNDERCUT_OFFSET  # signed depth along axis
+
+                        if _axis == 0:   # horizontal travel (±x)
+                            punch = gdspy.Rectangle(
+                                (tip_x,        tip_y - hw),
+                                (tip_x + sd,   tip_y + hw),
+                            )
+                        else:            # vertical travel (±y)
+                            punch = gdspy.Rectangle(
+                                (tip_x - hw,   tip_y),
+                                (tip_x + hw,   tip_y + sd),
+                            )
+
+                        undercut = gdspy.boolean(
+                            undercut, punch, "not",
+                            layer=UNDERCUT_RING_LAYER, precision=1e-5,
+                        )
+                        if undercut is not None:
+                            parts.append(undercut)
 
     elif inst.type_id == "branch_segment":
         add_branch_segment(parts, (x, y),
