@@ -270,6 +270,7 @@ class GDSScene(QGraphicsScene):
     selection_changed_signal = pyqtSignal(int)
     wire_connected        = pyqtSignal(int, str, int, str)  # id,port,id,port
     status_message        = pyqtSignal(str)
+    merge_requested       = pyqtSignal(list)  # list[int] of selected inst_ids
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -461,6 +462,19 @@ class GDSScene(QGraphicsScene):
                     self.component_moved.emit(item.inst.inst_id)
                     self.selection_changed_signal.emit(item.inst.inst_id)
                     self.status_message.emit(f"Rotated CCW → {item.inst.rotation}°")
+        elif event.key() == Qt.Key.Key_M:
+            # M → merge selected components
+            selected_ids = [
+                item.inst.inst_id
+                for item in self.selectedItems()
+                if isinstance(item, ComponentItem)
+            ]
+            if len(selected_ids) >= 2:
+                self.merge_requested.emit(selected_ids)
+            else:
+                self.status_message.emit(
+                    "Select 2 or more components to merge  [M]"
+                )
         super().keyPressEvent(event)
 
 
@@ -472,7 +486,7 @@ class GDSView(QGraphicsView):
     def __init__(self, scene: GDSScene):
         super().__init__(scene)
         self.setRenderHint(QPainter.RenderHint.Antialiasing)
-        self.setDragMode(QGraphicsView.DragMode.NoDrag)
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
         self.setTransformationAnchor(
             QGraphicsView.ViewportAnchor.AnchorUnderMouse
         )
@@ -493,7 +507,7 @@ class GDSView(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
             self.setCursor(QCursor(Qt.CursorShape.OpenHandCursor))
         else:
-            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
     def wheelEvent(self, event):

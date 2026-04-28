@@ -286,6 +286,13 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         port_defs=[],
         description="Simple rectangular wire segment",
     ),
+    "merged_group": ComponentType(
+        name="Merged Group",
+        type_id="merged_group",
+        params={},
+        port_defs=[],
+        description="A merged union of multiple components",
+    ),
 }
 
 
@@ -346,23 +353,6 @@ class ComponentInstance:
         """Rotate 90° counter-clockwise."""
         self.rotation = (self.rotation + 90) % 360
 
-    def clone(self, offset_x: float = 2.0, offset_y: float = -2.0) -> "ComponentInstance":
-        """
-        Return a new ComponentInstance that is a deep copy of this one,
-        placed *offset_x* / *offset_y* µm away, with a fresh inst_id and
-        no wire connections (connections reference inst_ids from the
-        original layout and would be stale on the copy).
-        """
-        new = ComponentInstance(
-            self.type_id,
-            self.x + offset_x,
-            self.y + offset_y,
-            rotation=self.rotation,
-            params=copy.deepcopy(self.params),
-        )
-        # connections intentionally not copied — they point to other inst_ids
-        return new
-
     @property
     def label(self) -> str:
         rot = f" {self.rotation}°" if self.rotation else ""
@@ -408,7 +398,88 @@ class ComponentInstance:
         ]
 
 
-# ── GDS polygon renderer ──────────────────────────────────────────────────────
+# ── Merged group ──────────────────────────────────────────────────────────────
+
+class MergedInstance(ComponentInstance):
+    """
+    A ComponentInstance whose geometry is pre-baked polygon data rather than
+    a parametric type.  Created by merge_instances(); rendered by returning
+    self._poly_data directly without calling the gdspy builders.
+
+    The anchor (x, y) is set to the centroid of the bounding box of all
+    merged polygons so that the Properties panel shows a meaningful position
+    and the item can still be moved / rotated like any other component.
+    """
+
+    def __init__(self, poly_data: "PolyData", cx: float, cy: float,
+                 source_labels: list[str]):
+        # Bypass normal ComponentInstance.__init__ param handling — we don't
+        # want it looking up "merged_group" in COMPONENT_TYPES for params.
+        ComponentInstance._id_counter += 1
+        self.inst_id   = ComponentInstance._id_counter
+        self.type_id   = "merged_group"
+        self.x         = cx
+        self.y         = cy
+        self.rotation  = 0
+        self.params: dict = {"source_labels": ", ".join(source_labels)}
+        self.connections: dict = {}
+        self._poly_data: PolyData = poly_data
+
+    @property
+    def label(self) -> str:  # type: ignore[override]
+        n = len(self._poly_data)
+        return f"Merged Group #{self.inst_id} ({n} polygons)"
+
+    def get_ports(self, cfg: "Config") -> list:  # type: ignore[override]
+        return []
+
+    def clone(self, offset_x: float = 2.0, offset_y: float = -2.0) -> "MergedInstance":
+        import copy as _copy
+        new = MergedInstance(
+            _copy.deepcopy(self._poly_data),
+            self.x + offset_x,
+            self.y + offset_y,
+            [self.params.get("source_labels", "")],
+        )
+        return new
+
+
+def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> MergedInstance:
+    """
+    Render each instance, collect all their polygons, and return a single
+    MergedInstance whose anchor sits at the centroid of the combined bounding box.
+
+    The polygon coordinates are kept in world space so that the MergedInstance
+    can be moved: render_instance() detects MergedInstance and returns
+    _poly_data unchanged (the canvas subtracts the anchor itself).
+
+    Parameters
+    ----------
+    instances : two or more ComponentInstance objects to merge
+    cfg       : Config passed to render_instance for each source instance
+
+    Returns
+    -------
+    MergedInstance with all source polygons baked in
+    """
+    if len(instances) < 2:
+        raise ValueError("Need at least 2 components to merge")
+
+    all_polys: PolyData = []
+    for inst in instances:
+        all_polys.extend(render_instance(inst, cfg))
+
+    # Compute centroid of bounding box over all polygon vertices
+    all_xs = [x for _, pts in all_polys for x, _ in pts]
+    all_ys = [y for _, pts in all_polys for _, y in pts]
+    cx = (min(all_xs) + max(all_xs)) / 2
+    cy = (min(all_ys) + max(all_ys)) / 2
+
+    labels = [inst.label for inst in instances]
+    return MergedInstance(all_polys, cx, cy, labels)
+
+
+
 
 PolyData = list[tuple[int, list[tuple[float, float]]]]  # [(layer, [(x,y)...])]
 
@@ -446,6 +517,23 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
       3. Rotating that local point by inst.rotation_steps × 90° CCW
       4. Translating back to world coords
     """
+    # MergedInstance carries pre-baked world-space polygons.
+    # We re-centre them on the current (inst.x, inst.y) so moves work.
+    if isinstance(inst, MergedInstance):
+        # Compute original centroid of the baked data
+        all_xs = [x for _, pts in inst._poly_data for x, _ in pts]
+        all_ys = [y for _, pts in inst._poly_data for _, y in pts]
+        if not all_xs:
+            return []
+        orig_cx = (min(all_xs) + max(all_xs)) / 2
+        orig_cy = (min(all_ys) + max(all_ys)) / 2
+        dx = inst.x - orig_cx
+        dy = inst.y - orig_cy
+        return [
+            (layer, [(x + dx, y + dy) for x, y in pts])
+            for layer, pts in inst._poly_data
+        ]
+
     from primitives import add_rect, add_square, add_taper_pad, smooth_taper
     from undercuts import (add_top_caps, add_side_caps,
                            add_L_undercut_right, add_L_undercut_top)

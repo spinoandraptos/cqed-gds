@@ -35,7 +35,7 @@ from PyQt6.QtGui import (
 from config import Config
 from component_model import (
     ComponentInstance, COMPONENT_TYPES, LAYER_COLORS, LAYER_NAMES,
-    export_to_gds,
+    export_to_gds, MergedInstance, merge_instances,
 )
 from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
 
@@ -222,9 +222,19 @@ class PropertiesPanel(QWidget):
         self._x_spin.blockSignals(False)
         self._y_spin.blockSignals(False)
 
-        # Parameter editors
-        for key, val in inst.params.items():
-            self._add_param_editor(inst, key, val)
+        # Parameter editors — merged groups show read-only source info
+        from component_model import MergedInstance
+        if isinstance(inst, MergedInstance):
+            src_lbl = QLabel(inst.params.get("source_labels", ""))
+            src_lbl.setStyleSheet("font-size:10px; color:#888; font-style:italic;")
+            src_lbl.setWordWrap(True)
+            self._params_layout.addRow("sources", src_lbl)
+            poly_lbl = QLabel(str(len(inst._poly_data)))
+            poly_lbl.setStyleSheet("font-size:10px; color:#888;")
+            self._params_layout.addRow("polygons", poly_lbl)
+        else:
+            for key, val in inst.params.items():
+                self._add_param_editor(inst, key, val)
 
         # Connection display
         if inst.connections:
@@ -453,12 +463,22 @@ class MainWindow(QMainWindow):
         act_paste.triggered.connect(self._paste)
         self.addAction(act_paste)
 
+        act_merge_shortcut = QAction(self)
+        act_merge_shortcut.setShortcut("Ctrl+M")
+        act_merge_shortcut.triggered.connect(self._merge_selected)
+        self.addAction(act_merge_shortcut)
+
         act_copy  = QAction("Copy  [Ctrl+C]", self)
         act_paste = QAction("Paste  [Ctrl+V]", self)
         act_copy.triggered.connect(self._copy_selected)
         act_paste.triggered.connect(self._paste)
         tb.addAction(act_copy)
         tb.addAction(act_paste)
+        tb.addSeparator()
+
+        act_merge = QAction("Merge  [M]", self)
+        act_merge.triggered.connect(self._merge_selected)
+        tb.addAction(act_merge)
         tb.addSeparator()
 
         act_rot_cw  = QAction("Rotate CW  [R]", self)
@@ -480,6 +500,7 @@ class MainWindow(QMainWindow):
         self.scene.selection_changed_signal.connect(self._on_selection_changed)
         self.scene.wire_connected.connect(self._on_wire_connected)
         self.scene.status_message.connect(self._status.showMessage)
+        self.scene.merge_requested.connect(self._on_merge_requested)
         self._props.param_changed.connect(self._on_param_changed)
 
         for layer, cb in self._left.layer_checks.items():
@@ -597,6 +618,56 @@ class MainWindow(QMainWindow):
         self._clipboard = new_inst      # subsequent pastes cascade by +2 µm each time
         self._status.showMessage(
             f"Pasted {new_inst.label} at ({new_inst.x:.2f}, {new_inst.y:.2f}) µm"
+        )
+
+    # ── Merge ─────────────────────────────────────────────────────────────────
+
+    def _merge_selected(self):
+        """Trigger a merge of all currently selected components."""
+        from canvas import ComponentItem
+        ids = [
+            item.inst.inst_id
+            for item in self.scene.selectedItems()
+            if isinstance(item, ComponentItem)
+        ]
+        if len(ids) >= 2:
+            self._on_merge_requested(ids)
+        else:
+            self._status.showMessage(
+                "Select 2 or more components to merge  [M / Ctrl+M]"
+            )
+
+    def _on_merge_requested(self, inst_ids: list):
+        """
+        Collect the instances by id, call merge_instances(), replace the
+        originals on the canvas with the single merged result, and select it.
+        """
+        instances = [self._instances[iid] for iid in inst_ids
+                     if iid in self._instances]
+        if len(instances) < 2:
+            self._status.showMessage("Need at least 2 components to merge")
+            return
+
+        try:
+            merged = merge_instances(instances, self.cfg)
+        except Exception as e:
+            self._status.showMessage(f"Merge failed: {e}")
+            return
+
+        # Remove originals
+        for iid in inst_ids:
+            self._instances.pop(iid, None)
+            self.scene.remove_component(iid)
+
+        # Add merged result
+        self._instances[merged.inst_id] = merged
+        self.scene.add_component(merged)
+        self.scene.select_component(merged.inst_id)
+        self._selected_id = merged.inst_id
+        self._props.load(merged)
+
+        self._status.showMessage(
+            f"Merged {len(instances)} components → {merged.label}"
         )
 
     # ── Rotate ────────────────────────────────────────────────────────────────
