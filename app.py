@@ -683,6 +683,247 @@ class SweepDialog(QWidget):
         })
 
 
+
+# ── Workspace sweep dialog ────────────────────────────────────────────────────
+
+class WorkspaceSweepDialog(QWidget):
+    """
+    Non-modal dialog for sweeping a single named parameter across the
+    **entire workspace** — every instance that carries that param gets
+    updated at each step.  N full workspace copies appear on the canvas
+    in an array, each with a different value of the swept param.
+
+    Typical use-case: sweep lead_width on every manhattan_jj and
+    simultaneously sync narrow_width on every taper_segment to match.
+    """
+
+    sweep_requested = pyqtSignal(dict)
+
+    def __init__(self, all_instances: dict, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle("Workspace Sweep")
+        self.setMinimumWidth(420)
+        self._all_instances = all_instances
+
+        # Collect every numeric param name that appears anywhere in the workspace
+        param_counts: dict[str, int] = {}
+        for inst in all_instances.values():
+            for k, v in inst.params.items():
+                if (isinstance(v, (int, float)) and not isinstance(v, bool)
+                        and not k.startswith("_")
+                        and k not in ("source_inst_id",)):
+                    param_counts[k] = param_counts.get(k, 0) + 1
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        title = QLabel("<b>Workspace Sweep</b>")
+        title.setStyleSheet("font-size:13px;")
+        lay.addWidget(title)
+
+        hint = QLabel(
+            "Each step clones the entire workspace with one parameter\n"
+            "changed on every component that has it."
+        )
+        hint.setStyleSheet("font-size:10px; color:#888;")
+        lay.addWidget(hint)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        # Primary param to sweep
+        self._param_combo = QComboBox()
+        sorted_params = sorted(param_counts, key=lambda k: -param_counts[k])
+        self._param_combo.addItems(sorted_params)
+        self._param_combo.currentTextChanged.connect(self._on_param_selected)
+        form.addRow("Parameter to sweep", self._param_combo)
+
+        self._affected_lbl = QLabel("")
+        self._affected_lbl.setStyleSheet("font-size:10px; color:#5DCAA5;")
+        self._affected_lbl.setWordWrap(True)
+        form.addRow("Affects", self._affected_lbl)
+
+        # Start / stop / steps
+        self._start_spin = QDoubleSpinBox()
+        self._stop_spin  = QDoubleSpinBox()
+        self._steps_spin = QSpinBox()
+        for sp in (self._start_spin, self._stop_spin):
+            sp.setRange(-10000, 10000)
+            sp.setDecimals(4)
+            sp.setSingleStep(0.05)
+            sp.setStyleSheet("font-size:11px;")
+        self._steps_spin.setRange(2, 200)
+        self._steps_spin.setValue(5)
+        self._steps_spin.setStyleSheet("font-size:11px;")
+        form.addRow("Start value (µm)", self._start_spin)
+        form.addRow("Stop value (µm)",  self._stop_spin)
+        form.addRow("Steps",            self._steps_spin)
+
+        # Spacing between workspace copies
+        self._spacing_spin = QDoubleSpinBox()
+        self._spacing_spin.setRange(1.0, 100000)
+        self._spacing_spin.setDecimals(1)
+        self._spacing_spin.setSingleStep(10.0)
+        self._spacing_spin.setValue(80.0)
+        self._spacing_spin.setStyleSheet("font-size:11px;")
+        form.addRow("Spacing between copies (µm)", self._spacing_spin)
+
+        # Array direction
+        self._direction_combo = QComboBox()
+        self._direction_combo.addItems(["+x (right)", "-x (left)", "+y (up)", "-y (down)"])
+        self._direction_combo.setStyleSheet("font-size:11px;")
+        form.addRow("Array direction", self._direction_combo)
+
+        lay.addLayout(form)
+
+        # ── Linked-param sync section ──────────────────────────────────────
+        self._sync_box = QGroupBox("Also sync these params to the same value")
+        self._sync_box.setStyleSheet("QGroupBox{font-size:11px;}")
+        self._sync_box.setCheckable(True)
+        self._sync_box.setChecked(True)
+        self._sync_lay = QVBoxLayout(self._sync_box)
+        self._sync_lay.setSpacing(3)
+        self._sync_hint = QLabel(
+            "Useful when sweeping lead_width and you also want\n"
+            "every taper_segment's narrow_width to match."
+        )
+        self._sync_hint.setStyleSheet("font-size:10px; color:#888;")
+        self._sync_lay.addWidget(self._sync_hint)
+        self._sync_checks: dict[str, QCheckBox] = {}   # param_key → checkbox
+        lay.addWidget(self._sync_box)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_run = QPushButton("▶  Generate array on canvas")
+        btn_run.setStyleSheet(
+            "background:#1a3a1a; border:1px solid #40bb40; color:#80ee80;"
+            " border-radius:4px; padding:5px 14px; font-size:12px;"
+        )
+        btn_run.clicked.connect(self._emit_sweep)
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(
+            "background:#1c1c1c; border:0.5px solid #2e2e2e; color:#ccc;"
+            " border-radius:4px; padding:5px 14px; font-size:12px;"
+        )
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_run)
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        # Seed the UI
+        if sorted_params:
+            self._on_param_selected(sorted_params[0])
+
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def _on_param_selected(self, key: str):
+        """Update the 'affects' label, default range, and sync checkboxes."""
+        # Affected instances
+        affected = [
+            inst for inst in self._all_instances.values()
+            if key in inst.params
+            and isinstance(inst.params[key], (int, float))
+            and not isinstance(inst.params[key], bool)
+        ]
+        if affected:
+            summary = ", ".join(
+                f"#{inst.inst_id} {inst.label}" for inst in affected[:6]
+            )
+            if len(affected) > 6:
+                summary += f" … (+{len(affected)-6} more)"
+            self._affected_lbl.setText(f"{len(affected)} instance(s): {summary}")
+        else:
+            self._affected_lbl.setText("(none found in workspace)")
+
+        # Default range: ±50 % around the first affected instance's value
+        if affected:
+            val = float(affected[0].params[key])
+            lo = val * 0.5 if val != 0 else 0.05
+            hi = val * 1.5 if val != 0 else 0.5
+            if lo > hi:
+                lo, hi = hi, lo
+            self._start_spin.setValue(round(lo, 4))
+            self._stop_spin.setValue(round(hi, 4))
+
+        # Rebuild sync checkboxes — offer every OTHER numeric param in the
+        # workspace as a candidate to receive the same value.
+        # Pre-check those whose name is related (e.g. narrow_width ↔ lead_width).
+        _AUTO_SYNC = {
+            "lead_width":  {"narrow_width"},
+            "narrow_width": {"lead_width"},
+        }
+        auto = _AUTO_SYNC.get(key, set())
+
+        # Clear old checkboxes (keep hint label at index 0)
+        while self._sync_lay.count() > 1:
+            item = self._sync_lay.takeAt(1)
+            if item.widget():
+                item.widget().deleteLater()
+        self._sync_checks.clear()
+
+        # Collect every other numeric param present in the workspace
+        other_params: dict[str, int] = {}
+        for inst in self._all_instances.values():
+            for k, v in inst.params.items():
+                if (k != key
+                        and isinstance(v, (int, float))
+                        and not isinstance(v, bool)
+                        and not k.startswith("_")
+                        and k not in ("source_inst_id",)):
+                    other_params[k] = other_params.get(k, 0) + 1
+
+        if not other_params:
+            no_lbl = QLabel("  No other numeric params in workspace")
+            no_lbl.setStyleSheet("font-size:10px; color:#666;")
+            self._sync_lay.addWidget(no_lbl)
+        else:
+            for pname, count in sorted(other_params.items(), key=lambda x: -x[1]):
+                cb = QCheckBox(f"  {pname}  ({count} instance(s))")
+                cb.setStyleSheet("font-size:10px;")
+                cb.setChecked(pname in auto)
+                self._sync_lay.addWidget(cb)
+                self._sync_checks[pname] = cb
+
+    def _direction_sign(self) -> tuple[int, int]:
+        txt = self._direction_combo.currentText()
+        return {
+            "+x (right)": ( 1,  0),
+            "-x (left)":  (-1,  0),
+            "+y (up)":    ( 0,  1),
+            "-y (down)":  ( 0, -1),
+        }[txt]
+
+    def _emit_sweep(self):
+        key     = self._param_combo.currentText()
+        start   = self._start_spin.value()
+        stop    = self._stop_spin.value()
+        steps   = self._steps_spin.value()
+        spacing = self._spacing_spin.value()
+        dxs, dys = self._direction_sign()
+
+        if steps < 2:
+            QMessageBox.warning(self, "Sweep", "Need at least 2 steps.")
+            return
+
+        # Collect additional params to sync
+        sync_params: list[str] = []
+        if self._sync_box.isChecked():
+            sync_params = [k for k, cb in self._sync_checks.items() if cb.isChecked()]
+
+        self.sweep_requested.emit({
+            "mode":        "workspace",
+            "param":       key,
+            "start":       start,
+            "stop":        stop,
+            "steps":       steps,
+            "spacing":     spacing,
+            "dx_sign":     dxs,
+            "dy_sign":     dys,
+            "sync_params": sync_params,   # other param keys to set to same value
+        })
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -837,8 +1078,8 @@ class MainWindow(QMainWindow):
         act_paste = QAction("Paste  [Ctrl+V]", self)
         act_copy.triggered.connect(self._copy_selected)
         act_paste.triggered.connect(self._paste)
-        tb.addAction(act_copy)
-        tb.addAction(act_paste)
+        # tb.addAction(act_copy)
+        # tb.addAction(act_paste)
         tb.addSeparator()
 
         act_merge = QAction("Merge  [M]", self)
@@ -879,6 +1120,10 @@ class MainWindow(QMainWindow):
         act_sweep.triggered.connect(self._open_sweep_dialog)
         tb.addAction(act_sweep)
 
+        act_ws_sweep = QAction("Workspace Sweep…  [W]", self)
+        act_ws_sweep.triggered.connect(self._open_workspace_sweep_dialog)
+        tb.addAction(act_ws_sweep)
+
         act_clear_sweep = QAction("Clear Sweep", self)
         act_clear_sweep.triggered.connect(self._clear_sweep)
         tb.addAction(act_clear_sweep)
@@ -891,6 +1136,11 @@ class MainWindow(QMainWindow):
         act_sweep_shortcut.setShortcut("S")
         act_sweep_shortcut.triggered.connect(self._open_sweep_dialog)
         self.addAction(act_sweep_shortcut)
+
+        act_ws_sweep_shortcut = QAction(self)
+        act_ws_sweep_shortcut.setShortcut("W")
+        act_ws_sweep_shortcut.triggered.connect(self._open_workspace_sweep_dialog)
+        self.addAction(act_ws_sweep_shortcut)
 
         tb.addSeparator()
 
@@ -1578,8 +1828,103 @@ class MainWindow(QMainWindow):
             f"with {param} from {start:.4g} → {stop:.4g}"
         )
 
+    def _open_workspace_sweep_dialog(self):
+        """
+        Open the Workspace Sweep dialog.  No component needs to be selected —
+        the sweep operates on every instance currently on the canvas.
+        """
+        if not self._instances:
+            self._status.showMessage(
+                "Canvas is empty — place some components first"
+            )
+            return
+
+        dlg = WorkspaceSweepDialog(self._instances, parent=self)
+        dlg.sweep_requested.connect(self._run_workspace_sweep)
+        dlg.show()
+        self._status.showMessage(
+            "Workspace Sweep dialog open — configure and click Generate"
+        )
+
+    def _run_workspace_sweep(self, cfg: dict):
+        """
+        Clone the entire workspace N times on the canvas, each copy offset
+        in the chosen direction by i × spacing.  At each step, every instance
+        that carries the swept param key has that param set to the step value.
+        Any additional 'sync_params' receive the same value on every instance
+        that has them.
+
+        All cloned instances are tagged in _sweep_ids for bulk-clear.
+        """
+        from component_model import instance_to_dict, instance_from_dict
+
+        # Clear existing sweep first
+        self._clear_sweep()
+
+        param       = cfg["param"]
+        start       = cfg["start"]
+        stop        = cfg["stop"]
+        steps       = cfg["steps"]
+        spacing     = cfg["spacing"]
+        dxs         = cfg["dx_sign"]
+        dys         = cfg["dy_sign"]
+        sync_params: list[str] = cfg.get("sync_params", [])
+
+        values = [start + (stop - start) * i / (steps - 1) for i in range(steps)]
+
+        # Serialise the current workspace once — we'll deserialise N fresh
+        # copies so each gets unique inst_ids and no shared state.
+        snapshot = [instance_to_dict(inst) for inst in self._instances.values()]
+
+        for i, val in enumerate(values):
+            # World-space offset for this copy.
+            # i=0 → offset 0 (first copy sits on top of / replaces original position),
+            # i=1 → 1×spacing, etc.  The original workspace is untouched at its
+            # current position; these copies fan out in the chosen direction.
+            world_dx = dxs * spacing * i
+            world_dy = dys * spacing * i
+
+            # Deserialise a fresh set of instances (unique inst_ids each time)
+            fresh = [instance_from_dict(d) for d in snapshot]
+
+            for inst in fresh:
+                # Translate position
+                inst.x += world_dx
+                inst.y += world_dy
+
+                # Apply primary swept param if this instance has it
+                if param in inst.params and isinstance(
+                    inst.params[param], (int, float)
+                ) and not isinstance(inst.params[param], bool):
+                    inst.params[param] = val
+
+                # Apply sync params to the same value
+                for sp in sync_params:
+                    if sp in inst.params and isinstance(
+                        inst.params[sp], (int, float)
+                    ) and not isinstance(inst.params[sp], bool):
+                        inst.params[sp] = val
+
+                # Tag as sweep copy
+                inst.params["_sweep_copy"]  = True
+                inst.params["_sweep_param"] = param
+                inst.params["_sweep_value"] = val
+                inst.params["_sweep_step"]  = i
+
+                self._instances[inst.inst_id] = inst
+                self.scene.add_component(inst)
+                self._sweep_ids.add(inst.inst_id)
+
+        total    = len(self._sweep_ids)
+        sync_msg = (
+            f", syncing {', '.join(sync_params)}" if sync_params else ""
+        )
+        self._status.showMessage(
+            f"Workspace sweep: {steps} copies × {len(snapshot)} components "
+            f"= {total} instances  |  {param}: {start:.4g} → {stop:.4g}{sync_msg}"
+        )
+
     def _clear_sweep(self):
-        """Remove all sweep preview copies from the canvas."""
         if not self._sweep_ids:
             return
         removed = 0
@@ -1634,7 +1979,9 @@ class MainWindow(QMainWindow):
     # ── Export GDS ────────────────────────────────────────────────────────────
 
     def _export_gds(self):
-        instances = list(self._instances.values())
+        # Exclude sweep preview copies — main export is the original workspace only
+        instances = [i for i in self._instances.values()
+                     if not i.params.get("_sweep_copy")]
         if not instances:
             QMessageBox.information(self, "Export", "Nothing to export.")
             return

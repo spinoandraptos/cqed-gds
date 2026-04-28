@@ -780,6 +780,9 @@ def _patched_cfg(cfg: Config, overrides: dict) -> Config:
     # JUNCTION_SQUARE_SIZE must equal JUNCTION_LEAD_WIDTH (it's the JJ square side)
     if "lead_width" in overrides and overrides["lead_width"] is not None:
         new_cfg.JUNCTION_SQUARE_SIZE = float(overrides["lead_width"])
+        # Also propagate to WIRE_WIDTH so that taper_segment fallback
+        # (narrow_width=None → cfg.WIRE_WIDTH) scales with the junction lead.
+        new_cfg.WIRE_WIDTH = float(overrides["lead_width"])
     return new_cfg
 
 
