@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "id_counter": 1773,
+  "id_counter": 1734,
   "instances": [
     {
       "version": 1,
@@ -82,11 +82,11 @@
       "inst_id": 73,
       "type_id": "wire",
       "x": -19.8,
-      "y": 7.0,
+      "y": 7.050000000000001,
       "rotation": 90,
       "params": {
         "direction": "+x",
-        "length": 5.86,
+        "length": 5.8,
         "width": 0.3,
         "layer": 5
       },
@@ -3396,7 +3396,7 @@
       "inst_id": 1734,
       "type_id": "undercut_ring",
       "x": 5.0,
-      "y": 9.700000000000001,
+      "y": 9.700000000000003,
       "rotation": 0,
       "params": {
         "bbox_x0": -2.0,

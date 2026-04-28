@@ -114,6 +114,7 @@ class ComponentItem(QGraphicsItem):
         )
         self.setAcceptHoverEvents(True)
         self.setZValue(1)
+        self._z_order: int = 0   # logical stacking order; higher = in front
 
         # Position in scene (pixels), y-flipped
         self.setPos(um_to_px(inst.x), -um_to_px(inst.y))
@@ -215,6 +216,39 @@ class ComponentItem(QGraphicsItem):
         # Signal that a drag may be starting so the app can snapshot undo state
         if event.button() == Qt.MouseButton.LeftButton:
             self._scene.component_drag_started.emit(self.inst.inst_id)
+
+    def contextMenuEvent(self, event):
+        """Right-click menu with z-order actions."""
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu()
+        menu.setStyleSheet("""
+            QMenu {
+                background-color: #1e2530;
+                color: #cdd6f4;
+                border: 1px solid #3d4555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QMenu::item { padding: 5px 20px 5px 12px; border-radius: 3px; }
+            QMenu::item:selected { background-color: #313244; }
+            QMenu::separator { background: #3d4555; height: 1px; margin: 3px 8px; }
+        """)
+        act_front  = menu.addAction("⬆  Bring to Front       ]")
+        act_fwd    = menu.addAction("↑  Bring Forward        [")
+        menu.addSeparator()
+        act_back   = menu.addAction("↓  Send Backward        {")
+        act_to_back = menu.addAction("⬇  Send to Back         }")
+
+        chosen = menu.exec(event.screenPos())
+        if chosen == act_front:
+            self._scene.bring_to_front(self.inst.inst_id)
+        elif chosen == act_fwd:
+            self._scene.bring_forward(self.inst.inst_id)
+        elif chosen == act_back:
+            self._scene.send_backward(self.inst.inst_id)
+        elif chosen == act_to_back:
+            self._scene.send_to_back(self.inst.inst_id)
+        event.accept()
 
     def nearest_port(self, scene_pos: QPointF) -> PortItem | None:
         """Return closest port within PORT_SNAP_UM, or None."""
@@ -571,6 +605,7 @@ class GDSScene(QGraphicsScene):
         self.addItem(item)
         self._component_items[inst.inst_id] = item
         self._apply_layer_visibility()
+        self._restack()
         return item
 
     def remove_component(self, inst_id: int):
@@ -715,6 +750,90 @@ class GDSScene(QGraphicsScene):
 
         return count
 
+    # ── Z-order (send to back / bring to front) ───────────────────────────────
+
+    def _restack(self):
+        """Apply logical _z_order values as Qt ZValues for all component items."""
+        items = list(self._component_items.values())
+        # Sort by _z_order so we can assign dense ZValues 1, 2, 3 …
+        items.sort(key=lambda i: i._z_order)
+        for rank, item in enumerate(items):
+            item._z_order = rank          # normalise to 0-based dense ints
+            item.setZValue(1 + rank)      # ZValue 1+ keeps components above wires (0.5)
+
+    def _selected_component_items(self) -> list:
+        return [
+            item for item in self.selectedItems()
+            if isinstance(item, ComponentItem)
+        ]
+
+    def bring_to_front(self, inst_id: int | None = None):
+        """Move component(s) to the very top of the stack."""
+        targets = (
+            [self._component_items[inst_id]]
+            if inst_id is not None and inst_id in self._component_items
+            else self._selected_component_items()
+        )
+        if not targets:
+            return
+        max_z = max(i._z_order for i in self._component_items.values())
+        for item in targets:
+            item._z_order = max_z + 1
+        self._restack()
+        self.status_message.emit("Brought to front")
+
+    def bring_forward(self, inst_id: int | None = None):
+        """Move component(s) one step toward the front."""
+        targets = (
+            [self._component_items[inst_id]]
+            if inst_id is not None and inst_id in self._component_items
+            else self._selected_component_items()
+        )
+        if not targets:
+            return
+        all_items = sorted(self._component_items.values(), key=lambda i: i._z_order)
+        for target in targets:
+            idx = all_items.index(target)
+            if idx < len(all_items) - 1:
+                # Swap with the item directly above
+                neighbor = all_items[idx + 1]
+                target._z_order, neighbor._z_order = neighbor._z_order, target._z_order
+        self._restack()
+        self.status_message.emit("Brought forward")
+
+    def send_to_back(self, inst_id: int | None = None):
+        """Move component(s) to the very bottom of the stack."""
+        targets = (
+            [self._component_items[inst_id]]
+            if inst_id is not None and inst_id in self._component_items
+            else self._selected_component_items()
+        )
+        if not targets:
+            return
+        min_z = min(i._z_order for i in self._component_items.values())
+        for item in targets:
+            item._z_order = min_z - 1
+        self._restack()
+        self.status_message.emit("Sent to back")
+
+    def send_backward(self, inst_id: int | None = None):
+        """Move component(s) one step toward the back."""
+        targets = (
+            [self._component_items[inst_id]]
+            if inst_id is not None and inst_id in self._component_items
+            else self._selected_component_items()
+        )
+        if not targets:
+            return
+        all_items = sorted(self._component_items.values(), key=lambda i: i._z_order)
+        for target in targets:
+            idx = all_items.index(target)
+            if idx > 0:
+                neighbor = all_items[idx - 1]
+                target._z_order, neighbor._z_order = neighbor._z_order, target._z_order
+        self._restack()
+        self.status_message.emit("Sent backward")
+
     # ── Wire mode ─────────────────────────────────────────────────────────────
 
     def set_wire_mode(self, enabled: bool):
@@ -835,6 +954,18 @@ class GDSScene(QGraphicsScene):
                 self.status_message.emit(
                     "Select 2 or more components to merge  [M]"
                 )
+        elif event.key() == Qt.Key.Key_BracketRight:
+            # ] → Bring to Front
+            self.bring_to_front()
+        elif event.key() == Qt.Key.Key_BracketLeft:
+            # [ → Bring Forward
+            self.bring_forward()
+        elif event.key() == Qt.Key.Key_BraceRight:
+            # } → Send to Back
+            self.send_to_back()
+        elif event.key() == Qt.Key.Key_BraceLeft:
+            # { → Send Backward
+            self.send_backward()
         super().keyPressEvent(event)
 
 
