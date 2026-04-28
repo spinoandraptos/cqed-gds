@@ -97,6 +97,57 @@ def _make_taper_ports(params: dict, cfg: Config) -> list[Port]:
     ]
 
 
+
+def _make_turn_ports(params: dict, cfg: Config) -> list[Port]:
+    """
+    Ports for a standalone 90° turn.
+
+    The turn arc has radius TURN_RADIUS.  Entry travels in `entry_dir`;
+    exit travels 90° away according to `turn_dir` ('l' CCW, 'r' CW).
+
+    Port positions:
+      "entry" — at the arc start (origin = 0,0)
+      "exit"  — at the arc end, offset by the swept arc geometry
+    """
+    entry_dir = params.get("entry_dir", "+x")
+    turn_dir  = params.get("turn_dir",  "l")
+    R = cfg.TURN_RADIUS
+
+    # Map (entry_dir, turn_dir) → exit offset (dx, dy) and exit direction
+    # A left turn (CCW) rotates the heading +90°; right (CW) rotates -90°.
+    _exit_map = {
+        ("+x", "l"): (( R,  R), "+y"),
+        ("+x", "r"): (( R, -R), "-y"),
+        ("-x", "l"): ((-R, -R), "-y"),
+        ("-x", "r"): ((-R,  R), "+y"),
+        ("+y", "l"): ((-R,  R), "-x"),
+        ("+y", "r"): (( R,  R), "+x"),
+        ("-y", "l"): (( R, -R), "+x"),
+        ("-y", "r"): ((-R, -R), "-x"),
+    }
+    (dx, dy), exit_dir = _exit_map[(entry_dir, turn_dir)]
+
+    # entry port faces opposite to entry_dir (wire comes in from outside)
+    _opp = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+    return [
+        Port("entry", 0,  0,  _opp[entry_dir]),
+        Port("exit",  dx, dy, exit_dir),
+    ]
+
+
+def _make_branch_segment_ports(params: dict, cfg: Config) -> list[Port]:
+    direction = params.get("direction", "+x")
+    length    = params.get("length", 10.0)
+    ends = {"+x": (length, 0), "-x": (-length, 0),
+            "+y": (0, length), "-y": (0, -length)}
+    ex, ey = ends[direction]
+    opp = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+    return [
+        Port("entry", 0,  0,  opp[direction]),
+        Port("exit",  ex, ey, direction),
+    ]
+
+
 COMPONENT_TYPES: dict[str, ComponentType] = {
     "square_node": ComponentType(
         name="Square node",
@@ -132,6 +183,20 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         params={},
         port_defs=[],
         description="+y → left turn → -x path with taper pad",
+    ),
+    "branch_segment": ComponentType(
+        name="Branch segment",
+        type_id="branch_segment",
+        params={"direction": "+x", "length": 10.0},
+        port_defs=[],
+        description="Straight TAPER_WIDTH branch segment (L1), like those in snake/top branch",
+    ),
+    "turn": ComponentType(
+        name="Turn (90°)",
+        type_id="turn",
+        params={"entry_dir": "+x", "turn_dir": "l"},
+        port_defs=[],
+        description="90° arc turn, configurable entry direction and handedness",
     ),
     "wire": ComponentType(
         name="Wire segment",
@@ -214,6 +279,10 @@ class ComponentInstance:
             raw = _make_jj_ports(self.params, cfg)
         elif self.type_id == "taper_pad":
             raw = _make_taper_ports(self.params, cfg)
+        elif self.type_id == "branch_segment":
+            raw = _make_branch_segment_ports(self.params, cfg)
+        elif self.type_id == "turn":
+            raw = _make_turn_ports(self.params, cfg)
         elif self.type_id == "wire":
             d = self.params.get("direction", "+x")
             L = self.params.get("length", 5.0)
@@ -281,7 +350,8 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     from undercuts import (add_top_caps, add_side_caps,
                            add_L_undercut_right, add_L_undercut_top)
     from components_lib import (add_square_node, add_manhattan_junction,
-                                add_top_branch, add_snake_right_branch)
+                                add_top_branch, add_snake_right_branch,
+                                add_turn, add_branch_segment)
 
     parts: list = []
     x, y = inst.x, inst.y
@@ -304,6 +374,16 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
 
     elif inst.type_id == "snake_route":
         add_snake_right_branch(parts, (x, y), cfg)
+
+    elif inst.type_id == "branch_segment":
+        add_branch_segment(parts, (x, y),
+                           inst.params.get("direction", "+x"),
+                           inst.params.get("length", 10.0), cfg)
+
+    elif inst.type_id == "turn":
+        add_turn(parts, (x, y),
+                 inst.params.get("entry_dir", "+x"),
+                 inst.params.get("turn_dir", "l"), cfg)
 
     elif inst.type_id == "wire":
         direction = inst.params.get("direction", "+x")

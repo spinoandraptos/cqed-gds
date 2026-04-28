@@ -274,6 +274,8 @@ class PropertiesPanel(QWidget):
                 "cap_style":      ["top", "side"],
                 "undercut_style": ["right", "top"],
                 "direction":      ["+x", "-x", "+y", "-y"],
+                "entry_dir":      ["+x", "-x", "+y", "-y"],
+                "turn_dir":       ["l", "r"],
             }.get(key, [val])
             w.addItems(options)
             w.setCurrentText(val)

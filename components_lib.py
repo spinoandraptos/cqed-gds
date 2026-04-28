@@ -172,6 +172,68 @@ def add_top_branch(
     add_taper_pad(parts, path.x, path.y, "-x", cfg.LAYER_BRANCH, cfg)
 
 
+def add_branch_segment(
+    parts: list,
+    start: tuple[float, float],
+    direction: str,
+    length: float,
+    cfg: Config,
+) -> tuple[float, float]:
+    """
+    Standalone straight branch segment (LAYER_BRANCH, TAPER_WIDTH wide).
+
+    This is the same rectangular segment used between turns in the snake
+    route and top branch — a uniform-width path on L1.
+
+    Parameters
+    ----------
+    start     : (x, y) centreline entry point
+    direction : '+x' | '-x' | '+y' | '-y'
+    length    : segment length in µm
+
+    Returns
+    -------
+    (exit_x, exit_y) — centreline exit point
+    """
+    path = gdspy.Path(cfg.TAPER_WIDTH, start)
+    path.segment(length, direction, layer=cfg.LAYER_BRANCH)
+    parts.append(path)
+    return path.x, path.y
+
+
+
+def add_turn(
+    parts: list,
+    start: tuple[float, float],
+    entry_dir: str,
+    turn_dir: str,
+    cfg: Config,
+) -> tuple[float, float]:
+    """
+    Standalone 90-degree turn arc (L1 / LAYER_BRANCH).
+
+    Parameters
+    ----------
+    start     : (x, y) of the arc entry point (centreline)
+    entry_dir : direction the wire travels INTO the turn
+                '+x' | '-x' | '+y' | '-y'
+    turn_dir  : 'l' (left / CCW) | 'r' (right / CW)
+
+    Returns
+    -------
+    (exit_x, exit_y) — centreline endpoint of the arc exit.
+    """
+    # gdspy.Path.turn() uses the current direction implicitly from its
+    # last segment.  We prime it with a zero-length segment in entry_dir
+    # so the turn knows which way it is heading.
+    path = gdspy.Path(cfg.TAPER_WIDTH, start)
+    path.segment(0, entry_dir, layer=cfg.LAYER_BRANCH)
+    path.turn(cfg.TURN_RADIUS, turn_dir,
+              layer=cfg.LAYER_BRANCH, number_of_points=128)
+    parts.append(path)
+    return path.x, path.y
+
+
 def add_snake_right_branch(
     parts: list,
     start: tuple[float, float],
