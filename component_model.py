@@ -318,6 +318,9 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
             "side_bottom": True,
             "side_left":   True,
             "side_right":  True,
+            # Sticky link — when True the ring follows its source component
+            "linked":         True,
+            "source_inst_id": -1,   # inst_id of the parent; -1 = detached
         },
         port_defs=[],
         description="0.8 µm ring outline around a component (sides deletable)",

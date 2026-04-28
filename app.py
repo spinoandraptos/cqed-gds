@@ -236,7 +236,12 @@ class PropertiesPanel(QWidget):
             poly_lbl.setStyleSheet("font-size:10px; color:#888;")
             self._params_layout.addRow("polygons", poly_lbl)
         else:
+            # Internal params that should not appear in the properties panel
+            _HIDDEN_PARAMS = {"ring_polys", "_offset_x", "_offset_y",
+                              "source_inst_id", "_source_instances"}
             for key, val in inst.params.items():
+                if key in _HIDDEN_PARAMS:
+                    continue
                 self._add_param_editor(inst, key, val)
 
         # Connection display
@@ -643,6 +648,32 @@ class MainWindow(QMainWindow):
             self._props._x_spin.blockSignals(False)
             self._props._y_spin.blockSignals(False)
 
+        # Move any undercut rings that are linked to this component.
+        # The ring stores the offset between its own anchor and the source anchor
+        # at creation time; we just keep that delta fixed.
+        if inst is not None:
+            self._sync_linked_rings(inst_id, inst.x, inst.y)
+
+    def _sync_linked_rings(self, source_id: int, new_x: float, new_y: float):
+        """Reposition all undercut rings whose source_inst_id == source_id."""
+        from canvas import um_to_px, ComponentItem
+        for ring_id, ring in self._instances.items():
+            if ring.type_id != "undercut_ring":
+                continue
+            if not ring.params.get("linked", True):
+                continue
+            if ring.params.get("source_inst_id", -1) != source_id:
+                continue
+            # Retrieve the stored offset (set once at ring-creation time)
+            dx = ring.params.get("_offset_x", 0.0)
+            dy = ring.params.get("_offset_y", 0.0)
+            ring.x = new_x + dx
+            ring.y = new_y + dy
+            item = self.scene._component_items.get(ring_id)
+            if item:
+                item.setPos(um_to_px(ring.x), -um_to_px(ring.y))
+                item._rebuild()
+
     def _on_wire_connected(self, id1: int, p1: str, id2: int, p2: str):
         self._status.showMessage(
             f"Connected #{id1}.{p1} → #{id2}.{p2}"
@@ -654,6 +685,7 @@ class MainWindow(QMainWindow):
     # ── Params ────────────────────────────────────────────────────────────────
 
     def _on_param_changed(self, inst_id: int, key: str, val):
+        from canvas import um_to_px
         inst = self._instances.get(inst_id)
         if inst is None:
             return
@@ -661,6 +693,26 @@ class MainWindow(QMainWindow):
             inst.x = val
         elif key == "_y":
             inst.y = val
+        # When an undercut ring is re-linked, immediately snap it back to source
+        elif key == "linked" and val is True and inst.type_id == "undercut_ring":
+            src_id = inst.params.get("source_inst_id", -1)
+            src = self._instances.get(src_id)
+            if src is not None:
+                dx = inst.params.get("_offset_x", 0.0)
+                dy = inst.params.get("_offset_y", 0.0)
+                inst.x = src.x + dx
+                inst.y = src.y + dy
+                item = self.scene._component_items.get(inst_id)
+                if item:
+                    item.setPos(um_to_px(inst.x), -um_to_px(inst.y))
+                    item._rebuild()
+                # Update position spinboxes in properties panel
+                self._props._x_spin.blockSignals(True)
+                self._props._y_spin.blockSignals(True)
+                self._props._x_spin.setValue(inst.x)
+                self._props._y_spin.setValue(inst.y)
+                self._props._x_spin.blockSignals(False)
+                self._props._y_spin.blockSignals(False)
         # Sync scene item position & rebuild polygons
         item = self.scene._component_items.get(inst_id)
         if item:
@@ -670,13 +722,30 @@ class MainWindow(QMainWindow):
     # ── Delete ────────────────────────────────────────────────────────────────
 
     def _delete_selected(self):
+        from canvas import ComponentItem
+        to_delete = []
         for item in self.scene.selectedItems():
-            from canvas import ComponentItem
             if isinstance(item, ComponentItem):
-                iid = item.inst.inst_id
-                self._instances.pop(iid, None)
-                self.scene.remove_component(iid)
-                if self._selected_id == iid:
+                to_delete.append(item.inst.inst_id)
+
+        for iid in to_delete:
+            # Also collect any undercut rings linked to this component
+            linked_rings = [
+                rid for rid, ring in self._instances.items()
+                if ring.type_id == "undercut_ring"
+                and ring.params.get("linked", True)
+                and ring.params.get("source_inst_id", -1) == iid
+            ]
+            self._instances.pop(iid, None)
+            self.scene.remove_component(iid)
+            if self._selected_id == iid:
+                self._selected_id = None
+                self._props.load(None)
+
+            for rid in linked_rings:
+                self._instances.pop(rid, None)
+                self.scene.remove_component(rid)
+                if self._selected_id == rid:
                     self._selected_id = None
                     self._props.load(None)
 
@@ -850,11 +919,16 @@ class MainWindow(QMainWindow):
 
         ring = ComponentInstance("undercut_ring", x=cx, y=cy)
         ring.params.update({
-            "ring_polys":  ring_polys,   # pre-baked LOCAL-offset shell polygons
-            "side_top":    sides.get("top",    True),
-            "side_bottom": sides.get("bottom", True),
-            "side_left":   sides.get("left",   True),
-            "side_right":  sides.get("right",  True),
+            "ring_polys":     ring_polys,   # pre-baked LOCAL-offset shell polygons
+            "side_top":       sides.get("top",    True),
+            "side_bottom":    sides.get("bottom", True),
+            "side_left":      sides.get("left",   True),
+            "side_right":     sides.get("right",  True),
+            "linked":         True,         # sticky — follows its source by default
+            "source_inst_id": source_id,    # id of the parent component
+            # Offset from source anchor → ring anchor (fixed at creation time)
+            "_offset_x":      cx - source.x,
+            "_offset_y":      cy - source.y,
         })
 
         self._instances[ring.inst_id] = ring
