@@ -43,6 +43,188 @@ from component_model import (
 from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
 
 
+# ── Palette icon painter ──────────────────────────────────────────────────────
+
+def _make_component_icon(type_id: str, size: int = 36) -> QPixmap:
+    """
+    Paint a miniature schematic of each component type onto a QPixmap.
+    Uses the real layer colours so the icon matches what appears on canvas.
+    """
+    from PyQt6.QtGui import QPainterPath, QPen, QBrush
+    from PyQt6.QtCore import QRectF
+
+    S = size
+    pm = QPixmap(S, S)
+    pm.fill(QColor(0, 0, 0, 0))
+    p = QPainter(pm)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    # Colour shorthands
+    C_BRANCH  = QColor("#7F77DD")
+    C_RING    = QColor("#C060FF")
+    C_CAP1    = QColor("#F0997B")
+    C_JJ_SQ   = QColor("#5DCAA5")
+    C_CAP2    = QColor("#EF9F27")
+    C_JJ      = QColor("#E24B4A")
+    C_NARROW  = QColor("#888780")
+
+    def filled(color: QColor, alpha: int = 180) -> QBrush:
+        c = QColor(color); c.setAlpha(alpha)
+        return QBrush(c)
+
+    def stroked(color: QColor, w: float = 1.0) -> QPen:
+        c = QColor(color); c.setAlpha(220)
+        return QPen(c, w)
+
+    m  = 3          # margin
+    cx = S // 2
+    cy = S // 2
+
+    if type_id == "square_node":
+        # Big green square + thin orange L-undercut on right + coral cap on top
+        sq = 18
+        sx = cx - sq // 2
+        sy = cy - sq // 2
+        p.setBrush(filled(C_JJ_SQ)); p.setPen(stroked(C_JJ_SQ))
+        p.drawRect(sx, sy, sq, sq)
+        # top cap strip
+        p.setBrush(filled(C_CAP1)); p.setPen(stroked(C_CAP1))
+        p.drawRect(sx, sy - 4, sq, 2)
+        p.setBrush(filled(C_CAP2)); p.setPen(stroked(C_CAP2))
+        p.drawRect(sx, sy - 7, sq, 3)
+        # right undercut L
+        p.setBrush(filled(C_CAP1)); p.setPen(stroked(C_CAP1))
+        p.drawRect(sx + sq, sy, 2, sq - 4)
+        p.drawRect(sx + sq, sy + sq - 6, 6, 2)
+
+    elif type_id == "manhattan_jj":
+        # Horizontal lead → small red square → vertical and right extensions
+        lw = 3   # lead width
+        # horizontal lead
+        p.setBrush(filled(C_JJ_SQ)); p.setPen(stroked(C_JJ_SQ))
+        p.drawRect(m, cy - lw // 2, 10, lw)
+        # JJ square
+        sq = 7
+        jx, jy = m + 10, cy - sq // 2
+        p.setBrush(filled(C_JJ)); p.setPen(stroked(C_JJ))
+        p.drawRect(jx, jy, sq, sq)
+        # right extension (lead + cap1 + cap2)
+        p.setBrush(filled(C_JJ_SQ)); p.setPen(stroked(C_JJ_SQ))
+        p.drawRect(jx + sq, cy - lw // 2, sq, lw)
+        p.setBrush(filled(C_CAP1)); p.setPen(stroked(C_CAP1))
+        p.drawRect(jx + sq * 2, jy, 2, sq)
+        p.setBrush(filled(C_CAP2)); p.setPen(stroked(C_CAP2))
+        p.drawRect(jx + sq * 2 + 2, jy, 5, sq)
+        # top extension
+        p.setBrush(filled(C_JJ_SQ)); p.setPen(stroked(C_JJ_SQ))
+        p.drawRect(jx, jy - sq, sq, sq)
+        p.setBrush(filled(C_CAP1)); p.setPen(stroked(C_CAP1))
+        p.drawRect(jx, jy - sq - 2, sq, 2)
+        p.setBrush(filled(C_CAP2)); p.setPen(stroked(C_CAP2))
+        p.drawRect(jx, jy - sq - 7, sq, 5)
+
+    elif type_id == "taper_pad":
+        # Narrow on left → wider on right → rectangular pad
+        path = QPainterPath()
+        path.moveTo(m,      cy - 2)
+        path.lineTo(m,      cy + 2)
+        path.lineTo(S - 14, cy + 8)
+        path.lineTo(S - 14, cy - 8)
+        path.closeSubpath()
+        p.setBrush(filled(C_BRANCH)); p.setPen(stroked(C_BRANCH))
+        p.drawPath(path)
+        p.drawRect(S - 14, cy - 8, 11, 16)
+
+    elif type_id == "snake_route":
+        # S-shaped path: right → up → right
+        pen = QPen(C_BRANCH, 4, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen); p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        path = QPainterPath()
+        path.moveTo(m, cy + 8)
+        path.lineTo(cx - 6, cy + 8)
+        path.arcTo(cx - 6 - 8, cy - 8, 16, 16, -90, 180)
+        path.lineTo(S - m, cy - 8)
+        p.drawPath(path)
+
+    elif type_id == "top_branch":
+        # up → left-arc → left with pad at end
+        pen = QPen(C_BRANCH, 4, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap, Qt.PenJoinStyle.RoundJoin)
+        p.setPen(pen); p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        path = QPainterPath()
+        path.moveTo(cx, S - m)
+        path.lineTo(cx, cy + 2)
+        path.arcTo(cx - 8, cy - 8, 16, 16, -90, -90)   # left turn
+        path.lineTo(m + 6, cy - 6)
+        p.drawPath(path)
+        # small pad at end
+        p.setBrush(filled(C_BRANCH)); p.setPen(stroked(C_BRANCH))
+        p.drawRect(m, cy - 11, 6, 11)
+
+    elif type_id == "taper_segment":
+        # Narrow left → wide right wedge; narrow tip in grey
+        path = QPainterPath()
+        path.moveTo(m,      cy - 2)
+        path.lineTo(m,      cy + 2)
+        path.lineTo(S - m,  cy + 9)
+        path.lineTo(S - m,  cy - 9)
+        path.closeSubpath()
+        p.setBrush(filled(C_BRANCH)); p.setPen(stroked(C_BRANCH))
+        p.drawPath(path)
+        # narrow-end grey sliver
+        tip = QPainterPath()
+        tip.moveTo(m,     cy - 2)
+        tip.lineTo(m,     cy + 2)
+        tip.lineTo(m + 5, cy + 3)
+        tip.lineTo(m + 5, cy - 3)
+        tip.closeSubpath()
+        p.setBrush(filled(C_NARROW, 210)); p.setPen(stroked(C_NARROW))
+        p.drawPath(tip)
+
+    elif type_id == "branch_segment":
+        # Plain wide rectangle
+        h = 9
+        p.setBrush(filled(C_BRANCH)); p.setPen(stroked(C_BRANCH))
+        p.drawRect(m, cy - h, S - 2 * m, h * 2)
+
+    elif type_id == "turn":
+        # Quarter-circle arc
+        pen = QPen(C_BRANCH, 8, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.FlatCap, Qt.PenJoinStyle.MiterJoin)
+        p.setPen(pen); p.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        r = S - 2 * m - 4
+        p.drawArc(QRectF(m, m, r, r), 0 * 16, -90 * 16)
+
+    elif type_id == "wire":
+        # Thin horizontal wire line
+        pen = QPen(C_JJ_SQ, 3, Qt.PenStyle.SolidLine,
+                   Qt.PenCapStyle.RoundCap)
+        p.setPen(pen)
+        p.drawLine(m, cy, S - m, cy)
+
+    elif type_id == "merged_group":
+        # Two overlapping rectangles in different colours
+        p.setBrush(filled(C_BRANCH, 160)); p.setPen(stroked(C_BRANCH))
+        p.drawRect(m, m + 4, S // 2 + 4, S - 2 * m - 8)
+        p.setBrush(filled(C_JJ_SQ, 160)); p.setPen(stroked(C_JJ_SQ))
+        p.drawRect(S // 2 - 4, m + 8, S // 2 - m + 4, S - 2 * m - 12)
+
+    elif type_id == "undercut_ring":
+        # Hollow square ring in purple
+        t = 4   # ring thickness
+        outer = S - 2 * m
+        inner = outer - 2 * t
+        p.setBrush(filled(C_RING, 160)); p.setPen(stroked(C_RING))
+        p.drawRect(m, m, outer, outer)
+        # punch out centre
+        p.setBrush(QBrush(QColor(20, 20, 20))); p.setPen(QPen(Qt.PenStyle.NoPen))
+        p.drawRect(m + t, m + t, inner, inner)
+
+    p.end()
+    return pm
+
+
 # ── Palette card ──────────────────────────────────────────────────────────────
 
 class PaletteCard(QFrame):
@@ -62,14 +244,14 @@ class PaletteCard(QFrame):
         lay.setContentsMargins(8, 4, 8, 4)
         lay.setSpacing(8)
 
-        # Colour swatch
-        swatch = QLabel()
-        swatch.setFixedSize(14, 14)
-        color = list(LAYER_COLORS.values())[list(COMPONENT_TYPES.keys()).index(type_id) % len(LAYER_COLORS)]
-        swatch.setStyleSheet(
-            f"background:{color}; border-radius:3px;"
+        # Geometry icon
+        icon_lbl = QLabel()
+        icon_lbl.setFixedSize(36, 36)
+        icon_lbl.setPixmap(_make_component_icon(type_id, size=36))
+        icon_lbl.setStyleSheet(
+            "background:#1a1a1a; border:0.5px solid #2a2a2a; border-radius:4px;"
         )
-        lay.addWidget(swatch)
+        lay.addWidget(icon_lbl)
 
         info = QVBoxLayout()
         info.setSpacing(1)
@@ -89,15 +271,10 @@ class PaletteCard(QFrame):
             mime.setText(self.type_id)
             drag.setMimeData(mime)
 
-            # Build a tiny pixmap for the drag ghost
-            pm = QPixmap(80, 30)
-            pm.fill(QColor(0, 0, 0, 0))
-            painter = QPainter(pm)
-            painter.setPen(QColor("#7F77DD"))
-            painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter,
-                             COMPONENT_TYPES[self.type_id].name)
-            painter.end()
+            # Use the geometry icon as drag ghost
+            pm = _make_component_icon(self.type_id, size=48)
             drag.setPixmap(pm)
+            drag.setHotSpot(pm.rect().center())
             drag.exec(Qt.DropAction.CopyAction)
 
 
@@ -353,6 +530,159 @@ class DropCanvas(GDSView):
         event.acceptProposedAction()
 
 
+# ── Sweep dialog ──────────────────────────────────────────────────────────────
+
+class SweepDialog(QWidget):
+    """
+    Non-modal dialog for configuring a 1-D parametric sweep of a single
+    component.  Emits sweep_requested when the user clicks Preview.
+
+    Parameters shown are the numeric (float/int) params of the selected
+    component; booleans and strings are excluded.
+    """
+
+    sweep_requested = pyqtSignal(dict)  # emits the sweep config dict
+
+    def __init__(self, inst: ComponentInstance, parent=None):
+        super().__init__(parent, Qt.WindowType.Window)
+        self.setWindowTitle(f"Sweep — {inst.label}")
+        self.setMinimumWidth(340)
+        self._inst = inst
+
+        # Collect sweepable params (numeric only)
+        self._numeric_params: dict[str, float] = {
+            k: v for k, v in inst.params.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and not k.startswith("_")
+            and k not in ("source_inst_id",)
+        }
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        title = QLabel(f"Component: <b>{inst.label}</b>")
+        title.setStyleSheet("font-size:12px;")
+        lay.addWidget(title)
+
+        form = QFormLayout()
+        form.setSpacing(6)
+
+        # Parameter selector
+        self._param_combo = QComboBox()
+        self._param_combo.addItems(list(self._numeric_params.keys()))
+        self._param_combo.currentTextChanged.connect(self._on_param_selected)
+        form.addRow("Parameter", self._param_combo)
+
+        # Current value (read-only hint)
+        self._current_lbl = QLabel("")
+        self._current_lbl.setStyleSheet("font-size:10px; color:#888;")
+        form.addRow("Current value", self._current_lbl)
+
+        # Start / stop / steps
+        self._start_spin = QDoubleSpinBox()
+        self._stop_spin  = QDoubleSpinBox()
+        self._steps_spin = QSpinBox()
+
+        for sp in (self._start_spin, self._stop_spin):
+            sp.setRange(-10000, 10000)
+            sp.setDecimals(4)
+            sp.setSingleStep(0.1)
+            sp.setStyleSheet("font-size:11px;")
+
+        self._steps_spin.setRange(2, 200)
+        self._steps_spin.setValue(5)
+        self._steps_spin.setStyleSheet("font-size:11px;")
+
+        form.addRow("Start value (µm)", self._start_spin)
+        form.addRow("Stop value (µm)",  self._stop_spin)
+        form.addRow("Number of steps",  self._steps_spin)
+
+        # Spacing between copies
+        self._spacing_spin = QDoubleSpinBox()
+        self._spacing_spin.setRange(0.1, 10000)
+        self._spacing_spin.setDecimals(2)
+        self._spacing_spin.setSingleStep(1.0)
+        self._spacing_spin.setValue(20.0)
+        self._spacing_spin.setStyleSheet("font-size:11px;")
+        form.addRow("Spacing between copies (µm)", self._spacing_spin)
+
+        # Direction of array
+        self._direction_combo = QComboBox()
+        self._direction_combo.addItems(["+x (right)", "-x (left)", "+y (up)", "-y (down)"])
+        self._direction_combo.setStyleSheet("font-size:11px;")
+        form.addRow("Array direction", self._direction_combo)
+
+        lay.addLayout(form)
+
+        # Buttons
+        btn_row = QHBoxLayout()
+        btn_preview = QPushButton("▶  Preview on canvas")
+        btn_preview.setStyleSheet(
+            "background:#1a3a1a; border:1px solid #40bb40; color:#80ee80;"
+            " border-radius:4px; padding:5px 14px; font-size:12px;"
+        )
+        btn_preview.clicked.connect(self._emit_sweep)
+        btn_close = QPushButton("Close")
+        btn_close.setStyleSheet(
+            "background:#1c1c1c; border:0.5px solid #2e2e2e; color:#ccc;"
+            " border-radius:4px; padding:5px 14px; font-size:12px;"
+        )
+        btn_close.clicked.connect(self.close)
+        btn_row.addWidget(btn_preview)
+        btn_row.addWidget(btn_close)
+        lay.addLayout(btn_row)
+
+        # Initialise labels with first param
+        self._on_param_selected(self._param_combo.currentText())
+
+    def _on_param_selected(self, key: str):
+        val = self._numeric_params.get(key, 0.0)
+        self._current_lbl.setText(f"{val:.4g}")
+        # Sensible defaults: ±50 % around current value
+        lo = val * 0.5 if val != 0 else -1.0
+        hi = val * 1.5 if val != 0 else  1.0
+        if lo > hi:
+            lo, hi = hi, lo
+        self._start_spin.setValue(round(lo, 4))
+        self._stop_spin.setValue(round(hi, 4))
+
+    def _direction_sign(self) -> tuple[int, int]:
+        """Return (dx_sign, dy_sign) from the selected array direction."""
+        txt = self._direction_combo.currentText()
+        return {
+            "+x (right)": ( 1,  0),
+            "-x (left)":  (-1,  0),
+            "+y (up)":    ( 0,  1),
+            "-y (down)":  ( 0, -1),
+        }[txt]
+
+    def _emit_sweep(self):
+        key    = self._param_combo.currentText()
+        start  = self._start_spin.value()
+        stop   = self._stop_spin.value()
+        steps  = self._steps_spin.value()
+        spacing = self._spacing_spin.value()
+        dxs, dys = self._direction_sign()
+
+        if steps < 2:
+            QMessageBox.warning(self, "Sweep", "Need at least 2 steps.")
+            return
+        if key not in self._numeric_params:
+            QMessageBox.warning(self, "Sweep", "No sweepable parameter selected.")
+            return
+
+        self.sweep_requested.emit({
+            "param":   key,
+            "start":   start,
+            "stop":    stop,
+            "steps":   steps,
+            "spacing": spacing,
+            "dx_sign": dxs,
+            "dy_sign": dys,
+        })
+
+
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
@@ -369,6 +699,7 @@ class MainWindow(QMainWindow):
         self._instances: dict[int, ComponentInstance] = {}
         self._selected_id: int | None = None
         self._clipboard: ComponentInstance | None = None   # copy/paste buffer
+        self._sweep_ids: set[int] = set()                  # inst_ids of sweep preview copies
 
         self._build_ui()
         self._connect_signals()
@@ -539,6 +870,25 @@ class MainWindow(QMainWindow):
         act_export_plot = QAction("Export GDS script…", self)
         act_export_plot.triggered.connect(self._export_plot_script)
         tb.addAction(act_export_plot)
+
+        tb.addSeparator()
+
+        act_sweep = QAction("Sweep…  [S]", self)
+        act_sweep.triggered.connect(self._open_sweep_dialog)
+        tb.addAction(act_sweep)
+
+        act_clear_sweep = QAction("Clear Sweep", self)
+        act_clear_sweep.triggered.connect(self._clear_sweep)
+        tb.addAction(act_clear_sweep)
+
+        act_export_sweep = QAction("Export Sweep GDS…", self)
+        act_export_sweep.triggered.connect(self._export_sweep_gds)
+        tb.addAction(act_export_sweep)
+
+        act_sweep_shortcut = QAction(self)
+        act_sweep_shortcut.setShortcut("S")
+        act_sweep_shortcut.triggered.connect(self._open_sweep_dialog)
+        self.addAction(act_sweep_shortcut)
 
         tb.addSeparator()
 
@@ -1059,6 +1409,151 @@ class MainWindow(QMainWindow):
                 f"Run it to produce:\n  {gds_name}\n\n"
                 f"Command:\n  python {_os.path.basename(path)}\n"
                 f"  python {_os.path.basename(path)} /custom/output.gds"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    # ── Parametric sweep ──────────────────────────────────────────────────────
+
+    def _open_sweep_dialog(self):
+        """Open the Sweep dialog for the currently selected component."""
+        if self._selected_id is None:
+            self._status.showMessage(
+                "Select a component first, then click Sweep  [S]"
+            )
+            return
+        inst = self._instances.get(self._selected_id)
+        if inst is None:
+            return
+        if inst.type_id in ("undercut_ring", "merged_group"):
+            self._status.showMessage(
+                "Cannot sweep undercut rings or merged groups — select a parametric component"
+            )
+            return
+
+        # Collect sweepable (numeric) params
+        numeric = {
+            k: v for k, v in inst.params.items()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+            and not k.startswith("_")
+            and k not in ("source_inst_id",)
+        }
+        if not numeric:
+            self._status.showMessage(
+                f"{inst.label} has no numeric parameters to sweep"
+            )
+            return
+
+        dlg = SweepDialog(inst, parent=self)
+        dlg.sweep_requested.connect(self._run_sweep)
+        dlg.show()
+        self._status.showMessage(
+            f"Sweep dialog open for {inst.label} — configure and click Preview"
+        )
+
+    def _run_sweep(self, cfg: dict):
+        """
+        Generate N preview copies of the selected component on the canvas,
+        each with a linearly interpolated value for the swept parameter.
+
+        All copies are tagged in self._sweep_ids so they can be bulk-cleared.
+        Existing sweep previews are cleared before drawing the new ones.
+        """
+        import numpy as np
+
+        if self._selected_id is None:
+            return
+        source = self._instances.get(self._selected_id)
+        if source is None:
+            return
+
+        # Clear any existing sweep copies first
+        self._clear_sweep()
+
+        param   = cfg["param"]
+        start   = cfg["start"]
+        stop    = cfg["stop"]
+        steps   = cfg["steps"]
+        spacing = cfg["spacing"]
+        dxs     = cfg["dx_sign"]
+        dys     = cfg["dy_sign"]
+
+        values = [start + (stop - start) * i / (steps - 1) for i in range(steps)]
+
+        # Estimate bounding width of source to auto-size the step offset if
+        # spacing is along x — use the spacing the user gave regardless.
+        for i, val in enumerate(values):
+            # Offset in array direction: index × spacing
+            ox = source.x + dxs * spacing * (i + 1)
+            oy = source.y + dys * spacing * (i + 1)
+
+            copy = source.clone(offset_x=ox - source.x,
+                                offset_y=oy - source.y)
+            copy.params[param] = val
+            # Mark as sweep copy (use a private param flag)
+            copy.params["_sweep_copy"] = True
+            copy.params["_sweep_param"] = param
+            copy.params["_sweep_value"] = val
+
+            self._instances[copy.inst_id] = copy
+            self.scene.add_component(copy)
+            self._sweep_ids.add(copy.inst_id)
+
+        n = len(values)
+        self._status.showMessage(
+            f"Sweep preview: {n} copies of {source.label} "
+            f"with {param} from {start:.4g} → {stop:.4g}"
+        )
+
+    def _clear_sweep(self):
+        """Remove all sweep preview copies from the canvas."""
+        if not self._sweep_ids:
+            return
+        removed = 0
+        for iid in list(self._sweep_ids):
+            self._instances.pop(iid, None)
+            self.scene.remove_component(iid)
+            if self._selected_id == iid:
+                self._selected_id = None
+                self._props.load(None)
+            removed += 1
+        self._sweep_ids.clear()
+        if removed:
+            self._status.showMessage(f"Cleared {removed} sweep preview copy/copies")
+
+    def _export_sweep_gds(self):
+        """Export only the sweep preview copies to a GDS file."""
+        if not self._sweep_ids:
+            QMessageBox.information(
+                self, "Export Sweep",
+                "No sweep preview on canvas.\n"
+                "Use Sweep… to generate one first."
+            )
+            return
+
+        sweep_instances = [
+            self._instances[iid]
+            for iid in self._sweep_ids
+            if iid in self._instances
+        ]
+        if not sweep_instances:
+            QMessageBox.information(self, "Export Sweep", "Sweep instances not found.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default   = f"sweep_{timestamp}.gds"
+        path, _   = QFileDialog.getSaveFileName(
+            self, "Export Sweep GDS", default, "GDS files (*.gds)"
+        )
+        if not path:
+            return
+
+        try:
+            export_to_gds(sweep_instances, self.cfg, path)
+            self._status.showMessage(f"Sweep exported → {os.path.basename(path)}")
+            QMessageBox.information(
+                self, "Export Sweep",
+                f"Saved {len(sweep_instances)} sweep variant(s):\n{path}"
             )
         except Exception as e:
             QMessageBox.critical(self, "Export failed", str(e))
