@@ -509,7 +509,15 @@ def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> Merged
     cy = (min(all_ys) + max(all_ys)) / 2
 
     labels = [inst.label for inst in instances]
-    return MergedInstance(all_polys, cx, cy, labels)
+
+    # Store polygons as LOCAL coords (relative to centroid) so that:
+    # - moving just adds (dx, dy) to each point via inst.x / inst.y
+    # - rotation pivots cleanly around the anchor in render_instance
+    local_polys: PolyData = [
+        (layer, [(px - cx, py - cy) for px, py in pts])
+        for layer, pts in all_polys
+    ]
+    return MergedInstance(local_polys, cx, cy, labels)
 
 
 
@@ -704,22 +712,33 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
       3. Rotating that local point by inst.rotation_steps × 90° CCW
       4. Translating back to world coords
     """
-    # MergedInstance carries pre-baked world-space polygons.
-    # We re-centre them on the current (inst.x, inst.y) so moves work.
+    x, y = inst.x, inst.y
+    steps = inst.rotation_steps
+
+    def _apply_rotation(world_pts_list: PolyData) -> PolyData:
+        """Rotate world-coord polygons around (x, y) by rotation_steps."""
+        if steps == 0:
+            return world_pts_list
+        rotated: PolyData = []
+        for layer, pts in world_pts_list:
+            new_pts = []
+            for px, py in pts:
+                lx, ly = px - x, py - y
+                rx, ry = _rotate_pt(lx, ly, steps)
+                new_pts.append((rx + x, ry + y))
+            rotated.append((layer, new_pts))
+        return rotated
+
+    # MergedInstance carries pre-baked LOCAL-space polygons (relative to centroid).
     if isinstance(inst, MergedInstance):
-        # Compute original centroid of the baked data
-        all_xs = [x for _, pts in inst._poly_data for x, _ in pts]
-        all_ys = [y for _, pts in inst._poly_data for _, y in pts]
-        if not all_xs:
+        if not inst._poly_data:
             return []
-        orig_cx = (min(all_xs) + max(all_xs)) / 2
-        orig_cy = (min(all_ys) + max(all_ys)) / 2
-        dx = inst.x - orig_cx
-        dy = inst.y - orig_cy
-        return [
-            (layer, [(x + dx, y + dy) for x, y in pts])
+        # Translate from local → world, then apply rotation
+        world = [
+            (layer, [(lx + x, ly + y) for lx, ly in pts])
             for layer, pts in inst._poly_data
         ]
+        return _apply_rotation(world)
 
     from primitives import add_rect, add_square, add_taper_pad, smooth_taper
     from undercuts import (add_top_caps, add_side_caps,
@@ -730,7 +749,6 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
                                 add_taper_segment)
 
     parts: list = []
-    x, y = inst.x, inst.y
 
     if inst.type_id == "square_node":
         add_square_node(parts, x, y,
@@ -784,32 +802,19 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
             add_rect(parts, (x - hw, y - length), (x + hw, y), layer)
 
     elif inst.type_id == "undercut_ring":
-        # ring_polys are stored as LOCAL offsets from anchor_x/anchor_y.
-        # Translate to current world position (inst.x, inst.y).
+        # ring_polys are stored as LOCAL offsets from anchor (inst.x, inst.y).
+        # Translate to world, then apply rotation around the same anchor.
         baked: list = inst.params.get("ring_polys", [])
         if not baked:
             return []
-        return [
+        world = [
             (lyr, [(px + x, py + y) for px, py in pts])
             for lyr, pts in baked
         ]
+        return _apply_rotation(world)
 
     raw = _collect_polygons(parts)
-
-    # Apply rotation around the instance origin (x, y)
-    steps = inst.rotation_steps
-    if steps == 0:
-        return raw
-
-    rotated: PolyData = []
-    for layer, pts in raw:
-        new_pts = []
-        for px, py in pts:
-            lx, ly = px - x, py - y          # to local
-            rx, ry = _rotate_pt(lx, ly, steps)   # rotate
-            new_pts.append((rx + x, ry + y))  # back to world
-        rotated.append((layer, new_pts))
-    return rotated
+    return _apply_rotation(raw)
 
 
 def export_to_gds(instances: list[ComponentInstance], cfg: Config,
