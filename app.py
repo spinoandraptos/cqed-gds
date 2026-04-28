@@ -506,6 +506,12 @@ class MainWindow(QMainWindow):
         act_merge = QAction("Merge  [M]", self)
         act_merge.triggered.connect(self._merge_selected)
         tb.addAction(act_merge)
+
+        act_unmerge = QAction("Unmerge", self)
+        act_unmerge.triggered.connect(self._unmerge_selected)
+        act_unmerge.setShortcut("Ctrl+Shift+M")
+        tb.addAction(act_unmerge)
+        self.addAction(act_unmerge)
         tb.addSeparator()
 
         act_undercut = QAction("Undercut Ring  [U]", self)
@@ -752,7 +758,42 @@ class MainWindow(QMainWindow):
             f"Merged {len(instances)} components → {merged.label}"
         )
 
-    # ── Undercut ring ──────────────────────────────────────────────────────────
+    def _unmerge_selected(self):
+        """
+        Split the selected MergedInstance back into its original components.
+        Only works if the group was created after the unmerge feature was added.
+        """
+        from component_model import MergedInstance, unmerge_instance
+
+        if self._selected_id is None:
+            self._status.showMessage("Select a merged group to unmerge")
+            return
+
+        inst = self._instances.get(self._selected_id)
+        if not isinstance(inst, MergedInstance):
+            self._status.showMessage("Selected component is not a merged group")
+            return
+
+        try:
+            restored = unmerge_instance(inst)
+        except ValueError as e:
+            QMessageBox.warning(self, "Cannot unmerge", str(e))
+            return
+
+        # Remove the merged group
+        self._instances.pop(self._selected_id, None)
+        self.scene.remove_component(self._selected_id)
+        self._selected_id = None
+        self._props.load(None)
+
+        # Add each restored instance back onto the canvas
+        for r in restored:
+            self._instances[r.inst_id] = r
+            self.scene.add_component(r)
+
+        self._status.showMessage(
+            f"Unmerged → {len(restored)} component{'s' if len(restored) != 1 else ''} restored"
+        )
 
     def _add_undercut_ring(self):
         """

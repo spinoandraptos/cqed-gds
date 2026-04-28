@@ -535,6 +535,10 @@ def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> Merged
 
     labels = [inst.label for inst in instances]
 
+    # Serialise source instances so unmerge can reconstruct them exactly,
+    # including after save/load (instance_to_dict is JSON-safe).
+    source_dicts = [instance_to_dict(inst) for inst in instances]
+
     # Store polygons as LOCAL coords (relative to centroid) so that:
     # - moving just adds (dx, dy) to each point via inst.x / inst.y
     # - rotation pivots cleanly around the anchor in render_instance
@@ -542,7 +546,26 @@ def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> Merged
         (layer, [(px - cx, py - cy) for px, py in pts])
         for layer, pts in all_polys
     ]
-    return MergedInstance(local_polys, cx, cy, labels)
+    mi = MergedInstance(local_polys, cx, cy, labels)
+    mi.params["_source_instances"] = source_dicts
+    return mi
+
+
+def unmerge_instance(merged: MergedInstance) -> list[ComponentInstance]:
+    """
+    Reconstruct the original ComponentInstances from a MergedInstance.
+
+    Returns the list of restored instances, or raises ValueError if the
+    merged group has no stored source data (e.g. was merged before this
+    feature was added).
+    """
+    source_dicts = merged.params.get("_source_instances")
+    if not source_dicts:
+        raise ValueError(
+            "This merged group has no stored source data and cannot be unmerged.\n"
+            "Only groups created after the unmerge feature was added can be split."
+        )
+    return [instance_from_dict(d) for d in source_dicts]
 
 
 
