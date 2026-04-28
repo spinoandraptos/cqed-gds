@@ -910,6 +910,103 @@ def load_workspace(filepath: str) -> list[ComponentInstance]:
     return instances
 
 
+def export_gds_script(instances: list[ComponentInstance], cfg: Config,
+                      filepath: str) -> None:
+    """
+    Render every instance and write a self-contained Python script that,
+    when run, reproduces the exact same GDS file using only gdspy.
+
+    The generated script embeds all polygon coordinates and layer numbers
+    directly — no dependency on this codebase whatsoever.
+
+    Parameters
+    ----------
+    instances : all ComponentInstances currently on the canvas
+    cfg       : Config (needed by render_instance)
+    filepath  : destination .py path chosen by the user
+    """
+    from collections import defaultdict
+
+    # ── 1. Render all geometry ────────────────────────────────────────────────
+    layer_polys: dict[int, list[list[tuple[float, float]]]] = defaultdict(list)
+    for inst in instances:
+        for layer, pts in render_instance(inst, cfg):
+            if len(pts) >= 3:
+                layer_polys[layer].append(pts)
+
+    if not layer_polys:
+        raise ValueError("Nothing to export — canvas is empty.")
+
+    # ── 2. Derive a default output GDS name from the script name ─────────────
+    import os
+    script_stem = os.path.splitext(os.path.basename(filepath))[0]
+    default_gds = f"{script_stem}.gds"
+
+    # ── 3. Build script text ──────────────────────────────────────────────────
+    def _fmt_pts(pts: list[tuple[float, float]]) -> str:
+        inner = ",".join(f"({x:.6f},{y:.6f})" for x, y in pts)
+        return f"[{inner}]"
+
+    lines: list[str] = []
+    a = lines.append
+
+    a('"""')
+    a(f'Auto-generated GDS script — reproduces the layout exported from the GDS Layout Editor.')
+    a(f'Output file: {default_gds}')
+    a('Dependency : gdspy  (pip install gdspy)')
+    a('Run        : python ' + os.path.basename(filepath))
+    a('"""')
+    a('')
+    a('import os')
+    a('import gdspy')
+    a('')
+    a('# ── Layer name reference (informational only) ────────────────────────────')
+    a('LAYER_NAMES = {')
+    for layer, name in sorted(LAYER_NAMES.items()):
+        a(f'    {layer}: "{name}",')
+    a('}')
+    a('')
+    a('# ── Polygon data: {layer: [[(x, y), ...], ...]} ─────────────────────────')
+    a('# Each entry is one polygon on the given GDS layer.')
+    a('POLYGONS = {')
+    for layer in sorted(layer_polys.keys()):
+        pts_list = layer_polys[layer]
+        name = LAYER_NAMES.get(layer, f"L{layer}")
+        a(f'    {layer}: [  # {name} — {len(pts_list)} polygon(s)')
+        for pts in pts_list:
+            a(f'        {_fmt_pts(pts)},')
+        a('    ],')
+    a('}')
+    a('')
+    a('')
+    a('def write_gds(output_path: str = None) -> str:')
+    a('    """Write the embedded layout to a GDS file and return the path."""')
+    a(f'    if output_path is None:')
+    a(f'        output_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),')
+    a(f'                                   "{default_gds}")')
+    a('')
+    a('    gdspy.current_library = gdspy.GdsLibrary()')
+    a('    cell = gdspy.Cell("LAYOUT")')
+    a('')
+    a('    for layer, polys in POLYGONS.items():')
+    a('        for pts in polys:')
+    a('            cell.add(gdspy.Polygon(pts, layer=layer))')
+    a('')
+    a('    gdspy.write_gds(output_path)')
+    a('    print(f"GDS written → {output_path}")')
+    a('    return output_path')
+    a('')
+    a('')
+    a('if __name__ == "__main__":')
+    a('    import sys')
+    a('    out = sys.argv[1] if len(sys.argv) > 1 else None')
+    a('    write_gds(out)')
+
+    # ── 4. Write file ─────────────────────────────────────────────────────────
+    with open(filepath, "w", encoding="utf-8") as fh:
+        fh.write("\n".join(lines) + "\n")
+
+
 def export_to_gds(instances: list[ComponentInstance], cfg: Config,
                   filepath: str) -> None:
     """Render all instances and write a GDS file."""

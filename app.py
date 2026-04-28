@@ -38,6 +38,7 @@ from component_model import (
     export_to_gds, MergedInstance, merge_instances,
     UNDERCUT_RING_LAYER, UNDERCUT_RING_THICKNESS,
     save_workspace, load_workspace,
+    export_gds_script,
 )
 from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
 
@@ -524,6 +525,10 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self._export_gds)
         tb.addAction(act_export)
 
+        act_export_plot = QAction("Export GDS script…", self)
+        act_export_plot.triggered.connect(self._export_plot_script)
+        tb.addAction(act_export_plot)
+
         tb.addSeparator()
 
         act_save_ws = QAction("Save workspace  [Ctrl+S]", self)
@@ -914,7 +919,36 @@ class MainWindow(QMainWindow):
         if not silent:
             QMessageBox.information(self, "Workspace loaded", msg)
 
-    # ── Export ────────────────────────────────────────────────────────────────
+    def _export_plot_script(self):
+        instances = list(self._instances.values())
+        if not instances:
+            QMessageBox.information(self, "Export", "Nothing to export.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default   = f"layout_{timestamp}.py"
+        path, _   = QFileDialog.getSaveFileName(
+            self, "Export GDS script", default, "Python scripts (*.py)"
+        )
+        if not path:
+            return
+
+        try:
+            export_gds_script(instances, self.cfg, path)
+            import os as _os
+            gds_name = _os.path.splitext(_os.path.basename(path))[0] + ".gds"
+            self._status.showMessage(f"GDS script exported → {_os.path.basename(path)}")
+            QMessageBox.information(
+                self, "Export",
+                f"Saved:\n{path}\n\n"
+                f"Run it to produce:\n  {gds_name}\n\n"
+                f"Command:\n  python {_os.path.basename(path)}\n"
+                f"  python {_os.path.basename(path)} /custom/output.gds"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    # ── Export GDS ────────────────────────────────────────────────────────────
 
     def _export_gds(self):
         instances = list(self._instances.values())
