@@ -343,6 +343,7 @@ class MainWindow(QMainWindow):
         self.cfg = Config()
         self._instances: dict[int, ComponentInstance] = {}
         self._selected_id: int | None = None
+        self._clipboard: ComponentInstance | None = None   # copy/paste buffer
 
         self._build_ui()
         self._connect_signals()
@@ -438,7 +439,26 @@ class MainWindow(QMainWindow):
 
         act_delete = QAction("Delete sel.", self)
         act_delete.triggered.connect(self._delete_selected)
+        act_delete.setShortcut("Delete")
+        self.addAction(act_delete)
         tb.addAction(act_delete)
+
+        act_copy = QAction(self)
+        act_copy.setShortcut("Ctrl+C")
+        act_copy.triggered.connect(self._copy_selected)
+        self.addAction(act_copy)
+
+        act_paste = QAction(self)
+        act_paste.setShortcut("Ctrl+V")
+        act_paste.triggered.connect(self._paste)
+        self.addAction(act_paste)
+
+        act_copy  = QAction("Copy  [Ctrl+C]", self)
+        act_paste = QAction("Paste  [Ctrl+V]", self)
+        act_copy.triggered.connect(self._copy_selected)
+        act_paste.triggered.connect(self._paste)
+        tb.addAction(act_copy)
+        tb.addAction(act_paste)
         tb.addSeparator()
 
         act_rot_cw  = QAction("Rotate CW  [R]", self)
@@ -550,6 +570,34 @@ class MainWindow(QMainWindow):
                 if self._selected_id == iid:
                     self._selected_id = None
                     self._props.load(None)
+
+    # ── Copy / Paste ──────────────────────────────────────────────────────────
+
+    def _copy_selected(self):
+        """Copy the currently selected component into the internal clipboard."""
+        if self._selected_id is None:
+            self._status.showMessage("Nothing selected to copy")
+            return
+        inst = self._instances.get(self._selected_id)
+        if inst is None:
+            return
+        self._clipboard = inst          # store reference; clone is made on paste
+        self._status.showMessage(f"Copied {inst.label}")
+
+    def _paste(self):
+        """Paste a clone of the clipboard component, offset by +2 µm in x and -2 µm in y."""
+        if self._clipboard is None:
+            self._status.showMessage("Clipboard is empty — copy a component first")
+            return
+        new_inst = self._clipboard.clone(offset_x=2.0, offset_y=-2.0)
+        self._instances[new_inst.inst_id] = new_inst
+        self.scene.add_component(new_inst)
+        # Select the newly pasted component
+        self.scene.select_component(new_inst.inst_id)
+        self._clipboard = new_inst      # subsequent pastes cascade by +2 µm each time
+        self._status.showMessage(
+            f"Pasted {new_inst.label} at ({new_inst.x:.2f}, {new_inst.y:.2f}) µm"
+        )
 
     # ── Rotate ────────────────────────────────────────────────────────────────
 

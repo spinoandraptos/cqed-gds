@@ -333,6 +333,13 @@ class GDSScene(QGraphicsScene):
         if inst_id in self._component_items:
             self.removeItem(self._component_items.pop(inst_id))
 
+    def select_component(self, inst_id: int) -> None:
+        """Programmatically select a component by inst_id, deselecting all others."""
+        self.clearSelection()
+        item = self._component_items.get(inst_id)
+        if item:
+            item.setSelected(True)
+
     def rebuild_component(self, inst_id: int):
         if inst_id in self._component_items:
             item = self._component_items[inst_id]

@@ -346,6 +346,23 @@ class ComponentInstance:
         """Rotate 90° counter-clockwise."""
         self.rotation = (self.rotation + 90) % 360
 
+    def clone(self, offset_x: float = 2.0, offset_y: float = -2.0) -> "ComponentInstance":
+        """
+        Return a new ComponentInstance that is a deep copy of this one,
+        placed *offset_x* / *offset_y* µm away, with a fresh inst_id and
+        no wire connections (connections reference inst_ids from the
+        original layout and would be stale on the copy).
+        """
+        new = ComponentInstance(
+            self.type_id,
+            self.x + offset_x,
+            self.y + offset_y,
+            rotation=self.rotation,
+            params=copy.deepcopy(self.params),
+        )
+        # connections intentionally not copied — they point to other inst_ids
+        return new
+
     @property
     def label(self) -> str:
         rot = f" {self.rotation}°" if self.rotation else ""
