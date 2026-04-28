@@ -626,6 +626,73 @@ def compute_undercut_ring_polys(
     return result
 
 
+def clip_undercut_ring_by_rect(
+    inst: "ComponentInstance",
+    rect_um: tuple[float, float, float, float],
+) -> bool:
+    """
+    Boolean-subtract a µm-space rectangle from an undercut_ring instance's
+    stored ring_polys.  Modifies inst.params["ring_polys"] in place.
+
+    Parameters
+    ----------
+    inst     : a ComponentInstance whose type_id == "undercut_ring"
+    rect_um  : (x0, y0, x1, y1) in world µm coords, with x0<x1 and y0<y1
+
+    Returns
+    -------
+    True  if any geometry was actually removed (ring changed)
+    False if nothing was clipped (rect didn't overlap any ring polygon)
+    """
+    baked: list = inst.params.get("ring_polys", [])
+    if not baked:
+        return False
+
+    x0, y0, x1, y1 = rect_um
+    cx, cy = inst.x, inst.y
+
+    # Convert local ring polys → world coords for gdspy boolean
+    world_polys = [
+        (lyr, [(px + cx, py + cy) for px, py in pts])
+        for lyr, pts in baked
+    ]
+
+    # Eraser rectangle in world coords
+    eraser = gdspy.Rectangle((x0, y0), (x1, y1))
+
+    new_baked: list = []
+    changed = False
+
+    for lyr, pts in world_polys:
+        if len(pts) < 3:
+            continue
+        src_poly = gdspy.Polygon(pts, layer=lyr)
+
+        # Check if the eraser overlaps this polygon at all (quick bbox test)
+        arr = np.array(pts)
+        px0, py0 = arr[:, 0].min(), arr[:, 1].min()
+        px1, py1 = arr[:, 0].max(), arr[:, 1].max()
+        if x1 < px0 or x0 > px1 or y1 < py0 or y0 > py1:
+            # No overlap — keep as-is
+            new_baked.append((lyr, [(float(px) - cx, float(py) - cy) for px, py in pts]))
+            continue
+
+        remainder = gdspy.boolean(src_poly, eraser, "not", layer=lyr, precision=1e-5)
+        changed = True
+        if remainder is None:
+            continue  # entire polygon was erased
+
+        polys_arr = remainder.polygons if hasattr(remainder, "polygons") else [remainder.points]
+        for poly_pts in polys_arr:
+            local_pts = [(float(px) - cx, float(py) - cy) for px, py in poly_pts]
+            if len(local_pts) >= 3:
+                new_baked.append((lyr, local_pts))
+
+    if changed:
+        inst.params["ring_polys"] = new_baked
+    return changed
+
+
 def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     """
     Call the underlying gdspy functions for this instance and return

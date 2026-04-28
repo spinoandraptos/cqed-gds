@@ -434,13 +434,16 @@ class MainWindow(QMainWindow):
         self._act_select = QAction("Select", self, checkable=True, checked=True)
         self._act_wire   = QAction("Wire", self, checkable=True)
         self._act_pan    = QAction("Pan", self, checkable=True)
+        self._act_erase  = QAction("Erase Ring  [X]", self, checkable=True)
         self._act_select.triggered.connect(lambda: self._set_tool("select"))
         self._act_wire.triggered.connect(lambda:   self._set_tool("wire"))
         self._act_pan.triggered.connect(lambda:    self._set_tool("pan"))
+        self._act_erase.triggered.connect(lambda:  self._set_tool("erase"))
 
         tb.addAction(self._act_select)
         tb.addAction(self._act_wire)
         tb.addAction(self._act_pan)
+        tb.addAction(self._act_erase)
         tb.addSeparator()
 
         act_fit   = QAction("Zoom fit", self)
@@ -476,6 +479,11 @@ class MainWindow(QMainWindow):
         act_undercut_shortcut.setShortcut("U")
         act_undercut_shortcut.triggered.connect(self._add_undercut_ring)
         self.addAction(act_undercut_shortcut)
+
+        act_erase_shortcut = QAction(self)
+        act_erase_shortcut.setShortcut("X")
+        act_erase_shortcut.triggered.connect(lambda: self._set_tool("erase"))
+        self.addAction(act_erase_shortcut)
 
         act_copy  = QAction("Copy  [Ctrl+C]", self)
         act_paste = QAction("Paste  [Ctrl+V]", self)
@@ -533,6 +541,7 @@ class MainWindow(QMainWindow):
         self.scene.status_message.connect(self._status.showMessage)
         self.scene.merge_requested.connect(self._on_merge_requested)
         self.scene.undercut_confirmed.connect(self._on_undercut_confirmed)
+        self.scene.erase_applied.connect(self._on_erase_applied)
         self._props.param_changed.connect(self._on_param_changed)
 
         for layer, cb in self._left.layer_checks.items():
@@ -552,8 +561,10 @@ class MainWindow(QMainWindow):
         self._act_select.setChecked(tool == "select")
         self._act_wire.setChecked(tool == "wire")
         self._act_pan.setChecked(tool == "pan")
+        self._act_erase.setChecked(tool == "erase")
         self.scene.set_wire_mode(tool == "wire")
         self.view.set_pan_mode(tool == "pan")
+        self.view.set_erase_mode(tool == "erase")
         for item in self.scene.all_instances():
             pass  # items remain movable only in select mode
         if tool == "select":
@@ -562,6 +573,10 @@ class MainWindow(QMainWindow):
             self._status.showMessage("Wire tool — click a port, then click destination port")
         elif tool == "pan":
             self._status.showMessage("Pan tool — drag to pan, scroll to zoom")
+        elif tool == "erase":
+            self._status.showMessage(
+                "Erase Ring tool — drag a rectangle to delete undercut ring geometry inside it"
+            )
 
     # ── Drop ─────────────────────────────────────────────────────────────────
 
@@ -782,6 +797,11 @@ class MainWindow(QMainWindow):
         self._status.showMessage(
             f"Undercut ring added — sides: {', '.join(active_sides) or 'none'}"
         )
+
+    def _on_erase_applied(self, inst_id: int):
+        """Refresh properties panel if the erased ring is currently selected."""
+        if self._selected_id == inst_id:
+            self._props.load(self._instances.get(inst_id))
 
     # ── Rotate ────────────────────────────────────────────────────────────────
 

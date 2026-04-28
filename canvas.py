@@ -423,6 +423,34 @@ class UnderCutEditItem(QGraphicsItem):
         super().mousePressEvent(event)
 
 
+ERASE_RECT_COLOR = QColor("#FF4444")
+
+
+class EraseRectItem(QGraphicsRectItem):
+    """
+    Translucent red rectangle shown while the user drags an erase selection.
+    Not interactive — purely visual feedback.
+    """
+
+    def __init__(self):
+        super().__init__()
+        pen = QPen(ERASE_RECT_COLOR, 1.5, Qt.PenStyle.DashLine)
+        fill = QColor(ERASE_RECT_COLOR)
+        fill.setAlpha(40)
+        self.setPen(pen)
+        self.setBrush(QBrush(fill))
+        self.setZValue(30)
+        self.hide()
+
+    def set_rect(self, p1: QPointF, p2: QPointF):
+        x0 = min(p1.x(), p2.x())
+        y0 = min(p1.y(), p2.y())
+        w  = abs(p2.x() - p1.x())
+        h  = abs(p2.y() - p1.y())
+        self.setRect(QRectF(x0, y0, w, h))
+        self.show()
+
+
 # ── Wire item ─────────────────────────────────────────────────────────────────
 
 class WireItem(QGraphicsItem):
@@ -471,6 +499,7 @@ class GDSScene(QGraphicsScene):
     status_message           = pyqtSignal(str)
     merge_requested          = pyqtSignal(list)  # list[int] of selected inst_ids
     undercut_confirmed       = pyqtSignal(int, dict)  # source inst_id, sides dict
+    erase_applied            = pyqtSignal(int)   # inst_id of ring that was modified
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -489,6 +518,9 @@ class GDSScene(QGraphicsScene):
         # Undercut ring edit state
         self._undercut_edit_item: UnderCutEditItem | None = None
         self._undercut_source_id: int | None = None
+
+        # Erase mode state
+        self._erase_mode = False
 
         # Layer visibility
         self.layer_visible: dict[int, bool] = {l: True for l in LAYER_COLORS}
@@ -630,6 +662,54 @@ class GDSScene(QGraphicsScene):
             if item:
                 item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
             self._undercut_source_id = None
+
+    # ── Erase mode ────────────────────────────────────────────────────────────
+
+    def set_erase_mode(self, enabled: bool):
+        self._erase_mode = enabled
+
+    def erase_undercut_in_rect(self, scene_rect: QRectF) -> int:
+        """
+        Subtract the given scene-space rectangle from every undercut_ring
+        instance whose geometry overlaps it.
+
+        Returns the number of rings that were modified.
+        """
+        from component_model import clip_undercut_ring_by_rect
+
+        # Convert scene pixels → world µm (y-flipped)
+        x0_um = px_to_um(scene_rect.left())
+        x1_um = px_to_um(scene_rect.right())
+        # Scene y is flipped: larger scene-y = smaller world-y
+        y0_um = -px_to_um(scene_rect.bottom())
+        y1_um = -px_to_um(scene_rect.top())
+
+        # Ensure ordering
+        if x0_um > x1_um:
+            x0_um, x1_um = x1_um, x0_um
+        if y0_um > y1_um:
+            y0_um, y1_um = y1_um, y0_um
+
+        rect_um = (x0_um, y0_um, x1_um, y1_um)
+
+        count = 0
+        for inst_id, item in list(self._component_items.items()):
+            if item.inst.type_id != "undercut_ring":
+                continue
+            changed = clip_undercut_ring_by_rect(item.inst, rect_um)
+            if changed:
+                item._rebuild()
+                self.erase_applied.emit(inst_id)
+                count += 1
+
+        if count:
+            self.status_message.emit(
+                f"Erased undercut geometry from {count} ring(s)"
+            )
+        else:
+            self.status_message.emit("Erase rect did not overlap any undercut ring")
+
+        return count
 
     # ── Wire mode ─────────────────────────────────────────────────────────────
 
@@ -777,6 +857,11 @@ class GDSView(QGraphicsView):
         self._zoom        = 1.0
         self._pan_mode    = False
 
+        # Erase drag state
+        self._erase_origin: QPointF | None = None
+        self._erase_rect_item = EraseRectItem()
+        scene.addItem(self._erase_rect_item)
+
     def set_pan_mode(self, enabled: bool):
         self._pan_mode = enabled
         if enabled:
@@ -786,18 +871,64 @@ class GDSView(QGraphicsView):
             self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
             self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
 
-    def wheelEvent(self, event):
-        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
-        self._zoom *= factor
-        self._zoom  = max(0.05, min(self._zoom, 50.0))
-        self.scale(factor, factor)
+    def set_erase_mode(self, enabled: bool):
+        gds_scene = self.scene()
+        if hasattr(gds_scene, "set_erase_mode"):
+            gds_scene.set_erase_mode(enabled)
+        if enabled:
+            self.setDragMode(QGraphicsView.DragMode.NoDrag)
+            self.setCursor(QCursor(Qt.CursorShape.CrossCursor))
+        else:
+            self._erase_rect_item.hide()
+            self._erase_origin = None
+            self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+            self.setCursor(QCursor(Qt.CursorShape.ArrowCursor))
+
+    def mousePressEvent(self, event):
+        gds_scene = self.scene()
+        if (getattr(gds_scene, "_erase_mode", False)
+                and event.button() == Qt.MouseButton.LeftButton):
+            self._erase_origin = self.mapToScene(event.pos())
+            self._erase_rect_item.set_rect(self._erase_origin, self._erase_origin)
+            event.accept()
+            return
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event):
         sp   = self.mapToScene(event.pos())
         um_x = px_to_um(sp.x())
         um_y = -px_to_um(sp.y())
         self.coord_changed.emit(um_x, um_y)
+
+        gds_scene = self.scene()
+        if (getattr(gds_scene, "_erase_mode", False)
+                and self._erase_origin is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            self._erase_rect_item.set_rect(self._erase_origin, sp)
+            event.accept()
+            return
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        gds_scene = self.scene()
+        if (getattr(gds_scene, "_erase_mode", False)
+                and event.button() == Qt.MouseButton.LeftButton
+                and self._erase_origin is not None):
+            end = self.mapToScene(event.pos())
+            rect = self._erase_rect_item.rect()
+            self._erase_rect_item.hide()
+            self._erase_origin = None
+            if rect.width() > 1 and rect.height() > 1:
+                gds_scene.erase_undercut_in_rect(rect)
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+    def wheelEvent(self, event):
+        factor = 1.15 if event.angleDelta().y() > 0 else 1 / 1.15
+        self._zoom *= factor
+        self._zoom  = max(0.05, min(self._zoom, 50.0))
+        self.scale(factor, factor)
 
     def zoom_fit(self):
         items = self.scene().items()
