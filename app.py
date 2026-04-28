@@ -741,25 +741,31 @@ class MainWindow(QMainWindow):
         if source is None:
             return
 
-        # Compute µm bounding box from the source's rendered polygons
+        # Compute µm bounding box from the source's rendered polygons.
+        # Exclude layer 11 (narrow-end slivers) from bbox calculation.
         polys = render_instance(source, self.cfg)
         if not polys:
             self._status.showMessage("Cannot compute bounding box — no geometry")
             return
 
-        all_xs = [x for _, pts in polys for x, _ in pts]
-        all_ys = [y for _, pts in polys for _, y in pts]
-        x0, x1 = min(all_xs), max(all_xs)
-        y0, y1 = min(all_ys), max(all_ys)
+        from component_model import compute_undercut_ring_polys, UNDERCUT_RING_LAYER, UNDERCUT_RING_THICKNESS
 
-        ring = ComponentInstance(
-            "undercut_ring",
-            x=(x0 + x1) / 2,
-            y=(y0 + y1) / 2,
+        all_xs = [x for layer, pts in polys if layer != 11 for x, _ in pts]
+        all_ys = [y for layer, pts in polys if layer != 11 for _, y in pts]
+        if not all_xs:
+            all_xs = [x for _, pts in polys for x, _ in pts]
+            all_ys = [y for _, pts in polys for _, y in pts]
+        cx = (min(all_xs) + max(all_xs)) / 2
+        cy = (min(all_ys) + max(all_ys)) / 2
+
+        # Compute the geometry-hugging offset ring as baked local-offset polys
+        ring_polys = compute_undercut_ring_polys(
+            polys, sides, UNDERCUT_RING_THICKNESS, UNDERCUT_RING_LAYER, cx, cy
         )
+
+        ring = ComponentInstance("undercut_ring", x=cx, y=cy)
         ring.params.update({
-            "bbox_x0": x0, "bbox_y0": y0,
-            "bbox_x1": x1, "bbox_y1": y1,
+            "ring_polys":  ring_polys,   # pre-baked LOCAL-offset shell polygons
             "side_top":    sides.get("top",    True),
             "side_bottom": sides.get("bottom", True),
             "side_left":   sides.get("left",   True),

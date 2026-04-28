@@ -303,9 +303,9 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         name="Undercut Ring",
         type_id="undercut_ring",
         params={
-            # Bounding box of the source object (µm, world coords)
-            "bbox_x0": 0.0, "bbox_y0": 0.0,
-            "bbox_x1": 4.0, "bbox_y1": 4.0,
+            # Bounding box as LOCAL offsets from the ring anchor (inst.x, inst.y)
+            "bbox_x0": -2.0, "bbox_y0": -2.0,
+            "bbox_x1":  2.0, "bbox_y1":  2.0,
             # Which of the 4 sides are present: top/bottom/left/right
             "side_top":    True,
             "side_bottom": True,
@@ -539,6 +539,93 @@ def _collect_polygons(parts: list) -> PolyData:
     return result
 
 
+def compute_undercut_ring_polys(
+    source_polys: PolyData,
+    sides: dict,
+    thickness: float,
+    layer: int,
+    cx: float,
+    cy: float,
+) -> list[tuple[int, list[tuple[float, float]]]]:
+    """
+    Compute a geometry-hugging undercut ring by:
+      1. Union all source polygons (excluding layer 11 slivers).
+      2. Offset outward by `thickness` µm using gdspy.offset().
+      3. Subtract the original union to get just the shell.
+      4. Optionally clip to only the requested sides (top/bottom/left/right)
+         by intersecting with a half-plane mask for each inactive side.
+      5. Return as LOCAL-offset PolyData (coords relative to cx, cy).
+
+    Parameters
+    ----------
+    source_polys : rendered polygons of the source component (world coords)
+    sides        : dict of side→bool from the undercut editor
+    thickness    : ring thickness in µm (UNDERCUT_RING_THICKNESS)
+    layer        : GDS layer for the ring
+    cx, cy       : world anchor of the ring instance (centroid of source bbox)
+    """
+    # Build gdspy polygon list, skipping layer-11 slivers
+    gds_polys = [
+        gdspy.Polygon(pts)
+        for lyr, pts in source_polys
+        if lyr != 11 and len(pts) >= 3
+    ]
+    if not gds_polys:
+        return []
+
+    # Union of source geometry
+    union = gdspy.boolean(gds_polys, None, "or", precision=1e-4)
+    if union is None:
+        return []
+
+    # Outward offset
+    expanded = gdspy.offset(union, thickness, join="round",
+                            tolerance=0.01, precision=1e-4)
+    if expanded is None:
+        return []
+
+    # Subtract original to get shell
+    shell = gdspy.boolean(expanded, union, "not", precision=1e-4)
+    if shell is None:
+        return []
+
+    # Clip inactive sides: build a large rectangular mask for each active
+    # side and intersect, then union the pieces. Simpler: subtract a mask
+    # rectangle for each *inactive* side.
+    all_xs = [x for _, pts in source_polys if _ != 11 for x, _ in pts]
+    all_ys = [y for _, pts in source_polys if _ != 11 for _, y in pts]
+    if not all_xs:
+        return []
+    x0, x1 = min(all_xs) - thickness * 2, max(all_xs) + thickness * 2
+    y0, y1 = min(all_ys) - thickness * 2, max(all_ys) + thickness * 2
+    src_x0, src_x1 = min(all_xs), max(all_xs)
+    src_y0, src_y1 = min(all_ys), max(all_ys)
+
+    inactive_masks = []
+    if not sides.get("top", True):
+        # Remove everything above src_y1
+        inactive_masks.append(gdspy.Rectangle((x0, src_y1), (x1, y1 + thickness)))
+    if not sides.get("bottom", True):
+        inactive_masks.append(gdspy.Rectangle((x0, y0 - thickness), (x1, src_y0)))
+    if not sides.get("left", True):
+        inactive_masks.append(gdspy.Rectangle((x0 - thickness, y0), (src_x0, y1)))
+    if not sides.get("right", True):
+        inactive_masks.append(gdspy.Rectangle((src_x1, y0), (x1 + thickness, y1)))
+
+    if inactive_masks:
+        shell = gdspy.boolean(shell, inactive_masks, "not", precision=1e-4)
+        if shell is None:
+            return []
+
+    # Collect result polygons and convert to LOCAL coords (relative to cx, cy)
+    result = []
+    polys_arr = shell.polygons if hasattr(shell, "polygons") else [shell.points]
+    for pts in polys_arr:
+        local_pts = [(float(px) - cx, float(py) - cy) for px, py in pts]
+        result.append((layer, local_pts))
+    return result
+
+
 def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     """
     Call the underlying gdspy functions for this instance and return
@@ -630,31 +717,15 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
             add_rect(parts, (x - hw, y - length), (x + hw, y), layer)
 
     elif inst.type_id == "undercut_ring":
-        # Build the four side rectangles of the ring.
-        # The ring sits *outside* the bbox by UNDERCUT_RING_THICKNESS.
-        # Corner overlaps are handled by making each side rectangle extend
-        # into the corner so the ring closes flush:
-        #   top / bottom  → full width including corners
-        #   left / right  → inner height only (no corner overlap)
-        x0 = inst.params.get("bbox_x0", 0.0)
-        y0 = inst.params.get("bbox_y0", 0.0)
-        x1 = inst.params.get("bbox_x1", 4.0)
-        y1 = inst.params.get("bbox_y1", 4.0)
-        t  = UNDERCUT_RING_THICKNESS
-        L  = UNDERCUT_RING_LAYER
-
-        if inst.params.get("side_top", True):
-            # top band: full width, sits above y1
-            add_rect(parts, (x0 - t, y1), (x1 + t, y1 + t), L)
-        if inst.params.get("side_bottom", True):
-            # bottom band: full width, sits below y0
-            add_rect(parts, (x0 - t, y0 - t), (x1 + t, y0), L)
-        if inst.params.get("side_left", True):
-            # left band: inner height only (between the two horizontal bands)
-            add_rect(parts, (x0 - t, y0), (x0, y1), L)
-        if inst.params.get("side_right", True):
-            # right band: inner height only
-            add_rect(parts, (x1, y0), (x1 + t, y1), L)
+        # ring_polys are stored as LOCAL offsets from anchor_x/anchor_y.
+        # Translate to current world position (inst.x, inst.y).
+        baked: list = inst.params.get("ring_polys", [])
+        if not baked:
+            return []
+        return [
+            (lyr, [(px + x, py + y) for px, py in pts])
+            for lyr, pts in baked
+        ]
 
     raw = _collect_polygons(parts)
 
