@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "id_counter": 1734,
+  "id_counter": 1773,
   "instances": [
     {
       "version": 1,
@@ -148,7 +148,7 @@
         "length": 6.1,
         "narrow_end": "start",
         "narrow_width": 0.2,
-        "narrow_undercut": false
+        "narrow_undercut": true
       },
       "connections": {}
     },
@@ -3396,7 +3396,7 @@
       "inst_id": 1734,
       "type_id": "undercut_ring",
       "x": 5.0,
-      "y": 9.700000000000003,
+      "y": 9.700000000000001,
       "rotation": 0,
       "params": {
         "bbox_x0": -2.0,
