@@ -23,10 +23,10 @@
       "type_id": "square_node",
       "x": -20.6,
       "y": 6.0,
-      "rotation": 180,
+      "rotation": 0,
       "params": {
-        "cap_style": "top",
-        "undercut_style": "right",
+        "cap_style": "side",
+        "undercut_style": "top",
         "square_x": 2.0,
         "square_y": 2.0
       },
