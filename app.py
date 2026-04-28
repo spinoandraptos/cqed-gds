@@ -179,8 +179,8 @@ class PropertiesPanel(QWidget):
         self._y_spin = QDoubleSpinBox()
         for sp in (self._x_spin, self._y_spin):
             sp.setRange(-10000, 10000)
-            sp.setSingleStep(0.5)
-            sp.setDecimals(2)
+            sp.setSingleStep(0.05)
+            sp.setDecimals(3)
             sp.setStyleSheet("font-size:11px;")
         self._x_spin.valueChanged.connect(self._on_x_changed)
         self._y_spin.valueChanged.connect(self._on_y_changed)
@@ -257,10 +257,9 @@ class PropertiesPanel(QWidget):
             )
         elif isinstance(val, float):
             w = QDoubleSpinBox()
-            w.setRange(0.001, 10000)
+            w.setRange(-10000, 10000)
             w.setDecimals(3)
-            # Use a finer step for sub-micron geometry params (widths, etc.)
-            w.setSingleStep(0.1 if key not in ("width", "narrow_width") else 0.05)
+            w.setSingleStep(0.1)
             w.setValue(val)
             w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
         elif isinstance(val, int):

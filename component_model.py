@@ -66,13 +66,66 @@ class ComponentType:
 
 
 def _make_square_ports(params: dict, cfg: Config) -> list[Port]:
+    """
+    Port positions match exactly how _build_three_square_chain (and the layout
+    code in general) attaches wire leads to the square.
+
+    The convention throughout the layout is: a WIRE_WIDTH-wide lead is placed
+    flush with one corner of the square, so its centreline sits at
+    ±(h − WIRE_WIDTH/2) perpendicular to the exit direction.
+
+    Which corner is used depends on cap_style / undercut_style:
+
+      cap_style="top",  undercut_style="right"  (sq1, sq3)
+        right edge  → lead exits +x, wire top-flush  → port at ( h,  h−W/2)
+        bottom edge → lead exits −y, wire left-flush  → port at (−h+W/2, −h)
+
+      cap_style="side", undercut_style="top"    (sq2)
+        top edge    → lead exits +y, wire right-flush → port at ( h−W/2,  h)
+        left edge   → lead exits −x, wire bottom-flush→ port at (−h, −(h−W/2))
+
+    Unused cardinal sides keep a centred port for potential future connections.
+    """
     h = cfg.SQUARE_SIZE / 2
-    return [
-        Port("top",    0,  h, "+y"),
-        Port("right",  h,  0, "+x"),
-        Port("bottom", 0, -h, "-y"),
-        Port("left",  -h,  0, "-x"),
-    ]
+    w = cfg.WIRE_WIDTH
+    # perpendicular offset: wire centreline is this far from the square centre
+    off = h - w / 2   # e.g. 1.0 − 0.15 = 0.85
+
+    cap_style      = params.get("cap_style",      "top")
+    undercut_style = params.get("undercut_style", "right")
+
+    if cap_style == "top" and undercut_style == "right":
+        # right lead: exits +x, top-flush
+        # bottom lead: exits -y, left-flush
+        return [
+            Port("right",  h,     off,  "+x"),
+            Port("bottom", -off, -h,    "-y"),
+            Port("top",    0,     h,    "+y"),   # centred fallback
+            Port("left",  -h,     0,    "-x"),   # centred fallback
+        ]
+    elif cap_style == "side" and undercut_style == "top":
+        # top lead: exits +y, right-flush
+        # left lead: exits -x, bottom-flush
+        return [
+            Port("top",    off,  h,    "+y"),
+            Port("left",  -h,   -off,  "-x"),
+            Port("right",  h,    0,    "+x"),   # centred fallback
+            Port("bottom", 0,   -h,    "-y"),   # centred fallback
+        ]
+    elif cap_style == "top" and undercut_style == "top":
+        return [
+            Port("top",    off,  h,    "+y"),
+            Port("bottom", 0,   -h,    "-y"),
+            Port("right",  h,    0,    "+x"),
+            Port("left",  -h,    0,    "-x"),
+        ]
+    else:  # cap_style="side", undercut_style="right"
+        return [
+            Port("right",  h,    off,  "+x"),
+            Port("left",  -h,    0,    "-x"),
+            Port("top",    0,    h,    "+y"),
+            Port("bottom", 0,   -h,    "-y"),
+        ]
 
 
 def _make_jj_ports(params: dict, cfg: Config) -> list[Port]:
@@ -149,11 +202,9 @@ def _make_branch_segment_ports(params: dict, cfg: Config) -> list[Port]:
 
 
 def _make_taper_segment_ports(params: dict, cfg: Config) -> list[Port]:
-    direction  = params.get("direction",    "+x")
-    length     = params.get("length",       10.0)
-    narrow_end = params.get("narrow_end",   "start")
-    # narrow_width only affects geometry width, not centreline position,
-    # so port (x, y) offsets are identical regardless of its value.
+    direction  = params.get("direction",  "+x")
+    length     = params.get("length",     10.0)
+    narrow_end = params.get("narrow_end", "start")
 
     ends = {"+x": (length, 0), "-x": (-length, 0),
             "+y": (0, length), "-y": (0, -length)}
@@ -210,9 +261,9 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
     "taper_segment": ComponentType(
         name="Taper segment",
         type_id="taper_segment",
-        params={"direction": "+x", "length": 6.1, "narrow_end": "start", "narrow_width": 0.3},
+        params={"direction": "+x", "length": 6.1, "narrow_end": "start"},
         port_defs=[],
-        description="Linear narrow↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
+        description="Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
     ),
     "branch_segment": ComponentType(
         name="Branch segment",
@@ -410,11 +461,9 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
 
     elif inst.type_id == "taper_segment":
         add_taper_segment(parts, (x, y),
-                          inst.params.get("direction",    "+x"),
-                          inst.params.get("length",       6.1),
-                          inst.params.get("narrow_end",   "start"),
-                          cfg,
-                          narrow_width=inst.params.get("narrow_width", cfg.WIRE_WIDTH))
+                          inst.params.get("direction",  "+x"),
+                          inst.params.get("length",     6.1),
+                          inst.params.get("narrow_end", "start"), cfg)
 
     elif inst.type_id == "branch_segment":
         add_branch_segment(parts, (x, y),
