@@ -79,10 +79,10 @@ def _make_jj_ports(params: dict, cfg: Config) -> list[Port]:
     s = cfg.JUNCTION_SQUARE_SIZE
     L = cfg.JUNCTION_LEAD_LENGTH
     return [
-        Port("lead_in",   0,            0,   "-x"),
-        Port("down_out",  L + s / 2,   -L,  "-y"),
-        Port("right_out", L + 2 * s + 0.9, 0, "+x"),
-        Port("top_out",   L + s / 2,    s + 0.9, "+y"),
+        Port("lead_in",   0,                  0,              "-x"),
+        Port("down_out",  L + s / 2,         -(s / 2 + L),   "-y"),  # bottom of down lead
+        Port("right_out", L + 2 * s + 0.9,   0,              "+x"),
+        Port("top_out",   L + s / 2,          s / 2 + s + 0.9, "+y"),  # top of CAP2
     ]
 
 
@@ -149,9 +149,11 @@ def _make_branch_segment_ports(params: dict, cfg: Config) -> list[Port]:
 
 
 def _make_taper_segment_ports(params: dict, cfg: Config) -> list[Port]:
-    direction  = params.get("direction",  "+x")
-    length     = params.get("length",     10.0)
-    narrow_end = params.get("narrow_end", "start")
+    direction  = params.get("direction",    "+x")
+    length     = params.get("length",       10.0)
+    narrow_end = params.get("narrow_end",   "start")
+    # narrow_width only affects geometry width, not centreline position,
+    # so port (x, y) offsets are identical regardless of its value.
 
     ends = {"+x": (length, 0), "-x": (-length, 0),
             "+y": (0, length), "-y": (0, -length)}
@@ -208,9 +210,9 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
     "taper_segment": ComponentType(
         name="Taper segment",
         type_id="taper_segment",
-        params={"direction": "+x", "length": 6.1, "narrow_end": "start"},
+        params={"direction": "+x", "length": 6.1, "narrow_end": "start", "narrow_width": 0.3},
         port_defs=[],
-        description="Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
+        description="Linear narrow↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
     ),
     "branch_segment": ComponentType(
         name="Branch segment",
@@ -408,9 +410,11 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
 
     elif inst.type_id == "taper_segment":
         add_taper_segment(parts, (x, y),
-                          inst.params.get("direction",  "+x"),
-                          inst.params.get("length",     6.1),
-                          inst.params.get("narrow_end", "start"), cfg)
+                          inst.params.get("direction",    "+x"),
+                          inst.params.get("length",       6.1),
+                          inst.params.get("narrow_end",   "start"),
+                          cfg,
+                          narrow_width=inst.params.get("narrow_width", cfg.WIRE_WIDTH))
 
     elif inst.type_id == "branch_segment":
         add_branch_segment(parts, (x, y),

@@ -179,13 +179,15 @@ def add_taper_segment(
     length: float,
     narrow_end: str,
     cfg: Config,
+    narrow_width: float | None = None,
 ) -> tuple[float, float]:
     """
-    Standalone linearly-tapered path segment (WIRE_WIDTH → TAPER_WIDTH, L1).
+    Standalone linearly-tapered path segment (narrow_width → TAPER_WIDTH, L1).
 
     This is the wedge shape used in the snake route and upper branch network
-    to transition from a narrow lead onto a full-width branch.  The narrow
-    end is always WIRE_WIDTH; the wide end is always TAPER_WIDTH.
+    to transition from a narrow lead onto a full-width branch.  The wide end
+    is always TAPER_WIDTH; the narrow end defaults to WIRE_WIDTH but can be
+    overridden via *narrow_width* (e.g. 0.2 µm for a JJ lead connection).
 
     The 1 µm slice at the narrow tip is automatically re-assigned to
     LAYER_NARROW_END (layer 11) via clip_narrow_end / clip_start_narrow_end,
@@ -193,12 +195,13 @@ def add_taper_segment(
 
     Parameters
     ----------
-    start      : (x, y) centreline of the entry end of the segment
-    direction  : '+x' | '-x' | '+y' | '-y' — direction of travel
-    length     : taper length in µm
-    narrow_end : 'start' — narrow at entry, widens toward exit
-                 'end'   — wide at entry, narrows toward exit
-                 (mirrors the two cases that appear in the real layout)
+    start        : (x, y) centreline of the entry end of the segment
+    direction    : '+x' | '-x' | '+y' | '-y' — direction of travel
+    length       : taper length in µm
+    narrow_end   : 'start' — narrow at entry, widens toward exit
+                   'end'   — wide at entry, narrows toward exit
+    narrow_width : override for the narrow-end width in µm.
+                   Defaults to cfg.WIRE_WIDTH when None.
 
     Returns
     -------
@@ -207,10 +210,12 @@ def add_taper_segment(
     if narrow_end not in ("start", "end"):
         raise ValueError(f"narrow_end must be 'start' or 'end'; got {narrow_end!r}")
 
+    nw = narrow_width if narrow_width is not None else cfg.WIRE_WIDTH
+
     if narrow_end == "start":
-        w0, w1 = cfg.WIRE_WIDTH, cfg.TAPER_WIDTH
+        w0, w1 = nw, cfg.TAPER_WIDTH
     else:
-        w0, w1 = cfg.TAPER_WIDTH, cfg.WIRE_WIDTH
+        w0, w1 = cfg.TAPER_WIDTH, nw
 
     path = gdspy.Path(w0, start)
     path.segment(length, direction, final_width=w1, layer=cfg.LAYER_BRANCH)

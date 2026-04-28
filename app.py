@@ -257,9 +257,10 @@ class PropertiesPanel(QWidget):
             )
         elif isinstance(val, float):
             w = QDoubleSpinBox()
-            w.setRange(-10000, 10000)
+            w.setRange(0.001, 10000)
             w.setDecimals(3)
-            w.setSingleStep(0.1)
+            # Use a finer step for sub-micron geometry params (widths, etc.)
+            w.setSingleStep(0.1 if key not in ("width", "narrow_width") else 0.05)
             w.setValue(val)
             w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
         elif isinstance(val, int):
