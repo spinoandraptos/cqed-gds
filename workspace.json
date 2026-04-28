@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "id_counter": 5,
+  "id_counter": 6,
   "instances": [
     {
       "version": 1,
@@ -51,22 +51,42 @@
       "version": 1,
       "inst_id": 4,
       "type_id": "manhattan_jj",
-      "x": -4.65,
-      "y": 19.450000000000003,
+      "x": 5.5,
+      "y": 17.5,
       "rotation": 0,
-      "params": {},
+      "params": {
+        "lead_width": 0.2,
+        "lead_length": 1.5
+      },
       "connections": {}
     },
     {
       "version": 1,
       "inst_id": 5,
       "type_id": "square_node",
-      "x": -2.9000000000000004,
-      "y": 15.15,
+      "x": -4.9,
+      "y": 14.15,
       "rotation": 0,
       "params": {
         "cap_style": "top",
-        "undercut_style": "right"
+        "undercut_style": "right",
+        "square_x": 2.0,
+        "square_y": 9.0,
+        "square_size": 9.0,
+        "wire_width": 0.3
+      },
+      "connections": {}
+    },
+    {
+      "version": 1,
+      "inst_id": 6,
+      "type_id": "manhattan_jj",
+      "x": -1.05,
+      "y": 16.2,
+      "rotation": 0,
+      "params": {
+        "lead_width": 0.9,
+        "lead_length": 1.9
       },
       "connections": {}
     }

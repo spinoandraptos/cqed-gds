@@ -91,51 +91,49 @@ def _make_square_ports(params: dict, cfg: Config) -> list[Port]:
 
     Unused cardinal sides keep a centred port for potential future connections.
     """
-    h = cfg.SQUARE_SIZE / 2
-    w = cfg.WIRE_WIDTH
-    # perpendicular offset: wire centreline is this far from the square centre
-    off = h - w / 2   # e.g. 1.0 − 0.15 = 0.85
+    # Respect per-instance dimensions
+    sx = params.get("square_x", cfg.SQUARE_SIZE)
+    sy = params.get("square_y", cfg.SQUARE_SIZE)
+    hx = sx / 2
+    hy = sy / 2
+    w  = cfg.WIRE_WIDTH
 
     cap_style      = params.get("cap_style",      "top")
     undercut_style = params.get("undercut_style", "right")
 
     if cap_style == "top" and undercut_style == "right":
-        # right lead: exits +x, top-flush
-        # bottom lead: exits -y, left-flush
         return [
-            Port("right",  h,     off,  "+x"),
-            Port("bottom", -off, -h,    "-y"),
-            Port("top",    0,     h,    "+y"),   # centred fallback
-            Port("left",  -h,     0,    "-x"),   # centred fallback
+            Port("right",   hx,          hy - w / 2,  "+x"),
+            Port("bottom", -hx + w / 2, -hy,          "-y"),
+            Port("top",     0,            hy,          "+y"),
+            Port("left",   -hx,           0,           "-x"),
         ]
     elif cap_style == "side" and undercut_style == "top":
-        # top lead: exits +y, right-flush
-        # left lead: exits -x, bottom-flush
         return [
-            Port("top",    off,  h,    "+y"),
-            Port("left",  -h,   -off,  "-x"),
-            Port("right",  h,    0,    "+x"),   # centred fallback
-            Port("bottom", 0,   -h,    "-y"),   # centred fallback
+            Port("top",    hx - w / 2,  hy,   "+y"),
+            Port("left",  -hx,         -hy + w / 2, "-x"),
+            Port("right",  hx,          0,    "+x"),
+            Port("bottom", 0,          -hy,   "-y"),
         ]
     elif cap_style == "top" and undercut_style == "top":
         return [
-            Port("top",    off,  h,    "+y"),
-            Port("bottom", 0,   -h,    "-y"),
-            Port("right",  h,    0,    "+x"),
-            Port("left",  -h,    0,    "-x"),
+            Port("top",    hx - w / 2,  hy,   "+y"),
+            Port("bottom", 0,           -hy,   "-y"),
+            Port("right",  hx,           0,    "+x"),
+            Port("left",  -hx,           0,    "-x"),
         ]
     else:  # cap_style="side", undercut_style="right"
         return [
-            Port("right",  h,    off,  "+x"),
-            Port("left",  -h,    0,    "-x"),
-            Port("top",    0,    h,    "+y"),
-            Port("bottom", 0,   -h,    "-y"),
+            Port("right",  hx,          hy - w / 2,  "+x"),
+            Port("left",  -hx,           0,           "-x"),
+            Port("top",    0,            hy,          "+y"),
+            Port("bottom", 0,           -hy,          "-y"),
         ]
 
 
 def _make_jj_ports(params: dict, cfg: Config) -> list[Port]:
-    s = cfg.JUNCTION_SQUARE_SIZE
-    L = cfg.JUNCTION_LEAD_LENGTH
+    s = params.get("lead_width",  cfg.JUNCTION_LEAD_WIDTH)   # square side = lead width
+    L = params.get("lead_length", cfg.JUNCTION_LEAD_LENGTH)
     return [
         Port("lead_in",   0,                  0,              "-x"),
         Port("down_out",  L + s / 2,         -(s / 2 + L),   "-y"),  # bottom of down lead
@@ -231,14 +229,23 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
     "square_node": ComponentType(
         name="Square node",
         type_id="square_node",
-        params={"cap_style": "top", "undercut_style": "right"},
+        params={
+            "cap_style": "top",
+            "undercut_style": "right",
+            "square_x": 2.0,   # µm — full width  (default = cfg.SQUARE_SIZE)
+            "square_y": 2.0,   # µm — full height (default = cfg.SQUARE_SIZE)
+        },
         port_defs=[],
         description="Bonding square with caps and L-undercut",
     ),
     "manhattan_jj": ComponentType(
         name="Manhattan JJ",
         type_id="manhattan_jj",
-        params={},
+        params={
+            # Per-instance overrides (None = use global Config value)
+            "lead_width":  0.2,   # µm — overrides Config.JUNCTION_LEAD_WIDTH
+            "lead_length": 1.5,   # µm — overrides Config.JUNCTION_LEAD_LENGTH
+        },
         port_defs=[],
         description="Manhattan-style Josephson junction stack",
     ),
@@ -701,6 +708,35 @@ def clip_undercut_ring_by_rect(
     return changed
 
 
+def _patched_cfg(cfg: Config, overrides: dict) -> Config:
+    """
+    Return a shallow copy of *cfg* with selected attributes replaced by values
+    from *overrides*.  Only keys that map to a known Config attribute and carry
+    a non-None value are applied.
+
+    Mapping from instance-param key → Config attribute name:
+        "square_size"  → SQUARE_SIZE
+        "wire_width"   → WIRE_WIDTH
+        "lead_width"   → JUNCTION_LEAD_WIDTH  (also sets JUNCTION_SQUARE_SIZE)
+        "lead_length"  → JUNCTION_LEAD_LENGTH
+    """
+    new_cfg = copy.copy(cfg)   # shallow copy — all scalars are independent
+    mapping = {
+        "square_size":  "SQUARE_SIZE",
+        "wire_width":   "WIRE_WIDTH",
+        "lead_width":   "JUNCTION_LEAD_WIDTH",
+        "lead_length":  "JUNCTION_LEAD_LENGTH",
+    }
+    for param_key, attr in mapping.items():
+        val = overrides.get(param_key)
+        if val is not None:
+            setattr(new_cfg, attr, float(val))
+    # JUNCTION_SQUARE_SIZE must equal JUNCTION_LEAD_WIDTH (it's the JJ square side)
+    if "lead_width" in overrides and overrides["lead_width"] is not None:
+        new_cfg.JUNCTION_SQUARE_SIZE = float(overrides["lead_width"])
+    return new_cfg
+
+
 def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     """
     Call the underlying gdspy functions for this instance and return
@@ -753,10 +789,14 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     if inst.type_id == "square_node":
         add_square_node(parts, x, y,
                         inst.params.get("cap_style", "top"),
-                        inst.params.get("undercut_style", "right"), cfg)
+                        inst.params.get("undercut_style", "right"), cfg,
+                        square_x=inst.params.get("square_x"),
+                        square_y=inst.params.get("square_y"))
 
     elif inst.type_id == "manhattan_jj":
-        add_manhattan_junction(parts, x, y, cfg)
+        # Apply per-instance lead_width / lead_length overrides
+        local_cfg = _patched_cfg(cfg, inst.params)
+        add_manhattan_junction(parts, x, y, local_cfg)
 
     elif inst.type_id == "taper_pad":
         add_taper_pad(parts, x, y,

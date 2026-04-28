@@ -30,22 +30,31 @@ def add_square_node(
     cap_style: str,
     undercut_style: str,
     cfg: Config,
+    square_x: float | None = None,
+    square_y: float | None = None,
 ) -> None:
     """
-    Place a bonding square with caps and undercut.
+    Place a bonding square (or rectangle) with caps and undercut.
 
     Parameters
     ----------
     cap_style      : 'top' | 'side'
     undercut_style : 'right' | 'top'
+    square_x       : full width  in µm (defaults to cfg.SQUARE_SIZE)
+    square_y       : full height in µm (defaults to cfg.SQUARE_SIZE)
     """
-    add_square(parts, cx, cy, cfg.SQUARE_SIZE, cfg.LAYER_BIYSK_JUNCTION)
+    sx = square_x if square_x is not None else cfg.SQUARE_SIZE
+    sy = square_y if square_y is not None else cfg.SQUARE_SIZE
+    hx, hy = sx / 2, sy / 2
+
+    # Draw the (possibly non-square) rectangle
+    add_rect(parts, (cx - hx, cy - hy), (cx + hx, cy + hy), cfg.LAYER_BIYSK_JUNCTION)
 
     cap_fn = {"top": add_top_caps, "side": add_side_caps}[cap_style]
-    cap_fn(parts, cx, cy, cfg)
+    cap_fn(parts, cx, cy, cfg, hx=hx, hy=hy)
 
     undercut_fn = {"right": add_L_undercut_right, "top": add_L_undercut_top}[undercut_style]
-    undercut_fn(parts, cx, cy, cfg)
+    undercut_fn(parts, cx, cy, cfg, hx=hx, hy=hy)
 
 
 # ── Manhattan Josephson junction ──────────────────────────────────────────────
@@ -86,14 +95,13 @@ def add_manhattan_junction(
     add_rect(parts, (x_sq, y_sq - s / 2), (x_sq + s, y_sq + s / 2), cfg.LAYER_JJ)
 
     # ── Right extensions ──────────────────────────────────────────────────
-    EXT1_H = 0.2   # height of first right extension
     EXT2_W = 0.1   # width of CAP1 strip
     EXT3_W = 0.8   # width of CAP2 wide bar
 
     add_rect(
         parts,
-        (x_sq + s,           y_sq - EXT1_H / 2),
-        (x_sq + 2 * s,       y_sq + EXT1_H / 2),
+        (x_sq + s,           y_sq - w / 2),
+        (x_sq + 2 * s,       y_sq + w / 2),
         cfg.LAYER_BIYSK_JUNCTION,
     )
     add_rect(
