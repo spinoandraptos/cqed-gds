@@ -37,6 +37,7 @@ from component_model import (
     ComponentInstance, COMPONENT_TYPES, LAYER_COLORS, LAYER_NAMES,
     export_to_gds, MergedInstance, merge_instances,
     UNDERCUT_RING_LAYER, UNDERCUT_RING_THICKNESS,
+    save_workspace, load_workspace,
 )
 from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
 
@@ -349,6 +350,10 @@ class DropCanvas(GDSView):
 # ── Main window ───────────────────────────────────────────────────────────────
 
 class MainWindow(QMainWindow):
+    # Default autosave location — same directory as this script
+    _AUTOSAVE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "workspace.json")
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("GDS Layout Editor")
@@ -362,6 +367,10 @@ class MainWindow(QMainWindow):
         self._build_ui()
         self._connect_signals()
         self._apply_dark_style()
+
+        # Auto-load last workspace if it exists
+        if os.path.isfile(self._AUTOSAVE_PATH):
+            self._load_workspace_from(self._AUTOSAVE_PATH, silent=True)
 
     # ── UI construction ───────────────────────────────────────────────────────
 
@@ -514,6 +523,21 @@ class MainWindow(QMainWindow):
         act_export = QAction("Export GDS…", self)
         act_export.triggered.connect(self._export_gds)
         tb.addAction(act_export)
+
+        tb.addSeparator()
+
+        act_save_ws = QAction("Save workspace  [Ctrl+S]", self)
+        act_save_ws.triggered.connect(self._save_workspace)
+        tb.addAction(act_save_ws)
+
+        act_load_ws = QAction("Load workspace…", self)
+        act_load_ws.triggered.connect(self._load_workspace_dialog)
+        tb.addAction(act_load_ws)
+
+        act_save_shortcut = QAction(self)
+        act_save_shortcut.setShortcut("Ctrl+S")
+        act_save_shortcut.triggered.connect(self._save_workspace)
+        self.addAction(act_save_shortcut)
 
         tb.addSeparator()
         snap_label = QLabel("  Snap (µm) ")
@@ -830,6 +854,66 @@ class MainWindow(QMainWindow):
             if self._selected_id in {i.inst_id for i in rotated}:
                 self._props.load(self._instances.get(self._selected_id))
 
+    # ── Workspace save / load ─────────────────────────────────────────────────
+
+    def _save_workspace(self):
+        """Save to the autosave path (next to the script), no dialog needed."""
+        instances = list(self._instances.values())
+        try:
+            save_workspace(instances, self._AUTOSAVE_PATH)
+            self._status.showMessage(
+                f"Workspace saved → {os.path.basename(self._AUTOSAVE_PATH)}"
+                f"  ({len(instances)} component{'s' if len(instances) != 1 else ''})"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "Save failed", str(e))
+
+    def _load_workspace_dialog(self):
+        """Let the user pick any .json workspace file to load."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Load Workspace", "", "Workspace files (*.json);;All files (*)"
+        )
+        if path:
+            self._load_workspace_from(path, silent=False)
+
+    def _load_workspace_from(self, path: str, silent: bool = False):
+        """
+        Clear the canvas and restore all instances from *path*.
+
+        Parameters
+        ----------
+        silent : if True, show the result only in the status bar (no dialog);
+                 used for the auto-load on startup.
+        """
+        try:
+            loaded = load_workspace(path)
+        except Exception as e:
+            if not silent:
+                QMessageBox.critical(self, "Load failed", str(e))
+            else:
+                self._status.showMessage(f"Auto-load failed: {e}")
+            return
+
+        # Clear existing canvas
+        for iid in list(self._instances.keys()):
+            self.scene.remove_component(iid)
+        self._instances.clear()
+        self._selected_id = None
+        self._props.load(None)
+
+        # Restore instances
+        for inst in loaded:
+            self._instances[inst.inst_id] = inst
+            self.scene.add_component(inst)
+
+        msg = (
+            f"Loaded {len(loaded)} component{'s' if len(loaded) != 1 else ''}"
+            f" from {os.path.basename(path)}"
+        )
+        self._status.showMessage(msg)
+        if not silent:
+            QMessageBox.information(self, "Workspace loaded", msg)
+
     # ── Export ────────────────────────────────────────────────────────────────
 
     def _export_gds(self):
@@ -931,3 +1015,12 @@ class MainWindow(QMainWindow):
                 color: #ccc;
             }
         """)
+
+    def closeEvent(self, event):
+        """Autosave workspace when the window is closed."""
+        if self._instances:
+            try:
+                save_workspace(list(self._instances.values()), self._AUTOSAVE_PATH)
+            except Exception:
+                pass   # never block closing due to a save error
+        event.accept()

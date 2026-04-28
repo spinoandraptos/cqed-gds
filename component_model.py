@@ -817,6 +817,99 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
     return _apply_rotation(raw)
 
 
+# ── Workspace serialization ───────────────────────────────────────────────────
+
+WORKSPACE_VERSION = 1
+
+
+def instance_to_dict(inst: ComponentInstance) -> dict:
+    """Serialise one ComponentInstance (or MergedInstance) to a plain dict."""
+    d: dict = {
+        "version":     WORKSPACE_VERSION,
+        "inst_id":     inst.inst_id,
+        "type_id":     inst.type_id,
+        "x":           inst.x,
+        "y":           inst.y,
+        "rotation":    inst.rotation,
+        "params":      copy.deepcopy(inst.params),
+        "connections": {k: list(v) for k, v in inst.connections.items()},
+    }
+    if isinstance(inst, MergedInstance):
+        d["_merged"]    = True
+        # _poly_data is list[(layer, [(x,y)…])] — fully JSON-serialisable
+        d["_poly_data"] = [
+            [layer, [[px, py] for px, py in pts]]
+            for layer, pts in inst._poly_data
+        ]
+    return d
+
+
+def instance_from_dict(d: dict) -> ComponentInstance:
+    """Deserialise a dict produced by instance_to_dict()."""
+    if d.get("_merged"):
+        poly_data: PolyData = [
+            (int(layer), [(float(px), float(py)) for px, py in pts])
+            for layer, pts in d["_poly_data"]
+        ]
+        inst = MergedInstance(
+            poly_data,
+            cx=d["x"],
+            cy=d["y"],
+            source_labels=[d["params"].get("source_labels", "")],
+        )
+    else:
+        inst = ComponentInstance(
+            type_id=d["type_id"],
+            x=d["x"],
+            y=d["y"],
+            params=d.get("params"),
+            rotation=d.get("rotation", 0),
+        )
+
+    # Restore the original inst_id so wire connections remain valid
+    inst.inst_id = d["inst_id"]
+
+    # Restore connections (stored as [other_id, other_port])
+    inst.connections = {
+        port: (int(other_id), other_port)
+        for port, (other_id, other_port) in d.get("connections", {}).items()
+    }
+    return inst
+
+
+def save_workspace(instances: list[ComponentInstance], filepath: str) -> None:
+    """Write all instances to a JSON workspace file."""
+    import json
+    payload = {
+        "version":    WORKSPACE_VERSION,
+        "id_counter": ComponentInstance._id_counter,
+        "instances":  [instance_to_dict(i) for i in instances],
+    }
+    with open(filepath, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2)
+
+
+def load_workspace(filepath: str) -> list[ComponentInstance]:
+    """
+    Read a JSON workspace file and return a list of ComponentInstances.
+    The global _id_counter is advanced past all loaded ids so new placements
+    never collide with restored ones.
+    """
+    import json
+    with open(filepath, "r", encoding="utf-8") as fh:
+        payload = json.load(fh)
+
+    instances = [instance_from_dict(d) for d in payload.get("instances", [])]
+
+    # Advance id counter so future instances don't reuse any loaded id
+    if instances:
+        max_id = max(i.inst_id for i in instances)
+        if max_id >= ComponentInstance._id_counter:
+            ComponentInstance._id_counter = max_id  # next __init__ will +1
+
+    return instances
+
+
 def export_to_gds(instances: list[ComponentInstance], cfg: Config,
                   filepath: str) -> None:
     """Render all instances and write a GDS file."""
