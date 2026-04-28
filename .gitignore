@@ -7,3 +7,9 @@ __pycache__/
 venv/
 env/
 .env/
+
+build/
+dist/
+
+workspace.json
+main.spec
