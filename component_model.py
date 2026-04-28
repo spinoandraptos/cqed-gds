@@ -579,21 +579,24 @@ def compute_undercut_ring_polys(
     layer        : GDS layer for the ring
     cx, cy       : world anchor of the ring instance (centroid of source bbox)
     """
-    # Build gdspy polygon list, skipping layer-11 slivers
+    # Build gdspy polygon list for the union used to compute the ring outline.
+    # Layer-11 slivers must be INCLUDED here so the outward offset wraps around
+    # the narrow tip — otherwise the ring contour stops at the L1 taper edge
+    # and leaves the L11 tip exposed outside the ring.
     gds_polys = [
         gdspy.Polygon(pts)
         for lyr, pts in source_polys
-        if lyr != 11 and len(pts) >= 3
+        if len(pts) >= 3
     ]
     if not gds_polys:
         return []
 
-    # Union of source geometry
+    # Union of ALL source geometry (including L11)
     union = gdspy.boolean(gds_polys, None, "or", precision=1e-4)
     if union is None:
         return []
 
-    # Outward offset
+    # Outward offset — now correctly encloses the L11 tip
     expanded = gdspy.offset(union, thickness, join="round",
                             tolerance=0.01, precision=1e-4)
     if expanded is None:
@@ -604,11 +607,10 @@ def compute_undercut_ring_polys(
     if shell is None:
         return []
 
-    # Clip inactive sides: build a large rectangular mask for each active
-    # side and intersect, then union the pieces. Simpler: subtract a mask
-    # rectangle for each *inactive* side.
-    all_xs = [x for _, pts in source_polys if _ != 11 for x, _ in pts]
-    all_ys = [y for _, pts in source_polys if _ != 11 for _, y in pts]
+    # Clip inactive sides — use bounding box of ALL polygons (including L11)
+    # so the side-clip masks are aligned with the true extent of the component.
+    all_xs = [x for _, pts in source_polys for x, _ in pts]
+    all_ys = [y for _, pts in source_polys for _, y in pts]
     if not all_xs:
         return []
     x0, x1 = min(all_xs) - thickness * 2, max(all_xs) + thickness * 2
