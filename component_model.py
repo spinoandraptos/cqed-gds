@@ -509,6 +509,24 @@ def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> Merged
     for inst in instances:
         all_polys.extend(render_instance(inst, cfg))
 
+    # ── Union polygons that share the same layer ──────────────────────────────
+    from collections import defaultdict
+    by_layer: dict[int, list] = defaultdict(list)
+    for layer, pts in all_polys:
+        if len(pts) >= 3:
+            by_layer[layer].append(gdspy.Polygon(pts))
+
+    merged_polys: PolyData = []
+    for layer, gds_list in by_layer.items():
+        union = gdspy.boolean(gds_list, None, "or", precision=1e-5, layer=layer)
+        if union is None:
+            continue
+        polys_arr = union.polygons if hasattr(union, "polygons") else [union.points]
+        for pts in polys_arr:
+            merged_polys.append((layer, [(float(px), float(py)) for px, py in pts]))
+
+    all_polys = merged_polys
+
     # Compute centroid of bounding box over all polygon vertices
     all_xs = [x for _, pts in all_polys for x, _ in pts]
     all_ys = [y for _, pts in all_polys for _, y in pts]
