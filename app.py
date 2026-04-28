@@ -1,0 +1,643 @@
+"""
+app.py — Main application window.
+
+Layout:
+  ┌──────────────────────────────────────────────────────┐
+  │  Toolbar (Select | Wire | Pan | Zoom fit | Export)   │
+  ├───────────────┬──────────────────┬────────────────────┤
+  │  Component    │                  │  Properties        │
+  │  palette      │   GDS Canvas     │  panel             │
+  │               │                  │                    │
+  │  Layer        │                  │  Connections       │
+  │  toggles      │                  │                    │
+  └───────────────┴──────────────────┴────────────────────┘
+  │  Status bar                                           │
+  └──────────────────────────────────────────────────────┘
+"""
+
+from __future__ import annotations
+import os
+from datetime import datetime
+
+from PyQt6.QtWidgets import (
+    QMainWindow, QWidget, QHBoxLayout, QVBoxLayout, QSplitter,
+    QToolBar, QLabel, QStatusBar, QScrollArea, QPushButton,
+    QGroupBox, QFormLayout, QLineEdit, QComboBox, QDoubleSpinBox,
+    QCheckBox, QFileDialog, QMessageBox, QFrame, QSizePolicy,
+    QSpinBox, QApplication,
+)
+from PyQt6.QtCore import Qt, QMimeData, QPointF, pyqtSignal, QSize
+from PyQt6.QtGui import (
+    QDrag, QAction, QColor, QPalette, QFont, QIcon,
+    QPixmap, QPainter, QBrush,
+)
+
+from config import Config
+from component_model import (
+    ComponentInstance, COMPONENT_TYPES, LAYER_COLORS, LAYER_NAMES,
+    export_to_gds,
+)
+from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
+
+
+# ── Palette card ──────────────────────────────────────────────────────────────
+
+class PaletteCard(QFrame):
+    """Draggable component card in the left palette."""
+
+    def __init__(self, type_id: str, parent=None):
+        super().__init__(parent)
+        ctype = COMPONENT_TYPES[type_id]
+        self.type_id = type_id
+
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setCursor(Qt.CursorShape.OpenHandCursor)
+        self.setToolTip(ctype.description)
+        self.setFixedHeight(54)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(8, 4, 8, 4)
+        lay.setSpacing(8)
+
+        # Colour swatch
+        swatch = QLabel()
+        swatch.setFixedSize(14, 14)
+        color = list(LAYER_COLORS.values())[list(COMPONENT_TYPES.keys()).index(type_id) % len(LAYER_COLORS)]
+        swatch.setStyleSheet(
+            f"background:{color}; border-radius:3px;"
+        )
+        lay.addWidget(swatch)
+
+        info = QVBoxLayout()
+        info.setSpacing(1)
+        name_lbl = QLabel(ctype.name)
+        name_lbl.setStyleSheet("font-weight:500; font-size:12px;")
+        desc_lbl = QLabel(ctype.description)
+        desc_lbl.setStyleSheet("color:#888; font-size:10px;")
+        desc_lbl.setWordWrap(True)
+        info.addWidget(name_lbl)
+        info.addWidget(desc_lbl)
+        lay.addLayout(info)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            drag = QDrag(self)
+            mime = QMimeData()
+            mime.setText(self.type_id)
+            drag.setMimeData(mime)
+
+            # Build a tiny pixmap for the drag ghost
+            pm = QPixmap(80, 30)
+            pm.fill(QColor(0, 0, 0, 0))
+            painter = QPainter(pm)
+            painter.setPen(QColor("#7F77DD"))
+            painter.drawText(pm.rect(), Qt.AlignmentFlag.AlignCenter,
+                             COMPONENT_TYPES[self.type_id].name)
+            painter.end()
+            drag.setPixmap(pm)
+            drag.exec(Qt.DropAction.CopyAction)
+
+
+# ── Left panel ────────────────────────────────────────────────────────────────
+
+class LeftPanel(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(195)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        # Components section
+        comp_label = QLabel("Components")
+        comp_label.setStyleSheet(
+            "font-size:10px; font-weight:500; color:#888; letter-spacing:0.05em;"
+        )
+        lay.addWidget(comp_label)
+
+        for type_id in COMPONENT_TYPES:
+            lay.addWidget(PaletteCard(type_id))
+
+        lay.addSpacing(10)
+
+        # Layer toggles
+        layer_label = QLabel("Layers")
+        layer_label.setStyleSheet(
+            "font-size:10px; font-weight:500; color:#888; letter-spacing:0.05em;"
+        )
+        lay.addWidget(layer_label)
+
+        self.layer_checks: dict[int, QCheckBox] = {}
+        for layer, name in LAYER_NAMES.items():
+            color = LAYER_COLORS.get(layer, "#888888")
+            row   = QWidget()
+            rl    = QHBoxLayout(row)
+            rl.setContentsMargins(2, 0, 2, 0)
+            rl.setSpacing(6)
+
+            swatch = QLabel()
+            swatch.setFixedSize(10, 10)
+            swatch.setStyleSheet(f"background:{color}; border-radius:2px;")
+            rl.addWidget(swatch)
+
+            cb = QCheckBox(f"{name}  L{layer}")
+            cb.setChecked(True)
+            cb.setStyleSheet("font-size:11px;")
+            self.layer_checks[layer] = cb
+            rl.addWidget(cb)
+            lay.addWidget(row)
+
+        lay.addStretch()
+
+
+# ── Properties panel ──────────────────────────────────────────────────────────
+
+class PropertiesPanel(QWidget):
+    param_changed = pyqtSignal(int, str, object)   # inst_id, key, value
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFixedWidth(195)
+        self._inst: ComponentInstance | None = None
+        self._editors: dict[str, QWidget] = {}
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(6)
+
+        # Title
+        self._title = QLabel("No selection")
+        self._title.setStyleSheet("font-size:12px; font-weight:500;")
+        lay.addWidget(self._title)
+
+        # Position
+        pos_box = QGroupBox("Position (µm)")
+        pos_box.setStyleSheet("QGroupBox{font-size:11px;}")
+        pf = QFormLayout(pos_box)
+        pf.setSpacing(4)
+        self._x_spin = QDoubleSpinBox()
+        self._y_spin = QDoubleSpinBox()
+        for sp in (self._x_spin, self._y_spin):
+            sp.setRange(-10000, 10000)
+            sp.setSingleStep(0.5)
+            sp.setDecimals(2)
+            sp.setStyleSheet("font-size:11px;")
+        self._x_spin.valueChanged.connect(self._on_x_changed)
+        self._y_spin.valueChanged.connect(self._on_y_changed)
+        pf.addRow("x", self._x_spin)
+        pf.addRow("y", self._y_spin)
+        lay.addWidget(pos_box)
+
+        # Parameters
+        self._params_box = QGroupBox("Parameters")
+        self._params_box.setStyleSheet("QGroupBox{font-size:11px;}")
+        self._params_layout = QFormLayout(self._params_box)
+        self._params_layout.setSpacing(4)
+        lay.addWidget(self._params_box)
+
+        # Connections
+        self._conn_box = QGroupBox("Connections")
+        self._conn_box.setStyleSheet("QGroupBox{font-size:11px;}")
+        self._conn_layout = QVBoxLayout(self._conn_box)
+        lay.addWidget(self._conn_box)
+
+        lay.addStretch()
+
+    def load(self, inst: ComponentInstance | None):
+        self._inst = inst
+        self._clear_params()
+        self._clear_conns()
+
+        if inst is None:
+            self._title.setText("No selection")
+            self._x_spin.setValue(0)
+            self._y_spin.setValue(0)
+            return
+
+        self._title.setText(inst.label)
+        self._x_spin.blockSignals(True)
+        self._y_spin.blockSignals(True)
+        self._x_spin.setValue(inst.x)
+        self._y_spin.setValue(inst.y)
+        self._x_spin.blockSignals(False)
+        self._y_spin.blockSignals(False)
+
+        # Parameter editors
+        for key, val in inst.params.items():
+            self._add_param_editor(inst, key, val)
+
+        # Connection display
+        if inst.connections:
+            for port_name, (other_id, other_port) in inst.connections.items():
+                lbl = QLabel(f"{port_name} → #{other_id}.{other_port}")
+                lbl.setStyleSheet("font-size:10px; color:#5DCAA5;")
+                self._conn_layout.addWidget(lbl)
+        else:
+            lbl = QLabel("No connections")
+            lbl.setStyleSheet("font-size:10px; color:#555;")
+            self._conn_layout.addWidget(lbl)
+
+    def _clear_params(self):
+        while self._params_layout.rowCount():
+            self._params_layout.removeRow(0)
+        self._editors.clear()
+
+    def _clear_conns(self):
+        while self._conn_layout.count():
+            item = self._conn_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+    def _add_param_editor(self, inst: ComponentInstance, key: str, val):
+        if isinstance(val, bool):
+            w = QCheckBox()
+            w.setChecked(val)
+            w.stateChanged.connect(
+                lambda state, k=key: self._emit(k, bool(state))
+            )
+        elif isinstance(val, float):
+            w = QDoubleSpinBox()
+            w.setRange(-10000, 10000)
+            w.setDecimals(3)
+            w.setSingleStep(0.1)
+            w.setValue(val)
+            w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
+        elif isinstance(val, int):
+            w = QSpinBox()
+            w.setRange(0, 99)
+            w.setValue(val)
+            w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
+        elif isinstance(val, str) and key in ("cap_style", "undercut_style",
+                                               "direction"):
+            w = QComboBox()
+            options = {
+                "cap_style":      ["top", "side"],
+                "undercut_style": ["right", "top"],
+                "direction":      ["+x", "-x", "+y", "-y"],
+            }.get(key, [val])
+            w.addItems(options)
+            w.setCurrentText(val)
+            w.currentTextChanged.connect(lambda v, k=key: self._emit(k, v))
+        else:
+            w = QLineEdit(str(val))
+            w.editingFinished.connect(
+                lambda k=key, ww=w: self._emit(k, ww.text())
+            )
+
+        w.setStyleSheet("font-size:11px;")
+        self._params_layout.addRow(key, w)
+        self._editors[key] = w
+
+    def _emit(self, key: str, val):
+        if self._inst:
+            self._inst.params[key] = val
+            self.param_changed.emit(self._inst.inst_id, key, val)
+
+    def _on_x_changed(self, v: float):
+        if self._inst:
+            self._inst.x = v
+            self.param_changed.emit(self._inst.inst_id, "_x", v)
+
+    def _on_y_changed(self, v: float):
+        if self._inst:
+            self._inst.y = v
+            self.param_changed.emit(self._inst.inst_id, "_y", v)
+
+
+# ── Drop-enabled canvas wrapper ───────────────────────────────────────────────
+
+class DropCanvas(GDSView):
+    component_dropped = pyqtSignal(str, float, float)  # type_id, x_um, y_um
+
+    def __init__(self, scene: GDSScene):
+        super().__init__(scene)
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event):
+        if event.mimeData().hasText():
+            event.acceptProposedAction()
+
+    def dragMoveEvent(self, event):
+        event.acceptProposedAction()
+
+    def dropEvent(self, event):
+        type_id = event.mimeData().text()
+        sp = self.mapToScene(event.position().toPoint())
+        um_x = snap(px_to_um(sp.x()),  SNAP_UM)
+        um_y = snap(-px_to_um(sp.y()), SNAP_UM)
+        self.component_dropped.emit(type_id, um_x, um_y)
+        event.acceptProposedAction()
+
+
+# ── Main window ───────────────────────────────────────────────────────────────
+
+class MainWindow(QMainWindow):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("GDS Layout Editor")
+        self.resize(1280, 780)
+
+        self.cfg = Config()
+        self._instances: dict[int, ComponentInstance] = {}
+        self._selected_id: int | None = None
+
+        self._build_ui()
+        self._connect_signals()
+        self._apply_dark_style()
+
+    # ── UI construction ───────────────────────────────────────────────────────
+
+    def _build_ui(self):
+        # Central widget
+        central = QWidget()
+        self.setCentralWidget(central)
+        root = QVBoxLayout(central)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Body
+        body = QHBoxLayout()
+        body.setContentsMargins(0, 0, 0, 0)
+        body.setSpacing(0)
+
+        # Left panel
+        self._left = LeftPanel()
+        body.addWidget(self._left)
+
+        # Separator
+        sep_l = QFrame()
+        sep_l.setFrameShape(QFrame.Shape.VLine)
+        sep_l.setStyleSheet("color:#2a2a2a;")
+        body.addWidget(sep_l)
+
+        # Canvas — must be created before toolbar (toolbar connects to view)
+        self.scene = GDSScene(self.cfg)
+        self.view  = DropCanvas(self.scene)
+        body.addWidget(self.view, stretch=1)
+
+        # Toolbar (built after self.view exists)
+        self._build_toolbar()
+
+        # Separator
+        sep_r = QFrame()
+        sep_r.setFrameShape(QFrame.Shape.VLine)
+        sep_r.setStyleSheet("color:#2a2a2a;")
+        body.addWidget(sep_r)
+
+        # Properties panel
+        self._props = PropertiesPanel()
+        body.addWidget(self._props)
+
+        root.addLayout(body, stretch=1)
+
+        # Status bar
+        self._status = QStatusBar()
+        self._status.setStyleSheet("font-size:11px; color:#888;")
+        self._coord_lbl = QLabel("x: —  y: —")
+        self._coord_lbl.setStyleSheet(
+            "font-family: monospace; font-size:11px; color:#555; padding-right:12px;"
+        )
+        self._status.addPermanentWidget(self._coord_lbl)
+        self.setStatusBar(self._status)
+        self._status.showMessage("Ready — drag a component onto the canvas")
+
+    def _build_toolbar(self):
+        tb = QToolBar("Main")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(16, 16))
+        tb.setStyleSheet(
+            "QToolBar{border:none; padding:2px 6px; spacing:4px;}"
+            "QToolButton{padding:4px 10px; border-radius:4px; font-size:12px;}"
+            "QToolButton:checked{background:#1c3a5a; color:#4fc3f7;}"
+            "QToolButton:hover{background:#1e1e1e;}"
+        )
+        self.addToolBar(tb)
+
+        self._act_select = QAction("Select", self, checkable=True, checked=True)
+        self._act_wire   = QAction("Wire", self, checkable=True)
+        self._act_pan    = QAction("Pan", self, checkable=True)
+        self._act_select.triggered.connect(lambda: self._set_tool("select"))
+        self._act_wire.triggered.connect(lambda:   self._set_tool("wire"))
+        self._act_pan.triggered.connect(lambda:    self._set_tool("pan"))
+
+        tb.addAction(self._act_select)
+        tb.addAction(self._act_wire)
+        tb.addAction(self._act_pan)
+        tb.addSeparator()
+
+        act_fit   = QAction("Zoom fit", self)
+        act_reset = QAction("Zoom 1:1", self)
+        act_fit.triggered.connect(self.view.zoom_fit)
+        act_reset.triggered.connect(self.view.zoom_reset)
+        tb.addAction(act_fit)
+        tb.addAction(act_reset)
+        tb.addSeparator()
+
+        act_delete = QAction("Delete sel.", self)
+        act_delete.triggered.connect(self._delete_selected)
+        tb.addAction(act_delete)
+        tb.addSeparator()
+
+        act_export = QAction("Export GDS…", self)
+        act_export.triggered.connect(self._export_gds)
+        tb.addAction(act_export)
+
+    def _connect_signals(self):
+        self.view.component_dropped.connect(self._on_drop)
+        self.view.coord_changed.connect(self._on_coord)
+        self.scene.component_moved.connect(self._on_component_moved)
+        self.scene.selection_changed_signal.connect(self._on_selection_changed)
+        self.scene.wire_connected.connect(self._on_wire_connected)
+        self.scene.status_message.connect(self._status.showMessage)
+        self._props.param_changed.connect(self._on_param_changed)
+
+        for layer, cb in self._left.layer_checks.items():
+            cb.toggled.connect(
+                lambda checked, l=layer: self.scene.set_layer_visible(l, checked)
+            )
+
+    # ── Tool switching ────────────────────────────────────────────────────────
+
+    def _set_tool(self, tool: str):
+        self._act_select.setChecked(tool == "select")
+        self._act_wire.setChecked(tool == "wire")
+        self._act_pan.setChecked(tool == "pan")
+        self.scene.set_wire_mode(tool == "wire")
+        self.view.set_pan_mode(tool == "pan")
+        for item in self.scene.all_instances():
+            pass  # items remain movable only in select mode
+        if tool == "select":
+            self._status.showMessage("Select tool — click to select, drag to move")
+        elif tool == "wire":
+            self._status.showMessage("Wire tool — click a port, then click destination port")
+        elif tool == "pan":
+            self._status.showMessage("Pan tool — drag to pan, scroll to zoom")
+
+    # ── Drop ─────────────────────────────────────────────────────────────────
+
+    def _on_drop(self, type_id: str, x: float, y: float):
+        inst = ComponentInstance(type_id, x, y)
+        self._instances[inst.inst_id] = inst
+        self.scene.add_component(inst)
+        self._status.showMessage(f"Placed {inst.label} at ({x:.2f}, {y:.2f}) µm")
+
+    # ── Coord display ─────────────────────────────────────────────────────────
+
+    def _on_coord(self, x: float, y: float):
+        self._coord_lbl.setText(f"x: {x:.2f}µm  y: {y:.2f}µm")
+
+    # ── Selection ────────────────────────────────────────────────────────────
+
+    def _on_selection_changed(self, inst_id: int):
+        self._selected_id = inst_id
+        inst = self._instances.get(inst_id)
+        self._props.load(inst)
+
+    def _on_component_moved(self, inst_id: int):
+        inst = self._instances.get(inst_id)
+        if inst and inst_id == self._selected_id:
+            self._props._x_spin.blockSignals(True)
+            self._props._y_spin.blockSignals(True)
+            self._props._x_spin.setValue(inst.x)
+            self._props._y_spin.setValue(inst.y)
+            self._props._x_spin.blockSignals(False)
+            self._props._y_spin.blockSignals(False)
+
+    def _on_wire_connected(self, id1: int, p1: str, id2: int, p2: str):
+        self._status.showMessage(
+            f"Connected #{id1}.{p1} → #{id2}.{p2}"
+        )
+        # Refresh properties if one of these is selected
+        if self._selected_id in (id1, id2):
+            self._props.load(self._instances.get(self._selected_id))
+
+    # ── Params ────────────────────────────────────────────────────────────────
+
+    def _on_param_changed(self, inst_id: int, key: str, val):
+        inst = self._instances.get(inst_id)
+        if inst is None:
+            return
+        if key == "_x":
+            inst.x = val
+        elif key == "_y":
+            inst.y = val
+        # Sync scene item position & rebuild polygons
+        item = self.scene._component_items.get(inst_id)
+        if item:
+            item.setPos(um_to_px(inst.x), -um_to_px(inst.y))
+            item._rebuild()
+
+    # ── Delete ────────────────────────────────────────────────────────────────
+
+    def _delete_selected(self):
+        for item in self.scene.selectedItems():
+            from canvas import ComponentItem
+            if isinstance(item, ComponentItem):
+                iid = item.inst.inst_id
+                self._instances.pop(iid, None)
+                self.scene.remove_component(iid)
+                if self._selected_id == iid:
+                    self._selected_id = None
+                    self._props.load(None)
+
+    # ── Export ────────────────────────────────────────────────────────────────
+
+    def _export_gds(self):
+        instances = list(self._instances.values())
+        if not instances:
+            QMessageBox.information(self, "Export", "Nothing to export.")
+            return
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        default   = f"layout_{timestamp}.gds"
+        path, _   = QFileDialog.getSaveFileName(
+            self, "Export GDS", default, "GDS files (*.gds)"
+        )
+        if not path:
+            return
+
+        try:
+            export_to_gds(instances, self.cfg, path)
+            self._status.showMessage(f"Exported → {os.path.basename(path)}")
+            QMessageBox.information(self, "Export", f"Saved:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export failed", str(e))
+
+    # ── Dark style ────────────────────────────────────────────────────────────
+
+    def _apply_dark_style(self):
+        self.setStyleSheet("""
+            QMainWindow, QWidget {
+                background: #141414;
+                color: #cccccc;
+            }
+            QGroupBox {
+                border: 0.5px solid #2e2e2e;
+                border-radius: 4px;
+                margin-top: 6px;
+                padding-top: 6px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 6px;
+                color: #777;
+            }
+            QDoubleSpinBox, QSpinBox, QLineEdit, QComboBox {
+                background: #1c1c1c;
+                border: 0.5px solid #2e2e2e;
+                border-radius: 3px;
+                padding: 2px 5px;
+                color: #ccc;
+                font-size: 11px;
+            }
+            QDoubleSpinBox:focus, QSpinBox:focus, QLineEdit:focus, QComboBox:focus {
+                border-color: #4fc3f7;
+            }
+            QCheckBox {
+                color: #aaa;
+            }
+            QCheckBox::indicator {
+                width: 12px;
+                height: 12px;
+                border: 0.5px solid #444;
+                border-radius: 2px;
+                background: #1c1c1c;
+            }
+            QCheckBox::indicator:checked {
+                background: #4fc3f7;
+                border-color: #4fc3f7;
+            }
+            QFrame[frameShape="5"] {
+                color: #222;
+                max-width: 1px;
+            }
+            QScrollBar:vertical {
+                background: #111;
+                width: 6px;
+            }
+            QScrollBar::handle:vertical {
+                background: #333;
+                border-radius: 3px;
+            }
+            QPushButton, QToolButton {
+                background: #1c1c1c;
+                border: 0.5px solid #2e2e2e;
+                border-radius: 4px;
+                color: #ccc;
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            QPushButton:hover, QToolButton:hover {
+                background: #252525;
+                border-color: #3a3a3a;
+            }
+            QStatusBar {
+                background: #0d0d0d;
+                border-top: 0.5px solid #222;
+                color: #555;
+                font-size: 11px;
+            }
+            QLabel {
+                color: #ccc;
+            }
+        """)
