@@ -11,7 +11,7 @@ from __future__ import annotations
 import gdspy
 
 from config import Config
-from primitives import add_rect, add_square, add_taper_pad, clip_narrow_end
+from primitives import add_rect, add_square, add_taper_pad, clip_narrow_end, clip_start_narrow_end
 from undercuts import (
     add_top_caps,
     add_side_caps,
@@ -170,6 +170,61 @@ def add_top_branch(
     parts.append(path)
 
     add_taper_pad(parts, path.x, path.y, "-x", cfg.LAYER_BRANCH, cfg)
+
+
+def add_taper_segment(
+    parts: list,
+    start: tuple[float, float],
+    direction: str,
+    length: float,
+    narrow_end: str,
+    cfg: Config,
+) -> tuple[float, float]:
+    """
+    Standalone linearly-tapered path segment (WIRE_WIDTH → TAPER_WIDTH, L1).
+
+    This is the wedge shape used in the snake route and upper branch network
+    to transition from a narrow lead onto a full-width branch.  The narrow
+    end is always WIRE_WIDTH; the wide end is always TAPER_WIDTH.
+
+    The 1 µm slice at the narrow tip is automatically re-assigned to
+    LAYER_NARROW_END (layer 11) via clip_narrow_end / clip_start_narrow_end,
+    matching the behaviour in layout.py.
+
+    Parameters
+    ----------
+    start      : (x, y) centreline of the entry end of the segment
+    direction  : '+x' | '-x' | '+y' | '-y' — direction of travel
+    length     : taper length in µm
+    narrow_end : 'start' — narrow at entry, widens toward exit
+                 'end'   — wide at entry, narrows toward exit
+                 (mirrors the two cases that appear in the real layout)
+
+    Returns
+    -------
+    (exit_x, exit_y) — centreline exit point
+    """
+    if narrow_end not in ("start", "end"):
+        raise ValueError(f"narrow_end must be 'start' or 'end'; got {narrow_end!r}")
+
+    if narrow_end == "start":
+        w0, w1 = cfg.WIRE_WIDTH, cfg.TAPER_WIDTH
+    else:
+        w0, w1 = cfg.TAPER_WIDTH, cfg.WIRE_WIDTH
+
+    path = gdspy.Path(w0, start)
+    path.segment(length, direction, final_width=w1, layer=cfg.LAYER_BRANCH)
+    parts.append(path)
+
+    if narrow_end == "start":
+        # Narrow tip is at the START — use the start-clip helper
+        clip_start_narrow_end(parts, direction, cfg.LAYER_BRANCH, cfg)
+    else:
+        # Narrow tip is at the END — use the standard end-clip helper
+        clip_narrow_end(parts, path, direction, cfg)
+
+    return path.x, path.y
+
 
 
 def add_branch_segment(

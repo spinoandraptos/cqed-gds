@@ -148,6 +148,27 @@ def _make_branch_segment_ports(params: dict, cfg: Config) -> list[Port]:
     ]
 
 
+def _make_taper_segment_ports(params: dict, cfg: Config) -> list[Port]:
+    direction  = params.get("direction",  "+x")
+    length     = params.get("length",     10.0)
+    narrow_end = params.get("narrow_end", "start")
+
+    ends = {"+x": (length, 0), "-x": (-length, 0),
+            "+y": (0, length), "-y": (0, -length)}
+    ex, ey = ends[direction]
+    opp = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+
+    if narrow_end == "start":
+        entry_label, exit_label = "narrow", "wide"
+    else:
+        entry_label, exit_label = "wide", "narrow"
+
+    return [
+        Port(entry_label, 0,  0,  opp[direction]),
+        Port(exit_label,  ex, ey, direction),
+    ]
+
+
 COMPONENT_TYPES: dict[str, ComponentType] = {
     "square_node": ComponentType(
         name="Square node",
@@ -183,6 +204,13 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         params={},
         port_defs=[],
         description="+y → left turn → -x path with taper pad",
+    ),
+    "taper_segment": ComponentType(
+        name="Taper segment",
+        type_id="taper_segment",
+        params={"direction": "+x", "length": 6.1, "narrow_end": "start"},
+        port_defs=[],
+        description="Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
     ),
     "branch_segment": ComponentType(
         name="Branch segment",
@@ -279,6 +307,8 @@ class ComponentInstance:
             raw = _make_jj_ports(self.params, cfg)
         elif self.type_id == "taper_pad":
             raw = _make_taper_ports(self.params, cfg)
+        elif self.type_id == "taper_segment":
+            raw = _make_taper_segment_ports(self.params, cfg)
         elif self.type_id == "branch_segment":
             raw = _make_branch_segment_ports(self.params, cfg)
         elif self.type_id == "turn":
@@ -351,7 +381,8 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
                            add_L_undercut_right, add_L_undercut_top)
     from components_lib import (add_square_node, add_manhattan_junction,
                                 add_top_branch, add_snake_right_branch,
-                                add_turn, add_branch_segment)
+                                add_turn, add_branch_segment,
+                                add_taper_segment)
 
     parts: list = []
     x, y = inst.x, inst.y
@@ -374,6 +405,12 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
 
     elif inst.type_id == "snake_route":
         add_snake_right_branch(parts, (x, y), cfg)
+
+    elif inst.type_id == "taper_segment":
+        add_taper_segment(parts, (x, y),
+                          inst.params.get("direction",  "+x"),
+                          inst.params.get("length",     6.1),
+                          inst.params.get("narrow_end", "start"), cfg)
 
     elif inst.type_id == "branch_segment":
         add_branch_segment(parts, (x, y),

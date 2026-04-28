@@ -276,6 +276,7 @@ class PropertiesPanel(QWidget):
                 "direction":      ["+x", "-x", "+y", "-y"],
                 "entry_dir":      ["+x", "-x", "+y", "-y"],
                 "turn_dir":       ["l", "r"],
+                "narrow_end":     ["start", "end"],
             }.get(key, [val])
             w.addItems(options)
             w.setCurrentText(val)

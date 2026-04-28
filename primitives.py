@@ -141,7 +141,7 @@ def _taper_slice_polygon(
     return np.array([n0, n1, cut1, cut0])
 
 
-def _expand_clip(pts: np.ndarray, narrow_end: str, eps: float = 1e-4) -> np.ndarray:
+def _expand_clip(pts: np.ndarray, narrow_end: str, eps: float = 0.01) -> np.ndarray:
     """
     Expand a trapezoidal clip polygon slightly outward so that floating-point
     imprecision doesn't leave a hairline layer-1 outline after boolean subtraction.
@@ -221,8 +221,50 @@ def clip_narrow_end(
     slice_pts = _expand_clip(slice_pts, narrow_end)
     clip_poly  = gdspy.Polygon(slice_pts)
 
-    remainder = gdspy.boolean(poly, clip_poly, "not", layer=src_layer)
-    sliver    = gdspy.boolean(poly, clip_poly, "and", layer=cfg.LAYER_NARROW_END)
+    remainder = gdspy.boolean(poly, clip_poly, "not", layer=src_layer, precision=1e-6)
+    sliver    = gdspy.boolean(poly, clip_poly, "and", layer=cfg.LAYER_NARROW_END,  precision=1e-6)
+
+    if remainder is not None:
+        parts.append(remainder)
+    if sliver is not None:
+        parts.append(sliver)
+
+
+def clip_start_narrow_end(
+    parts: list,
+    travel_direction: str,
+    src_layer: int,
+    cfg: Config,
+) -> None:
+    """
+    Reassign the 1 µm trapezoidal slice at the narrow (START) end of the
+    last polygon in *parts* to LAYER_NARROW_END (layer 11).
+
+    Use this when the taper widens as it travels — i.e. the path starts
+    narrow and expands — so the narrow tip is at the entry end (polygon
+    index 0), opposite to clip_narrow_end which handles end-narrow tapers.
+
+    The narrow_end direction is the OPPOSITE of travel_direction.
+
+    Parameters
+    ----------
+    travel_direction : '+x' | '-x' | '+y' | '-y' — direction taper travels
+    src_layer        : GDS layer the taper was placed on
+    cfg              : Config instance
+    """
+    opposite = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+    narrow_end = opposite[travel_direction]
+
+    poly = parts.pop()
+    # Start-narrow: the taper is the FIRST polygon (index 0) of the Path
+    taper_pts = poly.polygons[0] if hasattr(poly, "polygons") else poly.points
+
+    slice_pts = _taper_slice_polygon(taper_pts, narrow_end, cfg.NARROW_END_LENGTH)
+    slice_pts = _expand_clip(slice_pts, narrow_end)
+    clip_poly  = gdspy.Polygon(slice_pts)
+
+    remainder = gdspy.boolean(poly, clip_poly, "not", layer=src_layer,        precision=1e-6)
+    sliver    = gdspy.boolean(poly, clip_poly, "and", layer=cfg.LAYER_NARROW_END, precision=1e-6)
 
     if remainder is not None:
         parts.append(remainder)
