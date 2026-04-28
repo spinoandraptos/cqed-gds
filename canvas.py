@@ -21,6 +21,7 @@ from config import Config
 from component_model import (
     ComponentInstance, COMPONENT_TYPES, LAYER_COLORS,
     render_instance, Port,
+    UNDERCUT_RING_LAYER, UNDERCUT_RING_THICKNESS,
 )
 
 if TYPE_CHECKING:
@@ -195,8 +196,9 @@ class ComponentItem(QGraphicsItem):
             # Sync model position
             px = self.pos().x()
             py = self.pos().y()
-            self.inst.x = snap(px_to_um(px), SNAP_UM)
-            self.inst.y = snap(-px_to_um(py), SNAP_UM)
+            s = self._scene.snap_um
+            self.inst.x = snap(px_to_um(px), s)
+            self.inst.y = snap(-px_to_um(py), s)
             # Snap item to grid
             self.setPos(um_to_px(self.inst.x), -um_to_px(self.inst.y))
             self._scene.component_moved.emit(self.inst.inst_id)
@@ -222,6 +224,203 @@ class ComponentItem(QGraphicsItem):
                 best_dist = d
                 best = pi
         return best
+
+
+# ── Undercut ring editor overlay ──────────────────────────────────────────────
+
+# Colours for the interactive ring segments
+_RING_ACTIVE  = QColor("#C060FF")   # segment present (purple)
+_RING_DELETED = QColor("#444466")   # segment toggled off
+_RING_HOVER   = QColor("#E090FF")   # mouse-over highlight
+
+SIDE_NAMES = ("top", "bottom", "left", "right")
+
+
+class UnderCutSegmentItem(QGraphicsItem):
+    """
+    One clickable side-rectangle of the undercut ring.
+    Clicking toggles whether this segment is included.
+    """
+
+    def __init__(self, side: str, rect: QRectF, parent: "UnderCutEditItem"):
+        super().__init__(parent)
+        self.side    = side
+        self._rect   = rect
+        self._active = True
+        self._hovered = False
+        self.setAcceptHoverEvents(True)
+        self.setZValue(20)
+        self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+
+    def toggle(self):
+        self._active = not self._active
+        self.update()
+
+    @property
+    def active(self) -> bool:
+        return self._active
+
+    def boundingRect(self) -> QRectF:
+        return self._rect.adjusted(-2, -2, 2, 2)
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        if self._active:
+            base = _RING_HOVER if self._hovered else _RING_ACTIVE
+        else:
+            base = QColor("#666688") if self._hovered else _RING_DELETED
+
+        fill = QColor(base)
+        fill.setAlpha(160 if self._active else 60)
+        painter.setBrush(QBrush(fill))
+        pen_col = QColor(base)
+        pen_col.setAlpha(230)
+        painter.setPen(QPen(pen_col, 1.2))
+        painter.drawRect(self._rect)
+
+        # Label
+        painter.setPen(QPen(QColor(255, 255, 255, 180), 1))
+        font = QFont("monospace", 7)
+        painter.setFont(font)
+        painter.drawText(self._rect, Qt.AlignmentFlag.AlignCenter, self.side)
+
+    def hoverEnterEvent(self, event):
+        self._hovered = True
+        self.update()
+
+    def hoverLeaveEvent(self, event):
+        self._hovered = False
+        self.update()
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.toggle()
+            # Notify parent to update status
+            self.parentItem()._on_segment_clicked()
+        event.accept()
+
+
+class UnderCutEditItem(QGraphicsItem):
+    """
+    Temporary overlay placed over a component while the user selects
+    which ring segments to keep.  Contains four UnderCutSegmentItem
+    children (top/bottom/left/right) and a Confirm button.
+
+    When confirmed, emits a dict of side→bool via the callback passed in.
+    """
+
+    def __init__(
+        self,
+        bbox_px: QRectF,        # bounding box in scene pixels (outer edge of ring)
+        on_confirm,             # callable(sides: dict[str,bool])
+        on_cancel,              # callable()
+        scene: "GDSScene",
+    ):
+        super().__init__()
+        self._bbox   = bbox_px
+        self._on_confirm = on_confirm
+        self._on_cancel  = on_cancel
+        self._scene  = scene
+
+        t = UNDERCUT_RING_THICKNESS * PIXELS_PER_UM   # ring thickness in px
+
+        # Outer rect (ring outer edge)
+        ox0 = bbox_px.left()
+        oy0 = bbox_px.top()
+        ox1 = bbox_px.right()
+        oy1 = bbox_px.bottom()
+
+        # Four segment rects (same geometry as render_instance)
+        # Note: canvas y is flipped — top in µm = smaller scene-y
+        seg_rects = {
+            "top":    QRectF(ox0 - t, oy0 - t, (ox1 - ox0) + 2 * t, t),
+            "bottom": QRectF(ox0 - t, oy1,     (ox1 - ox0) + 2 * t, t),
+            "left":   QRectF(ox0 - t, oy0,     t, oy1 - oy0),
+            "right":  QRectF(ox1,     oy0,     t, oy1 - oy0),
+        }
+
+        self._segments: dict[str, UnderCutSegmentItem] = {}
+        for side, rect in seg_rects.items():
+            seg = UnderCutSegmentItem(side, rect, self)
+            self._segments[side] = seg
+
+        # Bounding rect covers everything including ring
+        self._bounding = QRectF(
+            ox0 - t - 4, oy0 - t - 4,
+            (ox1 - ox0) + 2 * t + 8,
+            (oy1 - oy0) + 2 * t + 8,
+        )
+
+        self.setZValue(15)
+        self._build_buttons()
+
+    def _build_buttons(self):
+        """Add Confirm / Cancel text labels as child items."""
+        cx = (self._bbox.left() + self._bbox.right()) / 2
+        # Place below the ring
+        t  = UNDERCUT_RING_THICKNESS * PIXELS_PER_UM
+        by = self._bbox.bottom() + t + 8
+
+        self._confirm_rect = QRectF(cx - 40, by, 78, 20)
+        self._cancel_rect  = QRectF(cx - 40, by + 24, 78, 20)
+
+        # Extend bounding to include buttons
+        self._bounding = self._bounding.united(
+            QRectF(cx - 42, by - 2, 82, 50)
+        )
+
+    def _on_segment_clicked(self):
+        active = sum(1 for s in self._segments.values() if s.active)
+        self._scene.status_message.emit(
+            f"Undercut ring: {active}/4 sides active — click Confirm or Cancel"
+        )
+        self.update()
+
+    def boundingRect(self) -> QRectF:
+        return self._bounding
+
+    def paint(self, painter: QPainter, option, widget=None):
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Dim overlay inside the ring bbox
+        dimmer = QColor(0, 0, 0, 60)
+        painter.setBrush(QBrush(dimmer))
+        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.drawRect(self._bbox)
+
+        # Dashed bbox outline
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.setPen(QPen(QColor("#C060FF"), 1.0, Qt.PenStyle.DashLine))
+        painter.drawRect(self._bbox)
+
+        # ── Confirm button ────────────────────────────────────────────────
+        painter.setBrush(QBrush(QColor("#1a3a1a")))
+        painter.setPen(QPen(QColor("#40bb40"), 1.2))
+        painter.drawRoundedRect(self._confirm_rect, 4, 4)
+        painter.setPen(QPen(QColor("#80ee80"), 1))
+        painter.setFont(QFont("sans-serif", 8, QFont.Weight.Bold))
+        painter.drawText(self._confirm_rect, Qt.AlignmentFlag.AlignCenter, "✓ Confirm")
+
+        # ── Cancel button ─────────────────────────────────────────────────
+        painter.setBrush(QBrush(QColor("#3a1a1a")))
+        painter.setPen(QPen(QColor("#bb4040"), 1.2))
+        painter.drawRoundedRect(self._cancel_rect, 4, 4)
+        painter.setPen(QPen(QColor("#ee8080"), 1))
+        painter.drawText(self._cancel_rect, Qt.AlignmentFlag.AlignCenter, "✕ Cancel")
+
+    def mousePressEvent(self, event):
+        pos = event.pos()
+        if self._confirm_rect.contains(pos):
+            sides = {side: seg.active for side, seg in self._segments.items()}
+            self._on_confirm(sides)
+            event.accept()
+            return
+        if self._cancel_rect.contains(pos):
+            self._on_cancel()
+            event.accept()
+            return
+        # Don't consume — let children handle segment clicks
+        super().mousePressEvent(event)
 
 
 # ── Wire item ─────────────────────────────────────────────────────────────────
@@ -266,11 +465,12 @@ class WireItem(QGraphicsItem):
 # ── Scene ─────────────────────────────────────────────────────────────────────
 
 class GDSScene(QGraphicsScene):
-    component_moved       = pyqtSignal(int)   # inst_id
+    component_moved          = pyqtSignal(int)   # inst_id
     selection_changed_signal = pyqtSignal(int)
-    wire_connected        = pyqtSignal(int, str, int, str)  # id,port,id,port
-    status_message        = pyqtSignal(str)
-    merge_requested       = pyqtSignal(list)  # list[int] of selected inst_ids
+    wire_connected           = pyqtSignal(int, str, int, str)
+    status_message           = pyqtSignal(str)
+    merge_requested          = pyqtSignal(list)  # list[int] of selected inst_ids
+    undercut_confirmed       = pyqtSignal(int, dict)  # source inst_id, sides dict
 
     def __init__(self, cfg: Config):
         super().__init__()
@@ -282,6 +482,13 @@ class GDSScene(QGraphicsScene):
         self._wire_mode   = False
         self._wire_start_port: PortItem | None = None
         self._wire_preview: QGraphicsLineItem | None = None
+
+        # Snap grid (µm) — adjustable at runtime
+        self.snap_um: float = SNAP_UM
+
+        # Undercut ring edit state
+        self._undercut_edit_item: UnderCutEditItem | None = None
+        self._undercut_source_id: int | None = None
 
         # Layer visibility
         self.layer_visible: dict[int, bool] = {l: True for l in LAYER_COLORS}
@@ -357,6 +564,72 @@ class GDSScene(QGraphicsScene):
         # Rebuild items with layer filter applied through opacity
         for item in self._component_items.values():
             item.update()
+
+    # ── Undercut ring editing ─────────────────────────────────────────────────
+
+    def begin_undercut_edit(self, inst_id: int) -> bool:
+        """
+        Start the interactive undercut-ring editor for the given component.
+        Returns False if the component isn't found or another edit is in progress.
+        """
+        if self._undercut_edit_item is not None:
+            self.status_message.emit(
+                "Finish or cancel the current undercut edit first"
+            )
+            return False
+
+        item = self._component_items.get(inst_id)
+        if item is None:
+            return False
+
+        # Compute scene-space bounding box of the component polygons
+        # (item.boundingRect() is in item-local coords; map to scene)
+        scene_rect = item.mapToScene(item.boundingRect()).boundingRect()
+
+        self._undercut_source_id = inst_id
+
+        edit = UnderCutEditItem(
+            bbox_px=scene_rect,
+            on_confirm=self._on_undercut_confirm,
+            on_cancel=self._on_undercut_cancel,
+            scene=self,
+        )
+        self.addItem(edit)
+        self._undercut_edit_item = edit
+
+        # Lock the source component so it can't be accidentally moved
+        item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+
+        active_count = 4
+        self.status_message.emit(
+            f"Undercut ring: {active_count}/4 sides active — "
+            "click segments to remove, then Confirm"
+        )
+        return True
+
+    def _on_undercut_confirm(self, sides: dict):
+        """Called by UnderCutEditItem when user clicks Confirm."""
+        src_id = self._undercut_source_id
+        self._finish_undercut_edit()
+        if src_id is not None:
+            self.undercut_confirmed.emit(src_id, sides)
+
+    def _on_undercut_cancel(self):
+        """Called by UnderCutEditItem when user clicks Cancel."""
+        self._finish_undercut_edit()
+        self.status_message.emit("Undercut ring cancelled")
+
+    def _finish_undercut_edit(self):
+        """Remove the overlay and restore movability of the source component."""
+        if self._undercut_edit_item is not None:
+            self.removeItem(self._undercut_edit_item)
+            self._undercut_edit_item = None
+
+        if self._undercut_source_id is not None:
+            item = self._component_items.get(self._undercut_source_id)
+            if item:
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+            self._undercut_source_id = None
 
     # ── Wire mode ─────────────────────────────────────────────────────────────
 
@@ -438,8 +711,11 @@ class GDSScene(QGraphicsScene):
 
     def keyPressEvent(self, event):
         if event.key() == Qt.Key.Key_Escape:
-            self._cancel_wire()
-            self.status_message.emit("Cancelled")
+            if self._undercut_edit_item is not None:
+                self._on_undercut_cancel()
+            else:
+                self._cancel_wire()
+                self.status_message.emit("Cancelled")
         elif event.key() == Qt.Key.Key_Delete:
             for item in self.selectedItems():
                 if isinstance(item, ComponentItem):

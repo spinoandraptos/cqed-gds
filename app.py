@@ -36,6 +36,7 @@ from config import Config
 from component_model import (
     ComponentInstance, COMPONENT_TYPES, LAYER_COLORS, LAYER_NAMES,
     export_to_gds, MergedInstance, merge_instances,
+    UNDERCUT_RING_LAYER, UNDERCUT_RING_THICKNESS,
 )
 from canvas import GDSScene, GDSView, um_to_px, px_to_um, snap, SNAP_UM
 
@@ -271,14 +272,17 @@ class PropertiesPanel(QWidget):
             w.setDecimals(3)
             w.setSingleStep(0.1)
             w.setValue(val)
-            w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
+            # Use editingFinished so rebuilds only fire when the user commits
+            # a value (Enter or focus-loss), not on every intermediate keystroke.
+            w.editingFinished.connect(lambda ww=w, k=key: self._emit(k, ww.value()))
         elif isinstance(val, int):
             w = QSpinBox()
             w.setRange(0, 99)
             w.setValue(val)
             w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
         elif isinstance(val, str) and key in ("cap_style", "undercut_style",
-                                               "direction"):
+                                               "direction", "narrow_end",
+                                               "entry_dir", "turn_dir"):
             w = QComboBox()
             options = {
                 "cap_style":      ["top", "side"],
@@ -336,8 +340,8 @@ class DropCanvas(GDSView):
     def dropEvent(self, event):
         type_id = event.mimeData().text()
         sp = self.mapToScene(event.position().toPoint())
-        um_x = snap(px_to_um(sp.x()),  SNAP_UM)
-        um_y = snap(-px_to_um(sp.y()), SNAP_UM)
+        um_x = snap(px_to_um(sp.x()),  self.scene().snap_um)
+        um_y = snap(-px_to_um(sp.y()), self.scene().snap_um)
         self.component_dropped.emit(type_id, um_x, um_y)
         event.acceptProposedAction()
 
@@ -468,6 +472,11 @@ class MainWindow(QMainWindow):
         act_merge_shortcut.triggered.connect(self._merge_selected)
         self.addAction(act_merge_shortcut)
 
+        act_undercut_shortcut = QAction(self)
+        act_undercut_shortcut.setShortcut("U")
+        act_undercut_shortcut.triggered.connect(self._add_undercut_ring)
+        self.addAction(act_undercut_shortcut)
+
         act_copy  = QAction("Copy  [Ctrl+C]", self)
         act_paste = QAction("Paste  [Ctrl+V]", self)
         act_copy.triggered.connect(self._copy_selected)
@@ -479,6 +488,11 @@ class MainWindow(QMainWindow):
         act_merge = QAction("Merge  [M]", self)
         act_merge.triggered.connect(self._merge_selected)
         tb.addAction(act_merge)
+        tb.addSeparator()
+
+        act_undercut = QAction("Undercut Ring  [U]", self)
+        act_undercut.triggered.connect(self._add_undercut_ring)
+        tb.addAction(act_undercut)
         tb.addSeparator()
 
         act_rot_cw  = QAction("Rotate CW  [R]", self)
@@ -493,6 +507,23 @@ class MainWindow(QMainWindow):
         act_export.triggered.connect(self._export_gds)
         tb.addAction(act_export)
 
+        tb.addSeparator()
+        snap_label = QLabel("  Snap (µm) ")
+        snap_label.setStyleSheet("font-size:11px; color:#888;")
+        tb.addWidget(snap_label)
+        self._snap_spin = QDoubleSpinBox()
+        self._snap_spin.setRange(0.001, 10.0)
+        self._snap_spin.setDecimals(3)
+        self._snap_spin.setSingleStep(0.05)
+        self._snap_spin.setValue(SNAP_UM)
+        self._snap_spin.setFixedWidth(72)
+        self._snap_spin.setStyleSheet(
+            "font-size:11px; background:#1c1c1c; border:0.5px solid #2e2e2e;"
+            " border-radius:3px; color:#ccc; padding:2px 4px;"
+        )
+        self._snap_spin.setToolTip("Snap grid resolution in µm")
+        tb.addWidget(self._snap_spin)
+
     def _connect_signals(self):
         self.view.component_dropped.connect(self._on_drop)
         self.view.coord_changed.connect(self._on_coord)
@@ -501,12 +532,19 @@ class MainWindow(QMainWindow):
         self.scene.wire_connected.connect(self._on_wire_connected)
         self.scene.status_message.connect(self._status.showMessage)
         self.scene.merge_requested.connect(self._on_merge_requested)
+        self.scene.undercut_confirmed.connect(self._on_undercut_confirmed)
         self._props.param_changed.connect(self._on_param_changed)
 
         for layer, cb in self._left.layer_checks.items():
             cb.toggled.connect(
                 lambda checked, l=layer: self.scene.set_layer_visible(l, checked)
             )
+
+        self._snap_spin.valueChanged.connect(self._on_snap_changed)
+
+    def _on_snap_changed(self, value: float):
+        self.scene.snap_um = value
+        self._status.showMessage(f"Snap grid set to {value:.3f} µm")
 
     # ── Tool switching ────────────────────────────────────────────────────────
 
@@ -668,6 +706,75 @@ class MainWindow(QMainWindow):
 
         self._status.showMessage(
             f"Merged {len(instances)} components → {merged.label}"
+        )
+
+    # ── Undercut ring ──────────────────────────────────────────────────────────
+
+    def _add_undercut_ring(self):
+        """
+        Begin the interactive undercut-ring editor for the selected component.
+        Must have exactly one component selected.
+        """
+        if self._selected_id is None:
+            self._status.showMessage(
+                "Select a component first, then click Undercut Ring  [U]"
+            )
+            return
+        inst = self._instances.get(self._selected_id)
+        if inst is None:
+            return
+        ok = self.scene.begin_undercut_edit(self._selected_id)
+        if ok:
+            self._status.showMessage(
+                f"Editing undercut ring for {inst.label} — "
+                "click segments to toggle, then Confirm or Cancel"
+            )
+
+    def _on_undercut_confirmed(self, source_id: int, sides: dict):
+        """
+        Called when the user confirms the ring.  Creates an undercut_ring
+        ComponentInstance whose bbox matches the source component's bounding box.
+        """
+        from component_model import render_instance
+
+        source = self._instances.get(source_id)
+        if source is None:
+            return
+
+        # Compute µm bounding box from the source's rendered polygons
+        polys = render_instance(source, self.cfg)
+        if not polys:
+            self._status.showMessage("Cannot compute bounding box — no geometry")
+            return
+
+        all_xs = [x for _, pts in polys for x, _ in pts]
+        all_ys = [y for _, pts in polys for _, y in pts]
+        x0, x1 = min(all_xs), max(all_xs)
+        y0, y1 = min(all_ys), max(all_ys)
+
+        ring = ComponentInstance(
+            "undercut_ring",
+            x=(x0 + x1) / 2,
+            y=(y0 + y1) / 2,
+        )
+        ring.params.update({
+            "bbox_x0": x0, "bbox_y0": y0,
+            "bbox_x1": x1, "bbox_y1": y1,
+            "side_top":    sides.get("top",    True),
+            "side_bottom": sides.get("bottom", True),
+            "side_left":   sides.get("left",   True),
+            "side_right":  sides.get("right",  True),
+        })
+
+        self._instances[ring.inst_id] = ring
+        self.scene.add_component(ring)
+        self.scene.select_component(ring.inst_id)
+        self._selected_id = ring.inst_id
+        self._props.load(ring)
+
+        active_sides = [s for s, v in sides.items() if v]
+        self._status.showMessage(
+            f"Undercut ring added — sides: {', '.join(active_sides) or 'none'}"
         )
 
     # ── Rotate ────────────────────────────────────────────────────────────────

@@ -26,6 +26,7 @@ from config import Config
 
 LAYER_COLORS: dict[int, str] = {
     1:  "#7F77DD",   # Branch
+    2:  "#C060FF",   # Undercut ring
     4:  "#F0997B",   # Cap1
     5:  "#5DCAA5",   # Biysk junction
     6:  "#EF9F27",   # Cap2
@@ -35,12 +36,16 @@ LAYER_COLORS: dict[int, str] = {
 
 LAYER_NAMES: dict[int, str] = {
     1: "Branch",
+    2: "Undercut ring",
     4: "Cap 1",
     5: "Biysk junc.",
     6: "Cap 2",
     10: "JJ",
     11: "Narrow end",
 }
+
+UNDERCUT_RING_LAYER     = 2
+UNDERCUT_RING_THICKNESS = 0.8   # µm
 
 
 # ── Port definition ───────────────────────────────────────────────────────────
@@ -261,7 +266,8 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
     "taper_segment": ComponentType(
         name="Taper segment",
         type_id="taper_segment",
-        params={"direction": "+x", "length": 6.1, "narrow_end": "start"},
+        params={"direction": "+x", "length": 6.1, "narrow_end": "start",
+                "narrow_width": 0.3},
         port_defs=[],
         description="Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with auto layer-11 narrow tip",
     ),
@@ -292,6 +298,22 @@ COMPONENT_TYPES: dict[str, ComponentType] = {
         params={},
         port_defs=[],
         description="A merged union of multiple components",
+    ),
+    "undercut_ring": ComponentType(
+        name="Undercut Ring",
+        type_id="undercut_ring",
+        params={
+            # Bounding box of the source object (µm, world coords)
+            "bbox_x0": 0.0, "bbox_y0": 0.0,
+            "bbox_x1": 4.0, "bbox_y1": 4.0,
+            # Which of the 4 sides are present: top/bottom/left/right
+            "side_top":    True,
+            "side_bottom": True,
+            "side_left":   True,
+            "side_right":  True,
+        },
+        port_defs=[],
+        description="0.8 µm ring outline around a component (sides deletable)",
     ),
 }
 
@@ -396,6 +418,17 @@ class ComponentInstance:
             Port(p.name, self.x + p.x, self.y + p.y, p.direction)
             for p in self.get_ports(cfg)
         ]
+
+    def clone(self, offset_x: float = 2.0, offset_y: float = -2.0) -> "ComponentInstance":
+        """Return a new ComponentInstance with the same type/params/rotation, offset by (offset_x, offset_y)."""
+        new = ComponentInstance(
+            self.type_id,
+            self.x + offset_x,
+            self.y + offset_y,
+            params=copy.deepcopy(self.params),
+            rotation=self.rotation,
+        )
+        return new
 
 
 # ── Merged group ──────────────────────────────────────────────────────────────
@@ -566,9 +599,10 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
 
     elif inst.type_id == "taper_segment":
         add_taper_segment(parts, (x, y),
-                          inst.params.get("direction",  "+x"),
-                          inst.params.get("length",     6.1),
-                          inst.params.get("narrow_end", "start"), cfg)
+                          inst.params.get("direction",    "+x"),
+                          inst.params.get("length",       6.1),
+                          inst.params.get("narrow_end",   "start"), cfg,
+                          narrow_width=inst.params.get("narrow_width", None))
 
     elif inst.type_id == "branch_segment":
         add_branch_segment(parts, (x, y),
@@ -594,6 +628,33 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
             add_rect(parts, (x - hw, y), (x + hw, y + length), layer)
         elif direction == "-y":
             add_rect(parts, (x - hw, y - length), (x + hw, y), layer)
+
+    elif inst.type_id == "undercut_ring":
+        # Build the four side rectangles of the ring.
+        # The ring sits *outside* the bbox by UNDERCUT_RING_THICKNESS.
+        # Corner overlaps are handled by making each side rectangle extend
+        # into the corner so the ring closes flush:
+        #   top / bottom  → full width including corners
+        #   left / right  → inner height only (no corner overlap)
+        x0 = inst.params.get("bbox_x0", 0.0)
+        y0 = inst.params.get("bbox_y0", 0.0)
+        x1 = inst.params.get("bbox_x1", 4.0)
+        y1 = inst.params.get("bbox_y1", 4.0)
+        t  = UNDERCUT_RING_THICKNESS
+        L  = UNDERCUT_RING_LAYER
+
+        if inst.params.get("side_top", True):
+            # top band: full width, sits above y1
+            add_rect(parts, (x0 - t, y1), (x1 + t, y1 + t), L)
+        if inst.params.get("side_bottom", True):
+            # bottom band: full width, sits below y0
+            add_rect(parts, (x0 - t, y0 - t), (x1 + t, y0), L)
+        if inst.params.get("side_left", True):
+            # left band: inner height only (between the two horizontal bands)
+            add_rect(parts, (x0 - t, y0), (x0, y1), L)
+        if inst.params.get("side_right", True):
+            # right band: inner height only
+            add_rect(parts, (x1, y0), (x1 + t, y1), L)
 
     raw = _collect_polygons(parts)
 

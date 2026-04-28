@@ -8,6 +8,7 @@ needed by callers (documented per function).
 
 from __future__ import annotations
 
+import math
 import gdspy
 
 from config import Config
@@ -221,12 +222,14 @@ def add_taper_segment(
     path.segment(length, direction, final_width=w1, layer=cfg.LAYER_BRANCH)
     parts.append(path)
 
-    if narrow_end == "start":
-        # Narrow tip is at the START — use the start-clip helper
-        clip_start_narrow_end(parts, direction, cfg.LAYER_BRANCH, cfg)
-    else:
-        # Narrow tip is at the END — use the standard end-clip helper
-        clip_narrow_end(parts, path, direction, cfg)
+    # Only clip when there is a genuine taper — if both widths are equal the
+    # polygon is a plain rectangle and _taper_slice_polygon cannot find distinct
+    # narrow/wide vertex pairs, causing an IndexError.
+    if not math.isclose(w0, w1):
+        if narrow_end == "start":
+            clip_start_narrow_end(parts, direction, cfg.LAYER_BRANCH, cfg)
+        else:
+            clip_narrow_end(parts, path, direction, cfg)
 
     return path.x, path.y
 
