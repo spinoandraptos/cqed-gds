@@ -212,6 +212,9 @@ class ComponentItem(QGraphicsItem):
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         self._scene.selection_changed_signal.emit(self.inst.inst_id)
+        # Signal that a drag may be starting so the app can snapshot undo state
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._scene.component_drag_started.emit(self.inst.inst_id)
 
     def nearest_port(self, scene_pos: QPointF) -> PortItem | None:
         """Return closest port within PORT_SNAP_UM, or None."""
@@ -494,6 +497,7 @@ class WireItem(QGraphicsItem):
 
 class GDSScene(QGraphicsScene):
     component_moved          = pyqtSignal(int)   # inst_id
+    component_drag_started   = pyqtSignal(int)   # inst_id — fired on press, before drag
     selection_changed_signal = pyqtSignal(int)
     wire_connected           = pyqtSignal(int, str, int, str)
     status_message           = pyqtSignal(str)

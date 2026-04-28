@@ -700,6 +700,8 @@ class MainWindow(QMainWindow):
         self._selected_id: int | None = None
         self._clipboard: ComponentInstance | None = None   # copy/paste buffer
         self._sweep_ids: set[int] = set()                  # inst_ids of sweep preview copies
+        self._undo_stack: list[list[dict]] = []            # serialised snapshots for Ctrl+Z
+        self._MAX_UNDO = 50
 
         self._build_ui()
         self._connect_signals()
@@ -892,6 +894,17 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        act_undo = QAction("Undo  [Ctrl+Z]", self)
+        act_undo.triggered.connect(self._undo)
+        tb.addAction(act_undo)
+
+        act_undo_shortcut = QAction(self)
+        act_undo_shortcut.setShortcut("Ctrl+Z")
+        act_undo_shortcut.triggered.connect(self._undo)
+        self.addAction(act_undo_shortcut)
+
+        tb.addSeparator()
+
         act_save_ws = QAction("Save workspace  [Ctrl+S]", self)
         act_save_ws.triggered.connect(self._save_workspace)
         tb.addAction(act_save_ws)
@@ -926,6 +939,7 @@ class MainWindow(QMainWindow):
         self.view.component_dropped.connect(self._on_drop)
         self.view.coord_changed.connect(self._on_coord)
         self.scene.component_moved.connect(self._on_component_moved)
+        self.scene.component_drag_started.connect(lambda _: self._push_undo())
         self.scene.selection_changed_signal.connect(self._on_selection_changed)
         self.scene.wire_connected.connect(self._on_wire_connected)
         self.scene.status_message.connect(self._status.showMessage)
@@ -944,6 +958,51 @@ class MainWindow(QMainWindow):
     def _on_snap_changed(self, value: float):
         self.scene.snap_um = value
         self._status.showMessage(f"Snap grid set to {value:.3f} µm")
+
+    # ── Undo ──────────────────────────────────────────────────────────────────
+
+    def _push_undo(self):
+        """Snapshot the current canvas state onto the undo stack."""
+        from component_model import instance_to_dict
+        snapshot = [instance_to_dict(inst) for inst in self._instances.values()]
+        self._undo_stack.append(snapshot)
+        if len(self._undo_stack) > self._MAX_UNDO:
+            self._undo_stack.pop(0)
+
+    def _undo(self):
+        """Restore the previous canvas state from the undo stack."""
+        if not self._undo_stack:
+            self._status.showMessage("Nothing to undo")
+            return
+        snapshot = self._undo_stack.pop()
+        self._restore_state(snapshot)
+        self._status.showMessage(
+            f"Undo — {len(self._undo_stack)} step(s) remaining"
+        )
+
+    def _restore_state(self, snapshot: list[dict]):
+        """
+        Rebuild the entire canvas from a serialised snapshot produced by
+        _push_undo().  Clears all current instances then re-adds them all.
+        """
+        from component_model import instance_from_dict
+
+        # Clear canvas
+        for iid in list(self._instances.keys()):
+            self.scene.remove_component(iid)
+        self._instances.clear()
+        self._sweep_ids.clear()
+        self._selected_id = None
+        self._props.load(None)
+
+        # Restore instances in original order
+        for d in snapshot:
+            inst = instance_from_dict(d)
+            self._instances[inst.inst_id] = inst
+            self.scene.add_component(inst)
+            # Re-tag sweep copies
+            if inst.params.get("_sweep_copy"):
+                self._sweep_ids.add(inst.inst_id)
 
     # ── Tool switching ────────────────────────────────────────────────────────
 
@@ -971,6 +1030,7 @@ class MainWindow(QMainWindow):
     # ── Drop ─────────────────────────────────────────────────────────────────
 
     def _on_drop(self, type_id: str, x: float, y: float):
+        self._push_undo()
         inst = ComponentInstance(type_id, x, y)
         self._instances[inst.inst_id] = inst
         self.scene.add_component(inst)
@@ -1039,6 +1099,9 @@ class MainWindow(QMainWindow):
         inst = self._instances.get(inst_id)
         if inst is None:
             return
+        # Push undo for all param edits except position (covered by drag)
+        if key not in ("_x", "_y"):
+            self._push_undo()
         if key == "_x":
             inst.x = val
         elif key == "_y":
@@ -1077,6 +1140,9 @@ class MainWindow(QMainWindow):
         for item in self.scene.selectedItems():
             if isinstance(item, ComponentItem):
                 to_delete.append(item.inst.inst_id)
+        if not to_delete:
+            return
+        self._push_undo()
 
         for iid in to_delete:
             # Also collect any undercut rings linked to this component
@@ -1117,6 +1183,7 @@ class MainWindow(QMainWindow):
         if self._clipboard is None:
             self._status.showMessage("Clipboard is empty — copy a component first")
             return
+        self._push_undo()
         new_inst = self._clipboard.clone(offset_x=2.0, offset_y=-2.0)
         self._instances[new_inst.inst_id] = new_inst
         self.scene.add_component(new_inst)
@@ -1161,6 +1228,8 @@ class MainWindow(QMainWindow):
             self._status.showMessage(f"Merge failed: {e}")
             return
 
+        self._push_undo()
+
         # Remove originals
         for iid in inst_ids:
             self._instances.pop(iid, None)
@@ -1198,6 +1267,8 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "Cannot unmerge", str(e))
             return
+
+        self._push_undo()
 
         # Remove the merged group
         self._instances.pop(self._selected_id, None)
@@ -1267,6 +1338,7 @@ class MainWindow(QMainWindow):
             polys, sides, UNDERCUT_RING_THICKNESS, UNDERCUT_RING_LAYER, cx, cy
         )
 
+        self._push_undo()
         ring = ComponentInstance("undercut_ring", x=cx, y=cy)
         ring.params.update({
             "ring_polys":     ring_polys,   # pre-baked LOCAL-offset shell polygons
@@ -1294,6 +1366,7 @@ class MainWindow(QMainWindow):
 
     def _on_erase_applied(self, inst_id: int):
         """Refresh properties panel if the erased ring is currently selected."""
+        self._push_undo()
         if self._selected_id == inst_id:
             self._props.load(self._instances.get(inst_id))
 
