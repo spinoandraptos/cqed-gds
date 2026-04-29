@@ -445,130 +445,98 @@ class ComponentInstance:
 
 class MergedInstance(ComponentInstance):
     """
-    A ComponentInstance whose geometry is pre-baked polygon data rather than
-    a parametric type.  Created by merge_instances(); rendered by returning
-    self._poly_data directly without calling the gdspy builders.
+    A group of ComponentInstances whose geometry is unified for display
+    (polygons on the same layer are boolean-unioned) but whose children
+    remain fully live and parametric.
 
-    The anchor (x, y) is set to the centroid of the bounding box of all
-    merged polygons so that the Properties panel shows a meaningful position
-    and the item can still be moved / rotated like any other component.
+    Editing a child param (e.g. narrow_width on a taper_segment) immediately
+    reflects in the next render because render_instance() re-derives geometry
+    from all children on every call — there is no baked polygon cache.
+
+    The anchor (x, y) is the centroid of the combined bounding box used only
+    for moving the group; each child stores its own absolute world coordinates.
     """
 
-    def __init__(self, poly_data: "PolyData", cx: float, cy: float,
-                 source_labels: list[str]):
-        # Bypass normal ComponentInstance.__init__ param handling — we don't
-        # want it looking up "merged_group" in COMPONENT_TYPES for params.
+    def __init__(self, children: "list[ComponentInstance]", cx: float, cy: float):
         ComponentInstance._id_counter += 1
-        self.inst_id   = ComponentInstance._id_counter
-        self.type_id   = "merged_group"
-        self.x         = cx
-        self.y         = cy
-        self.rotation  = 0
-        self.params: dict = {"source_labels": ", ".join(source_labels)}
+        self.inst_id    = ComponentInstance._id_counter
+        self.type_id    = "merged_group"
+        self.x          = cx
+        self.y          = cy
+        self.rotation   = 0
+        self.params: dict = {}
         self.connections: dict = {}
-        self._poly_data: PolyData = poly_data
+        self.children: list[ComponentInstance] = children
+        # Keep _poly_data as empty list so legacy code paths don't crash
+        self._poly_data: "PolyData" = []
 
     @property
     def label(self) -> str:  # type: ignore[override]
-        n = len(self._poly_data)
-        return f"Merged Group #{self.inst_id} ({n} polygons)"
+        return f"Merged Group #{self.inst_id} ({len(self.children)} components)"
 
     def get_ports(self, cfg: "Config") -> list:  # type: ignore[override]
-        return []
+        # Expose all children's ports so wire connections still work
+        ports = []
+        for child in self.children:
+            ports.extend(child.get_ports(cfg))
+        return ports
 
     def clone(self, offset_x: float = 2.0, offset_y: float = -2.0) -> "MergedInstance":
         import copy as _copy
-        new = MergedInstance(
-            _copy.deepcopy(self._poly_data),
-            self.x + offset_x,
-            self.y + offset_y,
-            [self.params.get("source_labels", "")],
-        )
-        return new
+        cloned = [_copy.deepcopy(c) for c in self.children]
+        for c in cloned:
+            c.x += offset_x
+            c.y += offset_y
+            ComponentInstance._id_counter += 1
+            c.inst_id = ComponentInstance._id_counter
+        return MergedInstance(cloned, self.x + offset_x, self.y + offset_y)
 
 
 def merge_instances(instances: list[ComponentInstance], cfg: "Config") -> MergedInstance:
     """
-    Render each instance, collect all their polygons, and return a single
-    MergedInstance whose anchor sits at the centroid of the combined bounding box.
+    Group instances into a MergedInstance that keeps children live.
 
-    The polygon coordinates are kept in world space so that the MergedInstance
-    can be moved: render_instance() detects MergedInstance and returns
-    _poly_data unchanged (the canvas subtracts the anchor itself).
+    The children's params remain fully editable — geometry is re-derived from
+    them on every render call, so parameter changes are immediately reflected
+    in the unified display without any rebake step.
 
     Parameters
     ----------
     instances : two or more ComponentInstance objects to merge
-    cfg       : Config passed to render_instance for each source instance
+    cfg       : Config (used only to compute the initial bounding-box centroid)
 
     Returns
     -------
-    MergedInstance with all source polygons baked in
+    MergedInstance wrapping the live children
     """
     if len(instances) < 2:
         raise ValueError("Need at least 2 components to merge")
 
+    # Compute centroid from current rendered geometry so the anchor is sane
     all_polys: PolyData = []
     for inst in instances:
         all_polys.extend(render_instance(inst, cfg))
 
-    # ── Union polygons that share the same layer ──────────────────────────────
-    from collections import defaultdict
-    by_layer: dict[int, list] = defaultdict(list)
-    for layer, pts in all_polys:
-        if len(pts) >= 3:
-            by_layer[layer].append(gdspy.Polygon(pts))
-
-    merged_polys: PolyData = []
-    for layer, gds_list in by_layer.items():
-        union = gdspy.boolean(gds_list, None, "or", precision=1e-5, layer=layer)
-        if union is None:
-            continue
-        polys_arr = union.polygons if hasattr(union, "polygons") else [union.points]
-        for pts in polys_arr:
-            merged_polys.append((layer, [(float(px), float(py)) for px, py in pts]))
-
-    all_polys = merged_polys
-
-    # Compute centroid of bounding box over all polygon vertices
     all_xs = [x for _, pts in all_polys for x, _ in pts]
     all_ys = [y for _, pts in all_polys for _, y in pts]
-    cx = (min(all_xs) + max(all_xs)) / 2
-    cy = (min(all_ys) + max(all_ys)) / 2
-
-    labels = [inst.label for inst in instances]
-
-    # Serialise source instances so unmerge can reconstruct them exactly,
-    # including after save/load (instance_to_dict is JSON-safe).
-    source_dicts = [instance_to_dict(inst) for inst in instances]
-
-    # Store polygons as LOCAL coords (relative to centroid) so that:
-    # - moving just adds (dx, dy) to each point via inst.x / inst.y
-    # - rotation pivots cleanly around the anchor in render_instance
-    local_polys: PolyData = [
-        (layer, [(px - cx, py - cy) for px, py in pts])
-        for layer, pts in all_polys
-    ]
-    mi = MergedInstance(local_polys, cx, cy, labels)
-    mi.params["_source_instances"] = source_dicts
-    return mi
+    # NEW:
+    return MergedInstance(list(instances), 0.0, 0.0)
 
 
 def unmerge_instance(merged: MergedInstance) -> list[ComponentInstance]:
     """
-    Reconstruct the original ComponentInstances from a MergedInstance.
+    Return the live child ComponentInstances from a MergedInstance.
 
-    Returns the list of restored instances, or raises ValueError if the
-    merged group has no stored source data (e.g. was merged before this
-    feature was added).
+    Because children are stored live (not serialised), unmerge always works —
+    the instances returned are the exact same objects that were merged, with
+    all their current param values intact.
     """
-    source_dicts = merged.params.get("_source_instances")
-    if not source_dicts:
+    if not hasattr(merged, "children") or not merged.children:
         raise ValueError(
-            "This merged group has no stored source data and cannot be unmerged.\n"
-            "Only groups created after the unmerge feature was added can be split."
+            "This merged group has no child instances and cannot be unmerged.\n"
+            "It may have been created by an older version of the software."
         )
-    return [instance_from_dict(d) for d in source_dicts]
+    return list(merged.children)
 
 
 
@@ -814,16 +782,25 @@ def render_instance(inst: ComponentInstance, cfg: Config) -> PolyData:
             rotated.append((layer, new_pts))
         return rotated
 
-    # MergedInstance carries pre-baked LOCAL-space polygons (relative to centroid).
+    # MergedInstance: render each live child, union by layer, return world-space polys.
     if isinstance(inst, MergedInstance):
-        if not inst._poly_data:
+        if not inst.children:
             return []
-        # Translate from local → world, then apply rotation
-        world = [
-            (layer, [(lx + x, ly + y) for lx, ly in pts])
-            for layer, pts in inst._poly_data
-        ]
-        return _apply_rotation(world)
+        from collections import defaultdict
+        by_layer: dict[int, list] = defaultdict(list)
+        for child in inst.children:
+            for layer, pts in render_instance(child, cfg):
+                if len(pts) >= 3:
+                    by_layer[layer].append(gdspy.Polygon(pts))
+        result: PolyData = []
+        for layer, gds_list in by_layer.items():
+            union = gdspy.boolean(gds_list, None, "or", precision=1e-5, layer=layer)
+            if union is None:
+                continue
+            polys_arr = union.polygons if hasattr(union, "polygons") else [union.points]
+            for pts in polys_arr:
+                result.append((layer, [(float(px), float(py)) for px, py in pts]))
+        return result
 
     from primitives import add_rect, add_square, add_taper_pad, smooth_taper
     from undercuts import (add_top_caps, add_side_caps,
@@ -1001,28 +978,22 @@ def instance_to_dict(inst: ComponentInstance) -> dict:
         "connections": {k: list(v) for k, v in inst.connections.items()},
     }
     if isinstance(inst, MergedInstance):
-        d["_merged"]    = True
-        # _poly_data is list[(layer, [(x,y)…])] — fully JSON-serialisable
-        d["_poly_data"] = [
-            [layer, [[px, py] for px, py in pts]]
-            for layer, pts in inst._poly_data
-        ]
+        d["_merged"] = True
+        # Serialise each live child so save/load round-trips correctly
+        d["_children"] = [instance_to_dict(c) for c in inst.children]
     return d
 
 
 def instance_from_dict(d: dict) -> ComponentInstance:
     """Deserialise a dict produced by instance_to_dict()."""
     if d.get("_merged"):
-        poly_data: PolyData = [
-            (int(layer), [(float(px), float(py)) for px, py in pts])
-            for layer, pts in d["_poly_data"]
-        ]
-        inst = MergedInstance(
-            poly_data,
-            cx=d["x"],
-            cy=d["y"],
-            source_labels=[d["params"].get("source_labels", "")],
-        )
+        # Restore live children, then wrap in a MergedInstance
+        children = [instance_from_dict(c) for c in d.get("_children", [])]
+        if not children and d.get("_poly_data"):
+            # Legacy save file with baked poly_data: nothing to do but create
+            # an empty group (params/poly data lost — user must re-merge)
+            children = []
+        inst = MergedInstance(children, cx=d["x"], cy=d["y"])
     else:
         inst = ComponentInstance(
             type_id=d["type_id"],

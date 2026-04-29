@@ -405,13 +405,16 @@ class PropertiesPanel(QWidget):
         # Parameter editors — merged groups show read-only source info
         from component_model import MergedInstance
         if isinstance(inst, MergedInstance):
-            src_lbl = QLabel(inst.params.get("source_labels", ""))
-            src_lbl.setStyleSheet("font-size:10px; color:#888; font-style:italic;")
-            src_lbl.setWordWrap(True)
-            self._params_layout.addRow("sources", src_lbl)
-            poly_lbl = QLabel(str(len(inst._poly_data)))
-            poly_lbl.setStyleSheet("font-size:10px; color:#888;")
-            self._params_layout.addRow("polygons", poly_lbl)
+            _HIDDEN = {"ring_polys", "_offset_x", "_offset_y",
+                       "source_inst_id", "_source_instances"}
+            for idx, child in enumerate(inst.children):
+                hdr = QLabel(f"  [{idx+1}] {child.label}")
+                hdr.setStyleSheet(
+                    "font-size:10px; color:#5DCAA5; font-weight:bold; padding-top:6px;")
+                self._params_layout.addRow(hdr)
+                for key, val in child.params.items():
+                    if key not in _HIDDEN:
+                        self._add_param_editor(child, key, val)
         else:
             # Internal params that should not appear in the properties panel
             _HIDDEN_PARAMS = {"ring_polys", "_offset_x", "_offset_y",
@@ -444,11 +447,14 @@ class PropertiesPanel(QWidget):
                 item.widget().deleteLater()
 
     def _add_param_editor(self, inst: ComponentInstance, key: str, val):
+        def emit(k, v, target=inst):
+            target.params[k] = v
+            self.param_changed.emit(target.inst_id, k, v)
         if isinstance(val, bool):
             w = QCheckBox()
             w.setChecked(val)
             w.stateChanged.connect(
-                lambda state, k=key: self._emit(k, bool(state))
+                lambda state, k=key: emit(k, bool(state))
             )
         elif isinstance(val, float):
             w = QDoubleSpinBox()
@@ -458,12 +464,12 @@ class PropertiesPanel(QWidget):
             w.setValue(val)
             # Use editingFinished so rebuilds only fire when the user commits
             # a value (Enter or focus-loss), not on every intermediate keystroke.
-            w.editingFinished.connect(lambda ww=w, k=key: self._emit(k, ww.value()))
+            w.editingFinished.connect(lambda ww=w, k=key: emit(k, ww.value()))
         elif isinstance(val, int):
             w = QSpinBox()
             w.setRange(0, 99)
             w.setValue(val)
-            w.valueChanged.connect(lambda v, k=key: self._emit(k, v))
+            w.valueChanged.connect(lambda v, k=key: emit(k, v))
         elif isinstance(val, str) and key in ("cap_style", "undercut_style",
                                                "direction", "narrow_end",
                                                "entry_dir", "turn_dir"):
@@ -478,11 +484,11 @@ class PropertiesPanel(QWidget):
             }.get(key, [val])
             w.addItems(options)
             w.setCurrentText(val)
-            w.currentTextChanged.connect(lambda v, k=key: self._emit(k, v))
+            w.currentTextChanged.connect(lambda v, k=key: emit(k, v))
         else:
             w = QLineEdit(str(val))
             w.editingFinished.connect(
-                lambda k=key, ww=w: self._emit(k, ww.text())
+                lambda k=key, ww=w: emit(k, ww.text())
             )
 
         w.setStyleSheet("font-size:11px;")
@@ -1324,7 +1330,6 @@ class MainWindow(QMainWindow):
                 continue
             if ring.params.get("source_inst_id", -1) != source_id:
                 continue
-            # Retrieve the stored offset (set once at ring-creation time)
             dx = ring.params.get("_offset_x", 0.0)
             dy = ring.params.get("_offset_y", 0.0)
             ring.x = new_x + dx
@@ -1346,7 +1351,24 @@ class MainWindow(QMainWindow):
 
     def _on_param_changed(self, inst_id: int, key: str, val):
         from canvas import um_to_px
+        from component_model import MergedInstance
         inst = self._instances.get(inst_id)
+
+        # If not found directly, the edited inst_id belongs to a child of a
+        # MergedInstance (children are not in self._instances).  Find the
+        # parent group so we can rebuild its canvas item after updating the
+        # child's param.
+        parent_merged: MergedInstance | None = None
+        if inst is None:
+            for candidate in self._instances.values():
+                if isinstance(candidate, MergedInstance):
+                    for child in candidate.children:
+                        if child.inst_id == inst_id:
+                            inst = child
+                            parent_merged = candidate
+                            break
+                if inst is not None:
+                    break
         if inst is None:
             return
         # Push undo for all param edits except position (covered by drag)
@@ -1376,10 +1398,12 @@ class MainWindow(QMainWindow):
                 self._props._y_spin.setValue(inst.y)
                 self._props._x_spin.blockSignals(False)
                 self._props._y_spin.blockSignals(False)
-        # Sync scene item position & rebuild polygons
-        item = self.scene._component_items.get(inst_id)
+        # Sync scene item position & rebuild polygons.
+        # For a child of a MergedInstance, rebuild the parent's canvas item.
+        rebuild_id = parent_merged.inst_id if parent_merged is not None else inst_id
+        item = self.scene._component_items.get(rebuild_id)
         if item:
-            item.setPos(um_to_px(inst.x), -um_to_px(inst.y))
+            item.setPos(um_to_px(item.inst.x), -um_to_px(item.inst.y))
             item._rebuild()
 
     # ── Delete ────────────────────────────────────────────────────────────────
@@ -1599,8 +1623,8 @@ class MainWindow(QMainWindow):
             "linked":         True,         # sticky — follows its source by default
             "source_inst_id": source_id,    # id of the parent component
             # Offset from source anchor → ring anchor (fixed at creation time)
-            "_offset_x":      cx - source.x,
-            "_offset_y":      cy - source.y,
+            "_offset_x":      cx - source.x,   # was hardcoded 0.0
+            "_offset_y":      cy - source.y,   # was hardcoded 0.0
         })
 
         self._instances[ring.inst_id] = ring

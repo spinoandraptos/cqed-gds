@@ -6,6 +6,7 @@ canvas.py — GDS canvas: grid, pan/zoom, component placement, port snapping,
 from __future__ import annotations
 import math
 from typing import TYPE_CHECKING
+from component_model import MergedInstance
 
 from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsView, QGraphicsItem,
@@ -115,6 +116,8 @@ class ComponentItem(QGraphicsItem):
         self.setAcceptHoverEvents(True)
         self.setZValue(1)
         self._z_order: int = 0   # logical stacking order; higher = in front
+        self._drag_start_x: float = inst.x
+        self._drag_start_y: float = inst.y
 
         # Position in scene (pixels), y-flipped
         self.setPos(um_to_px(inst.x), -um_to_px(inst.y))
@@ -138,7 +141,8 @@ class ComponentItem(QGraphicsItem):
         raw = render_instance(self.inst, self.cfg)
         self._polys = []
         all_pts: list[QPointF] = []
-        ox, oy = self.inst.x, self.inst.y
+        ox = self.inst.x
+        oy = self.inst.y
 
         for layer, pts in raw:
             qpts = [QPointF(um_to_px(x - ox), -um_to_px(y - oy)) for x, y in pts]
@@ -206,6 +210,12 @@ class ComponentItem(QGraphicsItem):
         return super().itemChange(change, value)
 
     def mouseReleaseEvent(self, event):
+        if isinstance(self.inst, MergedInstance):
+            dx = self.inst.x - self._drag_start_x
+            dy = self.inst.y - self._drag_start_y
+            for child in self.inst.children:
+                child.x += dx
+                child.y += dy
         super().mouseReleaseEvent(event)
         self._rebuild()
         self._scene.selection_changed_signal.emit(self.inst.inst_id)
@@ -213,8 +223,9 @@ class ComponentItem(QGraphicsItem):
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         self._scene.selection_changed_signal.emit(self.inst.inst_id)
-        # Signal that a drag may be starting so the app can snapshot undo state
         if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start_x = self.inst.x
+            self._drag_start_y = self.inst.y
             self._scene.component_drag_started.emit(self.inst.inst_id)
 
     def contextMenuEvent(self, event):
