@@ -36,6 +36,7 @@ GRID_UM       = 0.5         # major grid spacing in µm
 SNAP_UM       = 0.005         # snap grid in µm
 PORT_SNAP_UM  = 0.8         # distance to snap to a port (µm)
 PORT_RADIUS   = 4           # visual port dot radius (px)
+PORT_AUTO_SNAP_UM = 0.5   # distance within which a port snaps to its nearest opposing port
 
 CANVAS_BG      = QColor("#0d1117")
 GRID_COLOR     = QColor(255, 255, 255, 20)
@@ -118,6 +119,8 @@ class ComponentItem(QGraphicsItem):
         self._z_order: int = 0   # logical stacking order; higher = in front
         self._drag_start_x: float = inst.x
         self._drag_start_y: float = inst.y
+        self._snap_targets: list[tuple] = []  # list of (local_port, dst_PortItem)
+
 
         # Position in scene (pixels), y-flipped
         self.setPos(um_to_px(inst.x), -um_to_px(inst.y))
@@ -196,26 +199,158 @@ class ComponentItem(QGraphicsItem):
 
     # ── Interaction ───────────────────────────────────────────────────────────
 
+    def _clear_snap_connections(self):
+        """
+        Remove all connections on this instance and their reciprocal entries
+        on the other side, and delete the corresponding WireItems from the scene.
+        """
+        cfg = self._scene.cfg
+
+        # Collect world positions of all our ports
+        my_port_positions = set()
+        for p in self.inst.world_ports(cfg):
+            px = round(um_to_px(p.x), 1)
+            py = round(-um_to_px(p.y), 1)
+            my_port_positions.add((px, py))
+
+        # Remove WireItems touching any of our ports
+        for item in list(self._scene.items()):
+            if isinstance(item, WireItem):
+                p1 = (round(item.p1.x(), 1), round(item.p1.y(), 1))
+                p2 = (round(item.p2.x(), 1), round(item.p2.y(), 1))
+                if p1 in my_port_positions or p2 in my_port_positions:
+                    self._scene.removeItem(item)
+
+        # Clear reciprocal connections on other instances
+        for port_name, conn in list(self.inst.connections.items()):
+            conns = conn if isinstance(conn, list) else [conn]
+            for other_id, other_port in conns:
+                other_item = self._scene._component_items.get(other_id)
+                if other_item:
+                    existing = other_item.inst.connections.get(other_port)
+                    if isinstance(existing, list):
+                        # Remove just our entry from the list
+                        other_item.inst.connections[other_port] = [
+                            e for e in existing if e != (self.inst.inst_id, port_name)
+                        ]
+                        if not other_item.inst.connections[other_port]:
+                            del other_item.inst.connections[other_port]
+                    else:
+                        other_item.inst.connections.pop(other_port, None)
+
+        # Clear our own connections
+        self.inst.connections.clear()
+
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged:
-            # Sync model position
             px = self.pos().x()
             py = self.pos().y()
-            s = self._scene.snap_um
-            self.inst.x = snap(px_to_um(px), s)
-            self.inst.y = snap(-px_to_um(py), s)
-            # Snap item to grid
+            s  = self._scene.snap_um
+            new_x = snap(px_to_um(px), s)
+            new_y = snap(-px_to_um(py), s)
+            self.inst.x = new_x
+            self.inst.y = new_y
             self.setPos(um_to_px(self.inst.x), -um_to_px(self.inst.y))
+
+            # ── Port auto-snap detection ──────────────────────────────────────
+            # _opp = {"+x": "-x", "-x": "+x", "+y": "-y", "-y": "+y"}
+
+            # Clear previous highlights
+            for _, old_dst in self._snap_targets:
+                old_dst.setBrush(QBrush(QColor(0, 0, 0, 0)))
+            self._snap_targets = []
+
+            my_world_ports = self.inst.world_ports(self._scene.cfg)
+            my_local_ports = self.inst.get_ports(self._scene.cfg)
+            local_by_name  = {p.name: p for p in my_local_ports}
+
+            # For each src port, independently find its closest opposing dst port
+            src_to_best: dict[str, tuple] = {}  # port_name → (dist, local_port, dst_PortItem)
+            for src_port in my_world_ports:
+                if src_port.name in self.inst.connections:
+                    continue
+                for other_item in self._scene._component_items.values():
+                    if other_item is self:
+                        continue
+                    for dst_pi in other_item._port_items:
+                        # if dst_pi.port.name in other_item.inst.connections:
+                        #     continue
+                        # if dst_pi.port.direction != _opp.get(src_port.direction):
+                        #     continue
+                        wp   = dst_pi.world_pos()
+                        dst_x = px_to_um(wp.x())
+                        dst_y = -px_to_um(wp.y())
+                        dist  = math.hypot(src_port.x - dst_x, src_port.y - dst_y)
+                        if dist < PORT_AUTO_SNAP_UM:
+                            prev = src_to_best.get(src_port.name)
+                            if prev is None or dist < prev[0]:
+                                local_src = local_by_name.get(src_port.name)
+                                if local_src:
+                                    src_to_best[src_port.name] = (dist, local_src, dst_pi)
+
+            if src_to_best:
+                # Use the closest pair to determine the snap translation
+                primary = min(src_to_best.values(), key=lambda t: t[0])
+                _, primary_local, primary_dst = primary
+
+                wp = primary_dst.world_pos()
+                dst_x = px_to_um(wp.x())
+                dst_y = -px_to_um(wp.y())
+                snapped_x = dst_x - primary_local.x
+                snapped_y = dst_y - primary_local.y
+                self.inst.x = snapped_x
+                self.inst.y = snapped_y
+                self.setPos(um_to_px(snapped_x), -um_to_px(snapped_y))
+
+                # After snapping, re-evaluate ALL src ports at the new position
+                # to catch additional pairs that now align
+                my_world_ports2 = self.inst.world_ports(self._scene.cfg)
+                world_by_name   = {p.name: p for p in my_world_ports2}
+                for name, (_, local_src, dst_pi) in src_to_best.items():
+                    src_w = world_by_name.get(name)
+                    if src_w is None:
+                        continue
+                    wp2   = dst_pi.world_pos()
+                    dst_x2 = px_to_um(wp2.x())
+                    dst_y2 = -px_to_um(wp2.y())
+                    dist2  = math.hypot(src_w.x - dst_x2, src_w.y - dst_y2)
+                    if dist2 < PORT_AUTO_SNAP_UM:
+                        self._snap_targets.append((local_src, dst_pi))
+                        dst_pi.setBrush(QBrush(QColor("#00ff99")))
+            else:
+                self._snap_target = None
+
             self._scene.component_moved.emit(self.inst.inst_id)
         return super().itemChange(change, value)
 
     def mouseReleaseEvent(self, event):
+        if self._snap_targets:
+            src_inst = self.inst
+            for local_src, dst_pi in self._snap_targets:
+                dst_pi.setBrush(QBrush(QColor(0, 0, 0, 0)))
+                dst_inst = dst_pi.owner.inst
+
+                # Source side: one connection per port (normal)
+                self.inst.connections[local_src.name] = (dst_inst.inst_id, dst_pi.port.name)
+
+                # Destination side: store as list to allow multiple incoming connections
+                existing = dst_inst.connections.get(dst_pi.port.name)
+                if existing is None:
+                    dst_inst.connections[dst_pi.port.name] = [(self.inst.inst_id, local_src.name)]
+                elif isinstance(existing, list):
+                    dst_inst.connections[dst_pi.port.name].append((self.inst.inst_id, local_src.name))
+                else:
+                    # Was a single tuple from old code — upgrade to list
+                    dst_inst.connections[dst_pi.port.name] = [existing, (self.inst.inst_id, local_src.name)]
+            self._snap_targets = []
+
         if isinstance(self.inst, MergedInstance):
             dx = self.inst.x - self._drag_start_x
             dy = self.inst.y - self._drag_start_y
             for child in self.inst.children:
                 child.x += dx
                 child.y += dy
+
         super().mouseReleaseEvent(event)
         self._rebuild()
         self._scene.selection_changed_signal.emit(self.inst.inst_id)
@@ -224,6 +359,10 @@ class ComponentItem(QGraphicsItem):
         super().mousePressEvent(event)
         self._scene.selection_changed_signal.emit(self.inst.inst_id)
         if event.button() == Qt.MouseButton.LeftButton:
+            # Clear any snap-made connections and their wires so ports are
+            # free to re-snap on the new drag
+            self._clear_snap_connections()
+            self._snap_targets = []
             self._drag_start_x = self.inst.x
             self._drag_start_y = self.inst.y
             self._scene.component_drag_started.emit(self.inst.inst_id)

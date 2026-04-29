@@ -426,10 +426,12 @@ class PropertiesPanel(QWidget):
 
         # Connection display
         if inst.connections:
-            for port_name, (other_id, other_port) in inst.connections.items():
-                lbl = QLabel(f"{port_name} → #{other_id}.{other_port}")
-                lbl.setStyleSheet("font-size:10px; color:#5DCAA5;")
-                self._conn_layout.addWidget(lbl)
+            for port_name, conn in inst.connections.items():
+                conns = conn if isinstance(conn, list) else [conn]
+                for other_id, other_port in conns:
+                    lbl = QLabel(f"{port_name} → #{other_id}.{other_port}")
+                    lbl.setStyleSheet("font-size:10px; color:#5DCAA5;")
+                    self._conn_layout.addWidget(lbl)
         else:
             lbl = QLabel("No connections")
             lbl.setStyleSheet("font-size:10px; color:#555;")
@@ -1346,7 +1348,7 @@ class MainWindow(QMainWindow):
         # Refresh properties if one of these is selected
         if self._selected_id in (id1, id2):
             self._props.load(self._instances.get(self._selected_id))
-
+    
     # ── Params ────────────────────────────────────────────────────────────────
 
     def _on_param_changed(self, inst_id: int, key: str, val):
