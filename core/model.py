@@ -207,6 +207,35 @@ class GDSComponent:
             Port("E", Point(bb.x_max - ox, cy - oy), PortSide.EAST),
         ]
 
+# ── Component Group ───────────────────────────────────────────────────────────
+
+@dataclass
+class ComponentGroup:
+    """
+    A named logical container for components on the same layer.
+    Members remain fully independent GDSComponent objects —
+    grouping only affects selection, movement, and display.
+
+    bbox and ports are derived from the union of member bboxes.
+    """
+    name:       str
+    member_ids: List[str] = field(default_factory=list)
+    id:         str       = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    def bbox_from(self, components: List["GDSComponent"]) -> "BBox":
+        """Union bbox of all member components."""
+        members = [c for c in components if c.id in self.member_ids]
+        if not members:
+            return BBox(0, 0, 0, 0)
+        x_min = min(c.bbox.x_min for c in members)
+        y_min = min(c.bbox.y_min for c in members)
+        x_max = max(c.bbox.x_max for c in members)
+        y_max = max(c.bbox.y_max for c in members)
+        return BBox(x_min, y_min, x_max, y_max)
+
+    def origin_from(self, components: List["GDSComponent"]) -> "Point":
+        bb = self.bbox_from(components)
+        return Point(bb.x_min, bb.y_min)
 
 # ── Connection ────────────────────────────────────────────────────────────────
 
@@ -240,7 +269,8 @@ class DesignScene:
         self.is_dirty = False
         self._components: List[GDSComponent] = []
         self._connections: List[Connection]  = []
-
+        self._groups:     List[ComponentGroup] = []
+        
     @property
     def components(self) -> List[GDSComponent]:
         return list(self._components)   # return copy so callers can't mutate
@@ -266,10 +296,39 @@ class DesignScene:
             if c.id == comp_id:
                 return c
         return None
+    
+    @property
+    def groups(self) -> List[ComponentGroup]:
+        return list(self._groups)
+
+    def add_group(self, group: ComponentGroup) -> None:
+        self._groups.append(group)
+        self.is_dirty = True
+
+    def remove_group(self, group_id: str) -> Optional[ComponentGroup]:
+        for i, g in enumerate(self._groups):
+            if g.id == group_id:
+                self.is_dirty = True
+                return self._groups.pop(i)
+        return None
+
+    def get_group(self, group_id: str) -> Optional[ComponentGroup]:
+        for g in self._groups:
+            if g.id == group_id:
+                return g
+        return None
+
+    def group_of(self, comp_id: str) -> Optional[ComponentGroup]:
+        """Return the group containing this component, or None."""
+        for g in self._groups:
+            if comp_id in g.member_ids:
+                return g
+        return None
 
     def clear(self) -> None:
         self._components.clear()
         self._connections.clear()
+        self._groups.clear()
         self.is_dirty = False
 
     def __len__(self) -> int:

@@ -273,21 +273,159 @@ class DraggableShapeButton(QPushButton):
 
 # ── Properties Panel ──────────────────────────────────────────────────────────
 
+class MemberCard(QWidget):
+    """
+    Compact editable card for one group member shown inside the group view.
+    Emits the same signals as PropertiesPanel so MainWindow needs no changes.
+    """
+    layer_change_requested    = pyqtSignal(str, int)
+    geometry_change_requested = pyqtSignal(str, str, int)
+
+    def __init__(self, comp: GDSComponent, design, parent=None) -> None:
+        super().__init__(parent)
+        self._comp   = comp
+        self._design = design
+        self.setStyleSheet(f"""
+            QWidget {{
+                background: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BG_BORDER};
+                border-radius: 4px;
+            }}
+        """)
+        self._build(comp, design)
+
+    def _build(self, comp: GDSComponent, design) -> None:
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 6, 8, 6)
+        lay.setSpacing(3)
+
+        # ── Header: kind + id + layer colour swatch ───────────────────────────
+        header = QHBoxLayout()
+        swatch = QLabel("█")
+        color  = Colors.LAYER_COLORS[comp.layer % len(Colors.LAYER_COLORS)]
+        swatch.setStyleSheet(
+            f"color: {color}; font-size: 14px; background: transparent; border: none;"
+        )
+        kind_lbl = QLabel(f"{comp.kind.name.capitalize()}  ·  {comp.id}")
+        kind_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SM}px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        header.addWidget(swatch)
+        header.addWidget(kind_lbl)
+        header.addStretch()
+        lay.addLayout(header)
+
+        # ── Inline rows ───────────────────────────────────────────────────────
+        def inline(label: str, value: str) -> None:
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+                f"background: transparent; border: none;"
+            )
+            lbl.setFixedWidth(72)
+            val = QLabel(value)
+            val.setStyleSheet(
+                f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px; "
+                f"font-family: {Fonts.MONO_FAMILY}; background: transparent; border: none;"
+            )
+            row.addWidget(lbl); row.addWidget(val); row.addStretch()
+            lay.addLayout(row)
+
+        bb = comp.bbox
+        inline("Origin", f"{dbu_to_um(comp.origin.x):.2f}, {dbu_to_um(comp.origin.y):.2f} µm")
+        inline("BBox",
+               f"({dbu_to_um(bb.x_min):.1f}, {dbu_to_um(bb.y_min):.1f}) → "
+               f"({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f})")
+
+        # Connections
+        if design is not None:
+            sides = design.connected_sides(comp.id)
+            if sides:
+                order  = [PortSide.NORTH, PortSide.SOUTH, PortSide.EAST, PortSide.WEST]
+                labels = {PortSide.NORTH:"N", PortSide.SOUTH:"S",
+                          PortSide.EAST:"E",  PortSide.WEST:"W"}
+                inline("Connected",
+                       "  ·  ".join(labels[s] for s in order if s in sides))
+
+        # ── Editable fields ───────────────────────────────────────────────────
+        spin_style = f"""
+            QDoubleSpinBox, QSpinBox {{
+                background: {Colors.BG_BASE}; border: 1px solid {Colors.BG_BORDER};
+                border-radius: 3px; color: {Colors.TEXT_PRIMARY};
+                font-size: {Fonts.SIZE_XS}px; padding: 2px 4px;
+            }}
+            QDoubleSpinBox:hover, QSpinBox:hover {{ border-color: {Colors.ACCENT_DIM}; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button,
+            QSpinBox::up-button,       QSpinBox::down-button {{ width: 14px; }}
+        """
+
+        def spin_row(label: str, widget) -> None:
+            row = QHBoxLayout()
+            lbl = QLabel(label)
+            lbl.setStyleSheet(
+                f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+                f"background: transparent; border: none;"
+            )
+            lbl.setFixedWidth(72)
+            widget.setFixedWidth(100)
+            widget.setStyleSheet(spin_style)
+            row.addWidget(lbl); row.addWidget(widget); row.addStretch()
+            lay.addLayout(row)
+
+        # Layer
+        layer_sb = QSpinBox()
+        layer_sb.setRange(0, 63)
+        layer_sb.setValue(comp.layer)
+        layer_sb.valueChanged.connect(
+            lambda v, cid=comp.id: self.layer_change_requested.emit(cid, v)
+        )
+        spin_row("Layer", layer_sb)
+
+        # Kind-specific editable fields
+        if comp.kind == ComponentKind.RECTANGLE:
+            w_sb = QDoubleSpinBox()
+            w_sb.setRange(0.001, 10_000); w_sb.setDecimals(3)
+            w_sb.setSuffix(" µm"); w_sb.setValue(dbu_to_um(comp.width))
+            w_sb.editingFinished.connect(
+                lambda s=w_sb, cid=comp.id:
+                    self.geometry_change_requested.emit(cid, "width", um_to_dbu(s.value()))
+            )
+            spin_row("Width", w_sb)
+
+            h_sb = QDoubleSpinBox()
+            h_sb.setRange(0.001, 10_000); h_sb.setDecimals(3)
+            h_sb.setSuffix(" µm"); h_sb.setValue(dbu_to_um(comp.height))
+            h_sb.editingFinished.connect(
+                lambda s=h_sb, cid=comp.id:
+                    self.geometry_change_requested.emit(cid, "height", um_to_dbu(s.value()))
+            )
+            spin_row("Height", h_sb)
+
+        elif comp.kind == ComponentKind.PATH and comp.path_width:
+            pw_sb = QDoubleSpinBox()
+            pw_sb.setRange(0.001, 1_000); pw_sb.setDecimals(3)
+            pw_sb.setSuffix(" µm"); pw_sb.setValue(dbu_to_um(comp.path_width))
+            pw_sb.editingFinished.connect(
+                lambda s=pw_sb, cid=comp.id:
+                    self.geometry_change_requested.emit(cid, "path_width", um_to_dbu(s.value()))
+            )
+            spin_row("Path W", pw_sb)
+
+        elif comp.kind in (ComponentKind.POLYGON, ComponentKind.PATH):
+            inline("Vertices", str(comp.vertex_count))
+
+
 class PropertiesPanel(QWidget):
     """
-    Right dock: selected component properties.
-
-    Phase 2: Layer is now an editable spinbox (emits layer_change_requested
-    so MainWindow can wrap it in an EditComponent command for undo).
-    Vertex count row shown for polygon/path; path width row for paths.
-
-    Phase 3: Width, Height, and Path Width are now editable QDoubleSpinBoxes.
-    Each emits geometry_change_requested(comp_id, field, value_dbu) on commit
-    (editingFinished — fires on Enter or focus-out, not on every keystroke).
+    Right dock — two modes:
+      • Single component selected  → existing single-component view (unchanged)
+      • Group selected             → group view: header + scrollable MemberCard list
     """
 
-    layer_change_requested    = pyqtSignal(str, int)       # comp_id, new_layer
-    geometry_change_requested = pyqtSignal(str, str, int)  # comp_id, field, value_dbu
+    layer_change_requested    = pyqtSignal(str, int)
+    geometry_change_requested = pyqtSignal(str, str, int)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -299,6 +437,23 @@ class PropertiesPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
+        # ── Stack: page 0 = single component, page 1 = group ─────────────────
+        from PyQt6.QtWidgets import QStackedWidget
+        self._stack = QStackedWidget()
+        self._stack.addWidget(self._build_single_page())
+        self._stack.addWidget(self._build_group_page())
+        root.addWidget(self._stack)
+
+        self.clear()
+
+    # ── Single-component page (identical to original) ─────────────────────────
+
+    def _build_single_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+
         content = QWidget()
         content.setStyleSheet(f"background: {Colors.BG_SURFACE};")
         cl = QVBoxLayout(content)
@@ -306,18 +461,15 @@ class PropertiesPanel(QWidget):
                               Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
         cl.setSpacing(2)
 
-        # ── Identity ──────────────────────────────────────────────────────────
         cl.addWidget(SectionLabel("Identity"))
         self._row_id   = ValueRow("ID")
         self._row_kind = ValueRow("Kind")
         cl.addWidget(self._row_id)
         cl.addWidget(self._row_kind)
 
-        # Layer — editable spinbox
         layer_row = QWidget()
         lr = QHBoxLayout(layer_row)
-        lr.setContentsMargins(0, 2, 0, 2)
-        lr.setSpacing(8)
+        lr.setContentsMargins(0, 2, 0, 2); lr.setSpacing(8)
         lbl = QLabel("Layer")
         lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
         lbl.setFixedWidth(84)
@@ -326,42 +478,26 @@ class PropertiesPanel(QWidget):
         self._layer_spin.setEnabled(False)
         self._layer_spin.setFixedWidth(72)
         self._layer_spin.valueChanged.connect(self._on_layer_changed)
-        lr.addWidget(lbl)
-        lr.addWidget(self._layer_spin)
-        lr.addStretch()
+        lr.addWidget(lbl); lr.addWidget(self._layer_spin); lr.addStretch()
         cl.addWidget(layer_row)
-
         cl.addWidget(Separator())
 
-        # ── Geometry ──────────────────────────────────────────────────────────
         cl.addWidget(SectionLabel("Geometry"))
         self._row_x = ValueRow("X origin")
         self._row_y = ValueRow("Y origin")
-        cl.addWidget(self._row_x)
-        cl.addWidget(self._row_y)
-
-        # Width — editable spinbox, rect only
-        _, self._row_w_spin = self._make_dim_row("Width", "width", cl)
-
-        # Height — editable spinbox, rect only
-        _, self._row_h_spin = self._make_dim_row("Height", "height", cl)
-
-        # Vertices — read-only, polygon/path only
-        self._row_verts = ValueRow("Vertices")
+        cl.addWidget(self._row_x); cl.addWidget(self._row_y)
+        _, self._row_w_spin  = self._make_dim_row("Width",      "width",      cl)
+        _, self._row_h_spin  = self._make_dim_row("Height",     "height",     cl)
+        self._row_verts      = ValueRow("Vertices")
         cl.addWidget(self._row_verts)
-
-        # Path width — editable spinbox, path only
         _, self._row_pw_spin = self._make_dim_row("Path width", "path_width", cl)
-
         cl.addWidget(Separator())
 
-        # ── Bounding box ──────────────────────────────────────────────────────
         cl.addWidget(SectionLabel("Bounding Box"))
         self._row_bbox = ValueRow("Extents")
         cl.addWidget(self._row_bbox)
 
         cl.addWidget(Separator())
-        
         cl.addWidget(SectionLabel("Connections"))
         self._row_connections = ValueRow("Connected")
         cl.addWidget(self._row_connections)
@@ -374,10 +510,7 @@ class PropertiesPanel(QWidget):
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
         root.addWidget(scroll)
-
-        self.clear()
-
-    # ── Dim row factory ───────────────────────────────────────────────────────
+        return page
 
     def _make_dim_row(self, label_text: str, field: str, layout) -> tuple:
         """
@@ -421,38 +554,90 @@ class PropertiesPanel(QWidget):
         layout.addWidget(row)
         return row, sb
 
+    # ── Group page ────────────────────────────────────────────────────────────
+
+    def _build_group_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        # Fixed header
+        self._grp_header = QWidget()
+        self._grp_header.setStyleSheet(
+            f"background: {Colors.BG_ELEVATED}; "
+            f"border-bottom: 1px solid {Colors.BG_BORDER};"
+        )
+        hl = QVBoxLayout(self._grp_header)
+        hl.setContentsMargins(Geometry.PANEL_PADDING, 10,
+                              Geometry.PANEL_PADDING, 10)
+        hl.setSpacing(3)
+        self._grp_name_lbl  = QLabel("Group")
+        self._grp_name_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: 14px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        self._grp_meta_lbl  = QLabel("")
+        self._grp_meta_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+            f"background: transparent; border: none;"
+        )
+        self._grp_bbox_lbl  = QLabel("")
+        self._grp_bbox_lbl.setStyleSheet(self._grp_meta_lbl.styleSheet())
+        hl.addWidget(self._grp_name_lbl)
+        hl.addWidget(self._grp_meta_lbl)
+        hl.addWidget(self._grp_bbox_lbl)
+        root.addWidget(self._grp_header)
+
+        # Scrollable member cards
+        self._cards_scroll = QScrollArea()
+        self._cards_scroll.setWidgetResizable(True)
+        self._cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._cards_scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+
+        self._cards_container = QWidget()
+        self._cards_container.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        self._cards_layout = QVBoxLayout(self._cards_container)
+        self._cards_layout.setContentsMargins(
+            Geometry.PANEL_PADDING, Geometry.PANEL_PADDING,
+            Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
+        self._cards_layout.setSpacing(6)
+        self._cards_layout.addStretch()
+
+        self._cards_scroll.setWidget(self._cards_container)
+        root.addWidget(self._cards_scroll)
+        return page
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def clear(self) -> None:
+        self._stack.setCurrentIndex(0)
         self._current_comp_id = None
-        for sb in (self._layer_spin, self._row_w_spin, self._row_h_spin, self._row_pw_spin):
-            sb.blockSignals(True)
-            sb.setValue(0)
-            sb.setEnabled(False)
-            sb.blockSignals(False)
+        for sb in (self._layer_spin, self._row_w_spin,
+                   self._row_h_spin, self._row_pw_spin):
+            sb.blockSignals(True); sb.setValue(0)
+            sb.setEnabled(False);  sb.blockSignals(False)
         for r in [self._row_id, self._row_kind, self._row_x, self._row_y,
-                  self._row_verts, self._row_bbox]:
+                  self._row_verts, self._row_bbox, self._row_connections]:
             r.set_value("—")
-        self._row_connections.set_value("—")
 
     def show_component(self, comp: GDSComponent, design=None) -> None:
+        self._stack.setCurrentIndex(0)
         self._current_comp_id = comp.id
         bb = comp.bbox
 
         self._row_id.set_value(comp.id)
         self._row_kind.set_value(comp.kind.name.capitalize())
 
-        # Layer spinbox
         self._layer_spin.blockSignals(True)
         self._layer_spin.setValue(comp.layer)
         self._layer_spin.setEnabled(True)
         self._layer_spin.blockSignals(False)
 
-        # Origin (read-only — move via drag)
         self._row_x.set_value(f"{dbu_to_um(comp.origin.x):.3f} µm")
         self._row_y.set_value(f"{dbu_to_um(comp.origin.y):.3f} µm")
 
-        # Width / Height — rectangle only
         for sb in (self._row_w_spin, self._row_h_spin):
             sb.blockSignals(True)
         is_rect = comp.kind == ComponentKind.RECTANGLE
@@ -462,51 +647,77 @@ class PropertiesPanel(QWidget):
             self._row_w_spin.setValue(dbu_to_um(comp.width))
             self._row_h_spin.setValue(dbu_to_um(comp.height))
         else:
-            self._row_w_spin.setValue(0.0)
-            self._row_h_spin.setValue(0.0)
+            self._row_w_spin.setValue(0.0); self._row_h_spin.setValue(0.0)
         for sb in (self._row_w_spin, self._row_h_spin):
             sb.blockSignals(False)
 
-        # Vertices — polygon and path only
         if comp.kind in (ComponentKind.POLYGON, ComponentKind.PATH):
             self._row_verts.set_value(str(comp.vertex_count))
         else:
             self._row_verts.set_value("—")
 
-        # Path width — path only
         self._row_pw_spin.blockSignals(True)
         is_path = comp.kind == ComponentKind.PATH
         self._row_pw_spin.setEnabled(is_path)
-        if is_path:
-            self._row_pw_spin.setValue(dbu_to_um(comp.path_width or 0))
-        else:
-            self._row_pw_spin.setValue(0.0)
+        self._row_pw_spin.setValue(
+            dbu_to_um(comp.path_width or 0) if is_path else 0.0
+        )
         self._row_pw_spin.blockSignals(False)
 
-        # Bounding box
         self._row_bbox.set_value(
             f"({dbu_to_um(bb.x_min):.1f}, {dbu_to_um(bb.y_min):.1f})"
             f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f})"
         )
 
-        # Connections — requires design to resolve port→side mapping
         if design is not None:
             sides = design.connected_sides(comp.id)
             if sides:
-                # e.g. "N · E"
-                order = [PortSide.NORTH, PortSide.SOUTH, PortSide.EAST, PortSide.WEST]
-                labels = {
-                    PortSide.NORTH: "N",
-                    PortSide.SOUTH: "S",
-                    PortSide.EAST:  "E",
-                    PortSide.WEST:  "W",
-                }
-                text = "  ·  ".join(labels[s] for s in order if s in sides)
-                self._row_connections.set_value(text)
+                order  = [PortSide.NORTH, PortSide.SOUTH,
+                          PortSide.EAST,  PortSide.WEST]
+                labels = {PortSide.NORTH:"N", PortSide.SOUTH:"S",
+                          PortSide.EAST:"E",  PortSide.WEST:"W"}
+                self._row_connections.set_value(
+                    "  ·  ".join(labels[s] for s in order if s in sides)
+                )
             else:
                 self._row_connections.set_value("None")
         else:
             self._row_connections.set_value("—")
+
+    def show_group(self, group, design) -> None:
+        """Switch to group view and populate member cards."""
+        self._stack.setCurrentIndex(1)
+        self._current_comp_id = None
+
+        # Header
+        members = [design.get(cid) for cid in group.member_ids
+                   if design.get(cid)]
+        bb = group.bbox_from(design.components)
+
+        self._grp_name_lbl.setText(f"⬡  {group.name}")
+        self._grp_meta_lbl.setText(
+            f"{len(members)} component{'s' if len(members) != 1 else ''}  ·  "
+            f"id {group.id}"
+        )
+        self._grp_bbox_lbl.setText(
+            f"BBox  ({dbu_to_um(bb.x_min):.1f}, {dbu_to_um(bb.y_min):.1f})"
+            f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f}) µm"
+        )
+
+        # Rebuild member cards
+        # Remove all except the trailing stretch
+        while self._cards_layout.count() > 1:
+            item = self._cards_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for comp in members:
+            card = MemberCard(comp, design)
+            card.layer_change_requested.connect(self.layer_change_requested)
+            card.geometry_change_requested.connect(self.geometry_change_requested)
+            self._cards_layout.insertWidget(
+                self._cards_layout.count() - 1, card
+            )
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
@@ -516,5 +727,6 @@ class PropertiesPanel(QWidget):
 
     def _on_dim_changed(self, field: str, spinbox: QDoubleSpinBox) -> None:
         if self._current_comp_id:
-            value_dbu = um_to_dbu(spinbox.value())
-            self.geometry_change_requested.emit(self._current_comp_id, field, value_dbu)
+            self.geometry_change_requested.emit(
+                self._current_comp_id, field, um_to_dbu(spinbox.value())
+            )

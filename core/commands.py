@@ -14,7 +14,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
-from core.model import DesignScene, GDSComponent, Point, Connection
+from core.model import DesignScene, GDSComponent, Point, Connection, ComponentGroup
 
 # Fields that EditComponent is allowed to mutate.
 # A typo in a key name silently creates a new attribute on the dataclass,
@@ -224,6 +224,78 @@ class BatchCommand(Command):
     @property
     def description(self) -> str:
         return self._label
+    
+class GroupComponents(Command):
+    """
+    Collect existing components into a named ComponentGroup.
+    Components stay in the scene — only a group record is added.
+    """
+
+    def __init__(self, comp_ids: List[str], name: str) -> None:
+        from core.model import ComponentGroup
+        self._group = ComponentGroup(name=name, member_ids=list(comp_ids))
+
+    def execute(self, design: DesignScene) -> None:
+        design.add_group(self._group)
+
+    def undo(self, design: DesignScene) -> None:
+        design.remove_group(self._group.id)
+
+    @property
+    def description(self) -> str:
+        return f"Group '{self._group.name}'"
+
+
+class UngroupComponents(Command):
+    """Dissolve a group back to independent components."""
+
+    def __init__(self, group: "ComponentGroup") -> None:
+        self._group = ComponentGroup(
+            name=group.name,
+            member_ids=list(group.member_ids),
+            id=group.id,
+        )
+
+    def execute(self, design: DesignScene) -> None:
+        design.remove_group(self._group.id)
+
+    def undo(self, design: DesignScene) -> None:
+        design.add_group(self._group)
+
+    @property
+    def description(self) -> str:
+        return f"Ungroup '{self._group.name}'"
+
+
+class MoveGroup(Command):
+    """Translate all members of a group by (dx, dy)."""
+
+    def __init__(self, group_id: str, dx: int, dy: int) -> None:
+        self._group_id = group_id
+        self._dx = dx
+        self._dy = dy
+
+    def execute(self, design: DesignScene) -> None:
+        group = design.get_group(self._group_id)
+        if group:
+            for cid in group.member_ids:
+                comp = design.get(cid)
+                if comp:
+                    comp.move_by(self._dx, self._dy)
+            design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        group = design.get_group(self._group_id)
+        if group:
+            for cid in group.member_ids:
+                comp = design.get(cid)
+                if comp:
+                    comp.move_by(-self._dx, -self._dy)
+            design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        return "Move group"
 
 # ── Command Stack ─────────────────────────────────────────────────────────────
 

@@ -34,7 +34,7 @@ from typing import Any
 
 from core.model import (
     DesignScene, GDSComponent, ComponentKind,
-    Point, Port, PortSide, Connection,
+    Point, Port, PortSide, Connection, ComponentGroup
 )
 
 
@@ -61,7 +61,11 @@ def _encode(design: DesignScene) -> dict:
         "name":        design.name,
         "components":  [_encode_comp(c) for c in design.components],
         "connections": [_encode_conn(cn) for cn in design.connections],
+        "groups":      [_encode_group(g) for g in design.groups],  # ← add
     }
+
+def _encode_group(g) -> dict:
+    return {"id": g.id, "name": g.name, "member_ids": list(g.member_ids)}
 
 
 def _encode_comp(c: GDSComponent) -> dict:
@@ -120,6 +124,12 @@ def _decode(data: dict) -> DesignScene:
 
     for cn in data.get("connections", []):
         design._connections.append(_decode_conn(cn))
+
+    for gd in data.get("groups", []):
+        design._groups.append(
+            ComponentGroup(id=gd["id"], name=gd["name"],
+                        member_ids=gd["member_ids"])
+        )
 
     design.is_dirty = False
     return design

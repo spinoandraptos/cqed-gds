@@ -27,11 +27,11 @@ from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
 import qtawesome as qta
 from pathlib import Path
 from ui.theme import Colors, Fonts, Geometry, apply_theme
-from ui.canvas_scene import CanvasScene, PlacementMode
+from ui.canvas_scene import CanvasScene, PlacementMode, GroupItem
 from ui.canvas_view import CanvasView
 from ui.panels import ComponentPalette, PropertiesPanel
-from core.model import DesignScene, GDSComponent, ComponentKind
-from core.commands import CommandStack, EditComponent
+from core.model import DesignScene, GDSComponent, ComponentKind, ComponentGroup
+from core.commands import CommandStack, EditComponent, GroupComponents, UngroupComponents
 from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
 from core.serialiser import save, load, SerialisationError
@@ -90,10 +90,13 @@ class MainWindow(QMainWindow):
         self._act_selall = self._action("Select All",      "Ctrl+A",         self._select_all)
         self._act_delete = self._action("Delete",          "Delete",         self._delete_selected)
         self._act_sweep = self._action("Sweep Parameter…", "Ctrl+W", self._sweep)
+        self._act_group   = self._action("Group",   "Ctrl+G",       self._group_selected)
+        self._act_ungroup = self._action("Ungroup", "Ctrl+Shift+G", self._ungroup_selected)
         self._act_escape = self._action("Cancel / Select", "Escape",         self._escape)
         for a in [self._act_undo, self._act_redo, None,
                 self._act_selall, self._act_delete,
-                self._act_sweep, None, self._act_escape]:
+                self._act_sweep, self._act_group, self._act_ungroup,
+                None, self._act_escape]:
             edit_menu.addSeparator() if a is None else edit_menu.addAction(a)
 
         # View
@@ -265,6 +268,16 @@ class MainWindow(QMainWindow):
         self._scene.scene_changed.connect(self._on_scene_changed)
         self._scene.mode_changed.connect(self._on_mode_changed)
         self._scene.connections_changed.connect(self._refresh_props_for_selection)
+        self._scene.group_edit_entered.connect(
+            lambda gid: self._flash_status(
+                f"Editing group — click outside to exit", ms=0
+            )
+        )
+        self._scene.group_edit_exited.connect(
+            lambda: self._flash_status("Exited group edit")
+        )
+        self._scene.group_selected.connect(self._on_group_selected)
+
 
 
         # Phase 2: palette requests a mode, not an immediate placement
@@ -381,6 +394,77 @@ class MainWindow(QMainWindow):
         selected = self._scene.selectedItems()
         if len(selected) == 1 and hasattr(selected[0], "component"):
             self._props.show_component(selected[0].component, self._design)
+
+    @pyqtSlot()
+    def _group_selected(self) -> None:
+        selected = [
+            item.component
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        ]
+        if len(selected) < 2:
+            QMessageBox.information(
+                self, "Group", "Select two or more components to group."
+            )
+            return
+
+        # Validate: all must share the same layer
+        layers = {c.layer for c in selected}
+        if len(layers) > 1:
+            QMessageBox.warning(
+                self, "Group",
+                "All components must be on the same layer to group.\n"
+                f"Selected layers: {sorted(layers)}"
+            )
+            return
+
+        # Name: ask or auto-generate
+        from PyQt6.QtWidgets import QInputDialog
+        name, ok = QInputDialog.getText(
+            self, "Group Name", "Group name:",
+            text=f"group_{len(self._design.groups) + 1}"
+        )
+        if not ok or not name.strip():
+            return
+
+        comp_ids = [c.id for c in selected]
+        self._scene.cmd_stack.execute(GroupComponents(comp_ids, name.strip()))
+        self._flash_status(f"Grouped {len(selected)} components as '{name.strip()}'")
+
+    @pyqtSlot()
+    def _ungroup_selected(self) -> None:
+        # Find groups that are selected or whose members are selected
+        selected_comp_ids = {
+            item.component.id
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        }
+        # Also check if a GroupItem is directly selected
+        selected_group_ids = {
+            item.group.id
+            for item in self._scene.selectedItems()
+            if isinstance(item, GroupItem)  # import GroupItem at top
+        }
+        # Add groups whose members are all selected
+        for g in self._design.groups:
+            if any(cid in selected_comp_ids for cid in g.member_ids):
+                selected_group_ids.add(g.id)
+
+        if not selected_group_ids:
+            QMessageBox.information(self, "Ungroup", "No grouped components selected.")
+            return
+
+        for gid in selected_group_ids:
+            group = self._design.get_group(gid)
+            if group:
+                self._scene.cmd_stack.execute(UngroupComponents(group))
+        self._flash_status(f"Ungrouped {len(selected_group_ids)} group(s)")
+
+    @pyqtSlot(str)
+    def _on_group_selected(self, group_id: str) -> None:
+        group = self._design.get_group(group_id)
+        if group:
+            self._props.show_group(group, self._design)
 
     # ── Mode helpers ──────────────────────────────────────────────────────────
 

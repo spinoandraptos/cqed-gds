@@ -22,7 +22,7 @@ from typing import Dict, List, Optional
 
 from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
 from PyQt6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath,
+    QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath, QTransform
 )
 from PyQt6.QtWidgets import (
     QGraphicsScene, QGraphicsItem,
@@ -34,9 +34,9 @@ from dataclasses import dataclass, field
 
 from core.model import (
     DesignScene, GDSComponent, ComponentKind,
-    Point, Port, PortSide, dbu_to_um, um_to_dbu,
+    Point, Port, PortSide, dbu_to_um, um_to_dbu, ComponentGroup
 )
-from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts
+from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts, MoveGroup
 from ui.theme import Colors
 
 
@@ -226,6 +226,188 @@ class EdgeIndicatorItem(QGraphicsItem):
         fill.setAlpha(220)
         painter.setBrush(QBrush(fill))
         painter.drawPolygon(self._poly)
+
+# ── Group Graphics Item ───────────────────────────────────────────────────────
+
+_GROUP_BORDER_IDLE     = "#475569"
+_GROUP_BORDER_HOVER    = "#38bdf8"
+_GROUP_BORDER_EDITING  = "#f59e0b"   # amber — editing mode
+_GROUP_BG_ALPHA        = 18          # very faint fill so members show through
+
+
+class GroupItem(QGraphicsItem):
+    """
+    Visual container for a ComponentGroup.
+
+    Drag is handled MANUALLY — ItemIsMovable is never set.
+    During drag we call move_by() on each member directly so they
+    follow in real-time. On release we undo those live moves and
+    re-apply via MoveGroup so the command stack gets one clean entry.
+    """
+
+    def __init__(self, group: "ComponentGroup", scene_ref: "CanvasScene") -> None:
+        super().__init__()
+        self._group      = group
+        self._scene_ref  = scene_ref
+        self._editing    = False
+
+        # Drag state
+        self._drag_start:    Optional[QPointF] = None
+        self._last_drag_pos: Optional[QPointF] = None   # previous frame position
+        self._total_dx = 0   # accumulated DBU delta this drag gesture
+        self._total_dy = 0
+
+        self.setZValue(1)
+        self.setFlags(
+            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
+            # NO ItemIsMovable — we drive movement ourselves
+        )
+        self.setAcceptHoverEvents(True)
+
+    @property
+    def group(self) -> "ComponentGroup":
+        return self._group
+
+    @property
+    def is_editing(self) -> bool:
+        return self._editing
+
+    def enter_edit_mode(self) -> None:
+        self._editing = True
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self._scene_ref._set_group_members_movable(self._group.id, True)
+        self.update()
+
+    def exit_edit_mode(self) -> None:
+        self._editing = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+        self._scene_ref._set_group_members_movable(self._group.id, False)
+        self.update()
+
+    def _current_bbox(self) -> QRectF:
+        bb  = self._group.bbox_from(self._scene_ref._design.components)
+        pad = float(um_to_dbu(2))
+        return QRectF(
+            bb.x_min - pad, bb.y_min - pad,
+            bb.x_max - bb.x_min + pad * 2,
+            bb.y_max - bb.y_min + pad * 2,
+        )
+
+    def boundingRect(self) -> QRectF:
+        return self._current_bbox().adjusted(-4, -4, 4, 4)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        rect = self._current_bbox()
+        if self._editing:
+            border = _GROUP_BORDER_EDITING
+        elif self.isSelected():
+            border = _GROUP_BORDER_HOVER
+        else:
+            border = _GROUP_BORDER_IDLE
+
+        pen = QPen(QColor(border), 1.2)
+        pen.setCosmetic(True)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setDashPattern([8, 4])
+        painter.setPen(pen)
+        fill = QColor(border); fill.setAlpha(_GROUP_BG_ALPHA)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(rect, um_to_dbu(1), um_to_dbu(1))
+
+        name_pen = QPen(QColor(border)); name_pen.setCosmetic(True)
+        painter.setPen(name_pen)
+        font = painter.font()
+        font.setPixelSize(um_to_dbu(3))
+        painter.setFont(font)
+        painter.drawText(
+            QPointF(rect.left() + um_to_dbu(1),
+                    rect.top()  - um_to_dbu(0.5)),
+            self._group.name,
+        )
+
+    def hoverEnterEvent(self, event) -> None:
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        self.update(); super().hoverEnterEvent(event)
+
+    def hoverLeaveEvent(self, event) -> None:
+        self.unsetCursor()
+        self.update(); super().hoverLeaveEvent(event)
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton and not self._editing:
+            self._drag_start    = event.scenePos()
+            self._last_drag_pos = event.scenePos()
+            self._total_dx      = 0
+            self._total_dy      = 0
+            event.accept()
+            self._scene_ref.group_selected.emit(self._group.id)
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_start is None or self._editing:
+            super().mouseMoveEvent(event)
+            return
+
+        # Incremental delta since last frame — move members live
+        cur  = event.scenePos()
+        dx   = int(round(cur.x() - self._last_drag_pos.x()))
+        dy   = int(round(cur.y() - self._last_drag_pos.y()))
+
+        if dx != 0 or dy != 0:
+            for cid in self._group.member_ids:
+                comp = self._scene_ref._design.get(cid)
+                if comp:
+                    comp.move_by(dx, dy)
+            # Sync Qt items immediately — no full _on_model_changed needed
+            for cid in self._group.member_ids:
+                item = self._scene_ref._items.get(cid)
+                if item:
+                    item.sync_from_model()
+                    item.refresh_connection_state(self._scene_ref._design)
+
+            self._total_dx      += dx
+            self._total_dy      += dy
+            self._last_drag_pos  = cur
+
+            # Invalidate group border so it redraws at new position
+            self.prepareGeometryChange()
+
+        event.accept()
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._drag_start is not None
+                and not self._editing):
+
+            total_dx = self._total_dx
+            total_dy = self._total_dy
+
+            if total_dx != 0 or total_dy != 0:
+                # Reverse the live moves so the model is back at start,
+                # then re-apply via the command stack for a clean undo entry
+                for cid in self._group.member_ids:
+                    comp = self._scene_ref._design.get(cid)
+                    if comp:
+                        comp.move_by(-total_dx, -total_dy)
+
+                self._scene_ref.cmd_stack.execute(
+                    MoveGroup(self._group.id, total_dx, total_dy)
+                )
+
+            self._drag_start    = None
+            self._last_drag_pos = None
+            self._total_dx      = 0
+            self._total_dy      = 0
+            event.accept()
+            return
+
+        super().mouseReleaseEvent(event)
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        self.enter_edit_mode()
+        self._scene_ref.group_edit_entered.emit(self._group.id)
+        event.accept()
 
 
 # ── Component Graphics Item ───────────────────────────────────────────────────
@@ -521,11 +703,16 @@ class CanvasScene(QGraphicsScene):
     scene_changed      = pyqtSignal()
     mode_changed       = pyqtSignal(str)
     connections_changed = pyqtSignal()   # fired after any wiring change
+    group_edit_entered = pyqtSignal(str)   # group_id
+    group_edit_exited  = pyqtSignal()
+    group_selected = pyqtSignal(str)
 
     def __init__(self, design: DesignScene, parent=None) -> None:
         super().__init__(parent)
         self._design = design
         self._items: Dict[str, ComponentItem] = {}
+        self._group_items: Dict[str, GroupItem] = {}
+        self._editing_group_id: Optional[str]  = None
         self.cmd_stack = CommandStack(design)
         self.cmd_stack.connect_change(self._on_model_changed)
 
@@ -540,6 +727,8 @@ class CanvasScene(QGraphicsScene):
         # Wire Qt's built-in selection signal so the properties panel clears
         # when the user clicks empty canvas (previously this was never connected).
         self.selectionChanged.connect(self._on_selection_changed)
+        self.group_edit_entered.connect(self._on_group_edit_entered)
+
 
     # ── Public placement API ──────────────────────────────────────────────────
 
@@ -749,6 +938,30 @@ class CanvasScene(QGraphicsScene):
     # ── Mouse events ──────────────────────────────────────────────────────────
 
     def mousePressEvent(self, event) -> None:
+        # Exit group edit if clicking outside any group member
+        if self._editing_group_id:
+            group = self._design.get_group(self._editing_group_id)
+            if group:
+                hit = self.itemAt(
+                    event.scenePos(),
+                    self.views()[0].transform() if self.views() else QTransform()
+                )
+                # Walk up the item hierarchy — hit might be a child (port dot, delegate)
+                candidate = hit
+                while candidate is not None:
+                    if hasattr(candidate, "component"):
+                        break
+                    candidate = candidate.parentItem()
+
+                hit_comp = getattr(candidate, "component", None)
+                is_member = (hit_comp is not None and
+                            hit_comp.id in group.member_ids)
+
+                if not is_member:
+                    self.exit_group_edit()
+                    # Deselect everything so the group border clears
+                    self.clearSelection()
+
         snapped = self.snap_f(event.scenePos().x(), event.scenePos().y())
 
         if self._pl.mode == PlacementMode.PLACE_RECT:
@@ -942,6 +1155,9 @@ class CanvasScene(QGraphicsScene):
             if hasattr(item, "component"):
                 self.item_selected.emit(item.component.id)
 
+    def _on_group_edit_entered(self, group_id: str) -> None:
+        self._editing_group_id = group_id
+
     def _on_model_changed(self) -> None:
         model_ids = {c.id for c in self._design.components}
         scene_ids = set(self._items.keys())
@@ -958,6 +1174,45 @@ class CanvasScene(QGraphicsScene):
         for comp in self._design.components:
             self._items[comp.id].sync_from_model()
 
+        # ── Group sync ────────────────────────────────────────────────────────
+        model_gids  = {g.id for g in self._design.groups}
+        scene_gids  = set(self._group_items.keys())
+
+        for group in self._design.groups:
+            if group.id not in self._group_items:
+                gi = GroupItem(group, self)
+                self.addItem(gi)
+                self._group_items[group.id] = gi
+
+        for dead_id in scene_gids - model_gids:
+            self.removeItem(self._group_items.pop(dead_id))
+
+        # Invalidate group geometry after any model change
+        for gi in self._group_items.values():
+            gi.prepareGeometryChange()
+
         self.refresh_all_indicators()
         self.scene_changed.emit()
         self.update()
+
+    def _set_group_members_movable(self, group_id: str, movable: bool) -> None:
+        group = self._design.get_group(group_id)
+        if not group:
+            return
+        for cid in group.member_ids:
+            item = self._items.get(cid)
+            if item:
+                item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIsMovable, movable
+                )
+                item.setFlag(
+                    QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, movable
+                )
+
+    def exit_group_edit(self) -> None:
+        if self._editing_group_id:
+            gi = self._group_items.get(self._editing_group_id)
+            if gi:
+                gi.exit_edit_mode()
+            self._editing_group_id = None
+            self.group_edit_exited.emit()
