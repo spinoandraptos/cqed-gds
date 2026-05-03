@@ -8,6 +8,19 @@ Handles:
   - Zoom limits (1 nm/px → 1 mm/px)
   - Crosshair cursor overlay
   - Adaptive grid density (hides minor grid when zoomed out)
+
+Fix (drag bug):
+  The view previously used RubberBandDrag as its default drag mode.
+  That caused Qt to intercept every left-button drag at the view level and
+  start a rubber-band, which meant mouseMoveEvent was never forwarded to
+  ComponentItem during a drag — so _on_item_move was never called and
+  nothing moved.
+
+  Solution: default drag mode is now NoDrag so scene items receive all
+  mouse events unobstructed.  Rubber-band selection on empty canvas is
+  restored by temporarily switching to RubberBandDrag in mousePressEvent
+  only when no item is under the cursor, and switching back to NoDrag on
+  release.
 """
 
 from __future__ import annotations
@@ -40,10 +53,11 @@ class CanvasView(QGraphicsView):
     def __init__(self, scene, parent=None) -> None:
         super().__init__(scene, parent)
 
-        self._pan_active     = False
-        self._pan_start      = QPointF()
-        self._space_held     = False
-        self._current_zoom   = 1.0       # px per DBU unit
+        self._pan_active       = False
+        self._pan_start        = QPointF()
+        self._space_held       = False
+        self._current_zoom     = 1.0       # px per DBU unit
+        self._rubber_banding   = False     # True while an empty-canvas drag is live
 
         self._setup_view()
         self._fit_all()
@@ -64,7 +78,10 @@ class CanvasView(QGraphicsView):
         self.setResizeAnchor(
             QGraphicsView.ViewportAnchor.AnchorViewCenter
         )
-        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        # NoDrag by default — scene items must receive mouse events unobstructed.
+        # Rubber-band is enabled temporarily in mousePressEvent when clicking
+        # empty canvas (see below).
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
         self.setFrameShape(QFrame.Shape.NoFrame)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
@@ -117,7 +134,7 @@ class CanvasView(QGraphicsView):
     def _end_pan(self) -> None:
         self._pan_active = False
         self.setCursor(Qt.CursorShape.CrossCursor)
-        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
 
     def _do_pan(self, pos: QPointF) -> None:
         delta = pos - self._pan_start
@@ -128,6 +145,28 @@ class CanvasView(QGraphicsView):
         self.verticalScrollBar().setValue(
             self.verticalScrollBar().value() - int(delta.y())
         )
+
+    # ── Rubber-band helpers ───────────────────────────────────────────────────
+
+    def _item_under(self, viewport_pos) -> bool:
+        """Return True if there is any interactive item under the viewport position."""
+        scene_pos = self.mapToScene(viewport_pos.toPoint())
+        items = self.scene().items(scene_pos)
+        # Ignore purely decorative items that have no mouse buttons accepted
+        for item in items:
+            if item.acceptedMouseButtons() != Qt.MouseButton.NoButton:
+                return True
+        return False
+
+    def _start_rubber_band(self) -> None:
+        """Temporarily enable rubber-band drag for an empty-canvas drag gesture."""
+        self._rubber_banding = True
+        self.setDragMode(QGraphicsView.DragMode.RubberBandDrag)
+
+    def _end_rubber_band(self) -> None:
+        """Restore NoDrag after rubber-band selection finishes."""
+        self._rubber_banding = False
+        self.setDragMode(QGraphicsView.DragMode.NoDrag)
 
     # ── Drag-and-drop (receive from palette) ──────────────────────────────────
 
@@ -177,12 +216,22 @@ class CanvasView(QGraphicsView):
             )
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
+        # ── Pan: middle-button or Space+left ──────────────────────────────────
         if event.button() == Qt.MouseButton.MiddleButton or (
             event.button() == Qt.MouseButton.LeftButton and self._space_held
         ):
             self._start_pan(event.position())
             event.accept()
             return
+
+        # ── Left click on empty canvas → start rubber-band selection ─────────
+        # Only arm rubber-band when no interactive item is under the cursor so
+        # that clicks/drags on items are delivered straight to the scene/items.
+        if (event.button() == Qt.MouseButton.LeftButton
+                and not self._item_under(event.position())):
+            self._start_rubber_band()
+            # Fall through to super() so Qt can start the rubber-band gesture.
+
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
@@ -193,6 +242,7 @@ class CanvasView(QGraphicsView):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        # End pan
         if self._pan_active and (
             event.button() == Qt.MouseButton.MiddleButton or
             event.button() == Qt.MouseButton.LeftButton
@@ -200,6 +250,13 @@ class CanvasView(QGraphicsView):
             self._end_pan()
             event.accept()
             return
+
+        # End rubber-band — let super() commit the selection first, then clean up
+        if self._rubber_banding and event.button() == Qt.MouseButton.LeftButton:
+            super().mouseReleaseEvent(event)
+            self._end_rubber_band()
+            return
+
         super().mouseReleaseEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent) -> None:

@@ -36,7 +36,7 @@ from core.model import (
     DesignScene, GDSComponent, ComponentKind,
     Point, Port, PortSide, dbu_to_um, um_to_dbu, ComponentGroup
 )
-from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts, MoveGroup
+from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts, MoveGroup, BatchCommand
 from ui.theme import Colors
 
 
@@ -337,12 +337,10 @@ class GroupItem(QGraphicsItem):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._editing:
             self._scene_ref.group_selected.emit(self._group.id)
+            # Select the group if not already selected
             if not self.isSelected():
-                # First press: select only, don't arm drag
                 self.setSelected(True)
-                event.accept()
-                return
-            # Already selected: arm drag normally
+            # Always arm drag on the first press — don't require a second click
             self._drag_start    = event.scenePos()
             self._last_drag_pos = event.scenePos()
             self._total_dx      = 0
@@ -464,9 +462,6 @@ class ComponentItem(QGraphicsItem):
         self._drag_start:  Optional[QPointF] = None
         self._orig_pos:    Optional[Point]   = None
         self._snap_offset: Optional[Point]   = None
-        self._orig_positions: dict             = {}    
-        self._drag_committed: bool             = False  
-        self._was_selected:   bool             = False  
 
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
@@ -652,107 +647,27 @@ class ComponentItem(QGraphicsItem):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._was_selected = self.isSelected()
-            self._drag_start   = event.scenePos()
-            self._drag_committed = False
-            # Snapshot origins of ALL currently-selected items (including self)
-            super().mousePressEvent(event)   # lets Qt handle selection logic
-            self._orig_positions = {
-                item: Point(item._comp.origin.x, item._comp.origin.y)
-                for item in self._scene_ref.selectedItems()
-                if isinstance(item, ComponentItem)
-            }
-            self._snap_offset = None
+            event.accept()
         else:
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag_start is None:
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            self._scene_ref._on_item_move(event)
+            event.accept()
+        else:
             super().mouseMoveEvent(event)
-            return
-        delta = event.scenePos() - self._drag_start
-        if not self._drag_committed:
-            # Require a minimum movement threshold before starting drag
-            if abs(delta.x()) < 2.0 and abs(delta.y()) < 2.0:
-                return
-            self._drag_committed = True
-
-        # Move all selected items together
-        for item, orig in self._orig_positions.items():
-            tentative = Point(
-                orig.x + int(round(delta.x())),
-                orig.y + int(round(delta.y())),
-            )
-            dx = tentative.x - item._comp.origin.x
-            dy = tentative.y - item._comp.origin.y
-            item._comp.move_by(dx, dy)
-            item.sync_from_model()
-
-        # Port snap only for the item under the cursor
-        my_tentative = Point(
-            self._orig_positions[self]._comp_x() + int(round(delta.x())),
-            self._orig_positions[self]._comp_y() + int(round(delta.y())),
-        ) if self in self._orig_positions else None
-        self._scene_ref.clear_all_port_highlights()
-        if len(self._orig_positions) == 1 and self in self._orig_positions:
-            orig_self = self._orig_positions[self]
-            tentative = Point(
-                orig_self.x + int(round(delta.x())),
-                orig_self.y + int(round(delta.y())),
-            )
-            snap_result = self._scene_ref.find_port_snap(self._comp, tentative)
-            if snap_result:
-                snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
-                self._snap_offset = snap_origin
-                self.set_port_active(my_port_id, True)
-                other_item = self._scene_ref.item_for(their_comp_id)
-                if other_item:
-                    other_item.set_port_active(their_port_id, True)
-                return
-        self._snap_offset = None
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
-            self._scene_ref.clear_all_port_highlights()
-            if self._drag_committed:
-                delta = event.scenePos() - self._drag_start
-                for item, orig in self._orig_positions.items():
-                    if self._snap_offset is not None and item is self and len(self._orig_positions) == 1:
-                        final = self._snap_offset
-                    else:
-                        raw = Point(
-                            orig.x + int(round(delta.x())),
-                            orig.y + int(round(delta.y())),
-                        )
-                        final = self._scene_ref.snap(raw)
-                    if final != orig:
-                        self._scene_ref.disconnect_component(item._comp.id)
-                        # Reset to original so MoveComponent sees correct old pos
-                        dx = orig.x - item._comp.origin.x
-                        dy = orig.y - item._comp.origin.y
-                        item._comp.move_by(dx, dy)
-                        self._scene_ref.cmd_stack.execute(
-                            MoveComponent(item._comp.id, orig, final)
-                        )
-                    else:
-                        item.sync_from_model()
-                if self._snap_offset is not None and len(self._orig_positions) == 1:
-                    self._scene_ref._try_connect_snapped(self._comp, self._snap_offset)
-            self._drag_start     = None
-            self._orig_positions = {}
-            self._drag_committed = False
-            self._snap_offset    = None
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._scene_ref._on_item_release(event)
             event.accept()
-            return
-        super().mouseReleaseEvent(event)
+        else:
+            super().mouseReleaseEvent(event)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
-            selected = bool(value)
-            self._apply_style(selected, hovered=False)
-            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, selected)
-            if selected:
-                self._scene_ref.item_selected.emit(self._comp.id)
+            self._apply_style(bool(value), hovered=False)
         return super().itemChange(change, value)
 
 
@@ -787,6 +702,12 @@ class CanvasScene(QGraphicsScene):
         # Placement FSM — all state lives in one object; reset atomically.
         self._pl = PlacementState()
         self._pl.mode = PlacementMode.SELECT
+
+        # ── Drag state (managed at scene level) ───────────────────────────────
+        self._drag_start:     Optional[QPointF] = None
+        self._orig_positions: dict              = {}   # ComponentItem → Point
+        self._drag_committed: bool              = False
+        self._snap_offset:    Optional[Point]   = None
 
         # Wire Qt's built-in selection signal so the properties panel clears
         # when the user clicks empty canvas (previously this was never connected).
@@ -1084,37 +1005,35 @@ class CanvasScene(QGraphicsScene):
 
     # ── Mouse events ──────────────────────────────────────────────────────────
 
+    def _hit_component_item(self, scene_pos) -> Optional["ComponentItem"]:
+        """Walk the item at scene_pos up to the nearest ComponentItem, or None."""
+        transform = self.views()[0].transform() if self.views() else QTransform()
+        hit = self.itemAt(scene_pos, transform)
+        candidate = hit
+        while candidate is not None:
+            if isinstance(candidate, ComponentItem):
+                return candidate
+            candidate = candidate.parentItem()
+        return None
+
     def mousePressEvent(self, event) -> None:
-        # Exit group edit if clicking outside any group member
+        # ── Exit group edit on outside click ─────────────────────────────────
         if self._editing_group_id:
             group = self._design.get_group(self._editing_group_id)
             if group:
-                hit = self.itemAt(
-                    event.scenePos(),
-                    self.views()[0].transform() if self.views() else QTransform()
-                )
-                # Walk up the item hierarchy — hit might be a child (port dot, delegate)
-                candidate = hit
-                while candidate is not None:
-                    if hasattr(candidate, "component"):
-                        break
-                    candidate = candidate.parentItem()
-
-                hit_comp = getattr(candidate, "component", None)
-                is_member = (hit_comp is not None and
-                            hit_comp.id in group.member_ids)
-
+                hit_comp = getattr(self._hit_component_item(event.scenePos()), "component", None)
+                is_member = hit_comp is not None and hit_comp.id in group.member_ids
                 if not is_member:
                     self.exit_group_edit()
-                    # Deselect everything so the group border clears
                     self.clearSelection()
 
         snapped = self.snap_f(event.scenePos().x(), event.scenePos().y())
 
+        # ── Placement modes ───────────────────────────────────────────────────
         if self._pl.mode == PlacementMode.PLACE_RECT:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._stamp_rect(snapped)
-            return  # don't forward to items in placement mode
+            return
 
         if self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             if event.button() == Qt.MouseButton.LeftButton:
@@ -1123,15 +1042,29 @@ class CanvasScene(QGraphicsScene):
                 self._commit_poly_or_path()
             return
 
-        super().mousePressEvent(event)
+        # ── Select mode ───────────────────────────────────────────────────────
+        if event.button() == Qt.MouseButton.LeftButton:
+            comp_item = self._hit_component_item(event.scenePos())
+            if comp_item is not None:
+                # Item hit — _on_item_press (called via item.mousePressEvent)
+                # owns all selection logic. Call super() only to deliver the
+                # event to the item; Qt will NOT apply its own selection logic
+                # when the item's mousePressEvent accepts and returns without
+                # calling its own super().
+                self._on_item_press(comp_item, event)
+                return
+            else:
+                # Empty canvas — clear selection unless modifier held,
+                # then let super() start a rubber-band drag.
+                modifiers = event.modifiers()
+                multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
+                                          Qt.KeyboardModifier.ShiftModifier))
+                if not multi:
+                    self.clearSelection()
+                super().mousePressEvent(event)
+                return
 
-    def mouseDoubleClickEvent(self, event) -> None:
-        if self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
-            snapped = self.snap_f(event.scenePos().x(), event.scenePos().y())
-            self._add_vertex(snapped)
-            self._commit_poly_or_path()
-            return
-        super().mouseDoubleClickEvent(event)
+        super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
         raw     = event.scenePos()
@@ -1144,6 +1077,140 @@ class CanvasScene(QGraphicsScene):
             self._update_ghost_edge(snapped)
 
         super().mouseMoveEvent(event)
+
+    def _on_item_press(self, item: "ComponentItem", event) -> None:
+        """Called by ComponentItem.mousePressEvent — handles select + drag arm."""
+        modifiers = event.modifiers()
+        multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
+                                  Qt.KeyboardModifier.ShiftModifier))
+
+        # Block Qt's selectionChanged signal while we manipulate selection
+        # so _on_selection_changed doesn't fire mid-operation.
+        self.blockSignals(True)
+        try:
+            if multi:
+                item.setSelected(not item.isSelected())
+            else:
+                if not item.isSelected():
+                    self.clearSelection()
+                    item.setSelected(True)
+                # already selected: keep existing multi-selection for drag
+        finally:
+            self.blockSignals(False)
+
+        # Snapshot origins of everything currently selected
+        self._drag_start     = event.scenePos()
+        self._drag_committed = False
+        self._snap_offset    = None
+        self._orig_positions = {
+            i: Point(i._comp.origin.x, i._comp.origin.y)
+            for i in self.selectedItems()
+            if isinstance(i, ComponentItem)
+        }
+
+        # Fire selection signal once, cleanly, after we're done
+        sel = self.selectedItems()
+        if not sel:
+            self.item_selected.emit("")
+        elif len(sel) == 1 and hasattr(sel[0], "component"):
+            self.item_selected.emit(sel[0].component.id)
+
+    def _on_item_move(self, event) -> None:
+        """Called by ComponentItem.mouseMoveEvent during drag."""
+        if self._drag_start is None or not self._orig_positions:
+            return
+        delta = event.scenePos() - self._drag_start
+        if not self._drag_committed:
+            if abs(delta.x()) < 3.0 and abs(delta.y()) < 3.0:
+                return
+            self._drag_committed = True
+
+        for item, orig in self._orig_positions.items():
+            new_x = orig.x + int(round(delta.x()))
+            new_y = orig.y + int(round(delta.y()))
+            dx = new_x - item._comp.origin.x
+            dy = new_y - item._comp.origin.y
+            if dx != 0 or dy != 0:
+                item._comp.move_by(dx, dy)
+                item.sync_from_model()
+
+        self.clear_all_port_highlights()
+        self._snap_offset = None
+        if len(self._orig_positions) == 1:
+            item = next(iter(self._orig_positions))
+            orig = self._orig_positions[item]
+            tentative = Point(
+                orig.x + int(round(delta.x())),
+                orig.y + int(round(delta.y())),
+            )
+            snap_result = self.find_port_snap(item._comp, tentative)
+            if snap_result:
+                snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
+                self._snap_offset = snap_origin
+                item.set_port_active(my_port_id, True)
+                other = self.item_for(their_comp_id)
+                if other:
+                    other.set_port_active(their_port_id, True)
+
+    def _on_item_release(self, event) -> None:
+        self.clear_all_port_highlights()
+        if not self._drag_committed or not self._orig_positions:
+            self._drag_start     = None
+            self._orig_positions = {}
+            self._drag_committed = False
+            self._snap_offset    = None
+            return
+
+        delta = event.scenePos() - self._drag_start
+
+        # ── Build move commands ───────────────────────────────────────────────
+        move_cmds = []
+        for item, orig in self._orig_positions.items():
+            if self._snap_offset is not None and len(self._orig_positions) == 1:
+                final = self._snap_offset
+            else:
+                raw   = Point(orig.x + int(round(delta.x())),
+                            orig.y + int(round(delta.y())))
+                final = self.snap(raw)
+
+            # Revert live move so MoveComponent records correct before/after
+            item._comp.move_by(orig.x - item._comp.origin.x,
+                            orig.y - item._comp.origin.y)
+
+            if final != orig:
+                self.disconnect_component(item._comp.id)
+                move_cmds.append(MoveComponent(item._comp.id, orig, final))
+
+            item.sync_from_model()
+
+        # ── Push as one undo unit ─────────────────────────────────────────────
+        if move_cmds:
+            if len(move_cmds) == 1:
+                self.cmd_stack.execute(move_cmds[0])
+            else:
+                # Wrap in BatchCommand so one Undo reverses all items together
+                from core.commands import BatchCommand
+                self.cmd_stack.execute(
+                    BatchCommand(move_cmds, f"Move {len(move_cmds)} components")
+                )
+
+        if self._snap_offset is not None and len(self._orig_positions) == 1:
+            item = next(iter(self._orig_positions))
+            self._try_connect_snapped(item._comp, self._snap_offset)
+
+        self._drag_start     = None
+        self._orig_positions = {}
+        self._drag_committed = False
+        self._snap_offset    = None
+
+        if self._snap_offset is not None and len(self._orig_positions) == 1:
+            item = next(iter(self._orig_positions))
+            self._try_connect_snapped(item._comp, self._snap_offset)
+
+        self._drag_start     = None
+        self._orig_positions = {}
+        self._drag_committed = False
+        self._snap_offset    = None
 
     def keyPressEvent(self, event) -> None:
         if event.key() == Qt.Key.Key_Escape:
