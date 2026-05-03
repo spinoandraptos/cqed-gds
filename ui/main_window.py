@@ -17,7 +17,7 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QHBoxLayout, QMainWindow, QToolBar, QLabel, QVBoxLayout,
     QWidget, QSizePolicy, QMessageBox, QApplication, QToolButton,
-    QDialog, QDialogButtonBox
+    QDialog, QDialogButtonBox, QFileDialog
 )
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QFont, QColor,
@@ -32,7 +32,8 @@ from ui.canvas_view import CanvasView
 from ui.panels import ComponentPalette, PropertiesPanel
 from core.model import DesignScene, GDSComponent, ComponentKind
 from core.commands import CommandStack, EditComponent
-
+from ui.export_dialog import ExportResultDialog
+from core.exporter import export_gds, ExportError
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -146,6 +147,10 @@ class MainWindow(QMainWindow):
         # ── Delete ────────────────────────────────────────────────────────────
         self._tb_button("fa5s.trash-alt", "Delete Selected  (Del)",
                         self._delete_selected, color=Colors.ERROR)
+        
+        # ── Export GDS ────────────────────────────────────────────────────────────
+        self._toolbar.addSeparator()
+        self._tb_button("fa5s.file-export", "Export GDS  (Ctrl+E)", self._export_gds, color=Colors.ACCENT)
 
         # ── Spacer + zoom readout ─────────────────────────────────────────────
         spacer = QWidget()
@@ -401,9 +406,33 @@ class MainWindow(QMainWindow):
 
     def _save(self)    -> None: self._flash_status("Save — coming Phase 4")
     def _save_as(self) -> None: self._flash_status("Save As — coming Phase 4")
-    def _export_gds(self) -> None: self._flash_status("GDS export — coming Phase 4")
 
-    # ── Title ─────────────────────────────────────────────────────────────────
+    def _export_gds(self) -> None:
+        if not self._design.components:
+            QMessageBox.warning(self, "Export GDS", "Nothing to export — add some shapes first.")
+            return
+
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export GDS", f"{self._design.name}.gds",
+            "GDS Files (*.gds);;All Files (*)",
+        )
+        if not path:
+            return
+
+        # Identity map: app layer N → GDS (layer=N, datatype=0)
+        layers = {c.layer for c in self._design.components}
+        layer_map = {layer: (layer, 0) for layer in layers}
+
+        try:
+            summary = export_gds(self._design, path, layer_map)
+        except ExportError as exc:
+            QMessageBox.critical(self, "Export Failed", str(exc))
+            return
+
+        self._flash_status(f"Exported {summary['shapes']} shapes to {path}")
+        result_dlg = ExportResultDialog(summary, self)
+        result_dlg.exec()
+        # ── Title ─────────────────────────────────────────────────────────────────
 
     def _update_title(self) -> None:
         dirty = " •" if self._design.is_dirty else ""
