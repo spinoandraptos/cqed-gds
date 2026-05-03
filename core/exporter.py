@@ -14,6 +14,12 @@ Design rules:
   - Polygons    → gdstk.Polygon
   - Paths       → gdstk.FlexPath  (round caps/joins, width in µm)
 
+Group merging (new):
+  Components that belong to the same ComponentGroup AND share the same
+  app-layer are boolean-unioned (OR) into a single merged polygon before
+  being written to the GDS cell.  Ungrouped components are written
+  individually, exactly as before.
+
 Verification:
   After writing, re-read the file with gdstk and return a summary dict so
   the caller can show a confirmation dialog without re-importing the file.
@@ -21,12 +27,16 @@ Verification:
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Tuple, Optional, Set
 
 import gdstk
 
-from core.model import DesignScene, GDSComponent, ComponentKind, dbu_to_um, DBU_PER_UM
+from core.model import (
+    DesignScene, GDSComponent, ComponentGroup, ComponentKind,
+    dbu_to_um, DBU_PER_UM,
+)
 
 # (gds_layer, datatype)
 LayerMap = Dict[int, Tuple[int, int]]
@@ -47,6 +57,58 @@ def _resolve(layer: int, layer_map: LayerMap) -> Tuple[int, int]:
     return layer_map.get(layer, (layer, 0))
 
 
+# ── Component → gdstk polygon list (without adding to a cell) ─────────────────
+
+def _comp_to_gdstk_polys(
+    comp: GDSComponent,
+    gds_layer: int,
+    datatype: int,
+) -> List[gdstk.Polygon]:
+    """
+    Convert a GDSComponent to a list of gdstk.Polygon objects.
+
+    FlexPath is converted via get_polygons() so that all geometry is
+    in a uniform polygon representation suitable for boolean operations.
+    Returns an empty list if the component has degenerate geometry.
+    """
+    if comp.kind == ComponentKind.RECTANGLE:
+        x0 =  _um(comp.origin.x)
+        y0 = -_um(comp.origin.y)
+        x1 = x0 + _um(comp.width)
+        y1 = y0 - _um(comp.height)
+        rect = gdstk.rectangle(
+            (x0, y0), (x1, y1),
+            layer=gds_layer, datatype=datatype,
+        )
+        return [rect]
+
+    elif comp.kind == ComponentKind.POLYGON:
+        if not comp.points or len(comp.points) < 3:
+            return []
+        pts = _pts_um(comp.points)
+        return [gdstk.Polygon(pts, layer=gds_layer, datatype=datatype)]
+
+    elif comp.kind == ComponentKind.PATH:
+        if not comp.points or len(comp.points) < 2:
+            return []
+        pts   = _pts_um(comp.points)
+        width = _um(comp.path_width) if comp.path_width else 0.001
+        fp    = gdstk.FlexPath(
+            pts[0], width,
+            layer=gds_layer, datatype=datatype,
+        )
+        for pt in pts[1:]:
+            fp.segment(pt)
+        # Flatten FlexPath → plain Polygon list for boolean ops
+        polys = fp.get_polygons()
+        for p in polys:
+            p.layer    = gds_layer
+            p.datatype = datatype
+        return list(polys)
+
+    return []
+
+
 # ── Core export ───────────────────────────────────────────────────────────────
 
 class ExportError(Exception):
@@ -62,6 +124,10 @@ def export_gds(
 ) -> dict:
     """
     Write *design* to a GDS-II file at *path*.
+
+    Components that belong to the same group and share the same app-layer
+    are boolean-unioned into a single merged shape.  All other components
+    are written individually.
 
     Returns a verification summary dict:
         {
@@ -83,9 +149,22 @@ def export_gds(
         lib  = gdstk.Library(unit=unit, precision=precision)
         cell = lib.new_cell(design.name)
 
+        # ── Partition components into grouped vs ungrouped ────────────────────
+        grouped_ids: Set[str] = set()
+        for group in design.groups:
+            grouped_ids.update(group.member_ids)
+
+        comp_map = {c.id: c for c in design.components}
+
+        # ── Emit merged shapes for each (group × layer) bucket ───────────────
+        for group in design.groups:
+            _emit_merged_group(cell, group, comp_map, layer_map)
+
+        # ── Emit ungrouped components individually (unchanged behaviour) ──────
         for comp in design.components:
-            gds_layer, datatype = _resolve(comp.layer, layer_map)
-            _add_component(cell, comp, gds_layer, datatype)
+            if comp.id not in grouped_ids:
+                gds_layer, datatype = _resolve(comp.layer, layer_map)
+                _add_component(cell, comp, gds_layer, datatype)
 
         lib.write_gds(str(path))
 
@@ -94,16 +173,66 @@ def export_gds(
     except Exception as exc:
         raise ExportError(f"gdstk error: {exc}") from exc
 
-    # ── Verify by re-reading ──────────────────────────────────────────────────
     return _verify(path, design.name)
 
 
-def _add_component(cell, comp, gds_layer, datatype):
+# ── Group merger ──────────────────────────────────────────────────────────────
+
+def _emit_merged_group(
+    cell,
+    group: ComponentGroup,
+    comp_map: Dict[str, GDSComponent],
+    layer_map: LayerMap,
+) -> None:
+    """
+    For each unique app-layer present among the group's members, collect all
+    polygon geometry and boolean-union it into one (or more) merged polygon(s).
+    The result is added directly to *cell*.
+    """
+    # Bucket member components by app-layer
+    by_layer: Dict[int, List[GDSComponent]] = defaultdict(list)
+    for cid in group.member_ids:
+        comp = comp_map.get(cid)
+        if comp is not None:
+            by_layer[comp.layer].append(comp)
+
+    for app_layer, comps in by_layer.items():
+        gds_layer, datatype = _resolve(app_layer, layer_map)
+
+        # Gather all polygon geometry for this (group, layer) bucket
+        all_polys: List[gdstk.Polygon] = []
+        for comp in comps:
+            all_polys.extend(_comp_to_gdstk_polys(comp, gds_layer, datatype))
+
+        if not all_polys:
+            continue
+
+        if len(all_polys) == 1:
+            # Nothing to merge — emit as-is
+            cell.add(all_polys[0])
+        else:
+            # Boolean OR → unified outline, no interior seams
+            merged = gdstk.boolean(
+                all_polys, [],
+                operation="or",
+                layer=gds_layer,
+                datatype=datatype,
+            )
+            if merged:
+                cell.add(*merged)
+            else:
+                # Fallback: union returned nothing (degenerate case), emit raw
+                cell.add(*all_polys)
+
+
+# ── Individual component emitter (ungrouped path, unchanged) ──────────────────
+
+def _add_component(cell, comp: GDSComponent, gds_layer: int, datatype: int) -> None:
     if comp.kind == ComponentKind.RECTANGLE:
         x0 =  _um(comp.origin.x)
         y0 = -_um(comp.origin.y)           # negate Y
         x1 = x0 + _um(comp.width)
-        y1 = y0 - _um(comp.height)         # negate Y (height goes the other way now)
+        y1 = y0 - _um(comp.height)         # negate Y
         cell.add(gdstk.rectangle(
             (x0, y0), (x1, y1),
             layer=gds_layer, datatype=datatype,
@@ -112,13 +241,13 @@ def _add_component(cell, comp, gds_layer, datatype):
     elif comp.kind == ComponentKind.POLYGON:
         if not comp.points or len(comp.points) < 3:
             return
-        pts = _pts_um(comp.points)          # already negates Y
+        pts = _pts_um(comp.points)
         cell.add(gdstk.Polygon(pts, layer=gds_layer, datatype=datatype))
 
     elif comp.kind == ComponentKind.PATH:
         if not comp.points or len(comp.points) < 2:
             return
-        pts   = _pts_um(comp.points)        # already negates Y
+        pts   = _pts_um(comp.points)
         width = _um(comp.path_width) if comp.path_width else 0.001
         fp    = gdstk.FlexPath(
             pts[0], width,
@@ -128,6 +257,8 @@ def _add_component(cell, comp, gds_layer, datatype):
             fp.segment(pt)
         cell.add(fp)
 
+
+# ── Verification ──────────────────────────────────────────────────────────────
 
 def _verify(path: Path, cell_name: str) -> dict:
     """Re-read the written file and return a summary."""
