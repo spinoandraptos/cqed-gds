@@ -252,6 +252,8 @@ class MainWindow(QMainWindow):
         self._scene.item_hovered.connect(self._on_item_hovered)
         self._scene.scene_changed.connect(self._on_scene_changed)
         self._scene.mode_changed.connect(self._on_mode_changed)
+        self._scene.connections_changed.connect(self._refresh_props_for_selection)
+
 
         # Phase 2: palette requests a mode, not an immediate placement
         self._palette.place_mode_requested.connect(self._on_place_mode_requested)
@@ -275,7 +277,7 @@ class MainWindow(QMainWindow):
         if comp_id:
             comp = self._design.get(comp_id)
             if comp:
-                self._props.show_component(comp)
+                self._props.show_component(comp, self._design)
                 self._sb_layer.setText(f"LAYER  {comp.layer}")
                 return
         self._props.clear()
@@ -336,7 +338,7 @@ class MainWindow(QMainWindow):
         if item:
             item.sync_from_model()
         # Refresh the panel so bbox and spinbox values reflect the new state.
-        self._props.show_component(comp)
+        self._props.show_component(comp, self._design)
         label = field.replace("_", " ").title()
         self._flash_status(f"{label} → {value_dbu / 1000:.3f} µm")
 
@@ -345,6 +347,12 @@ class MainWindow(QMainWindow):
         label = f"ZOOM  {zoom * 1000:.2f} px/µm"
         self._sb_zoom.setText(label)
         self._tb_zoom_label.setText(f"{zoom * 1000:.2f} px/µm")
+
+    def _refresh_props_for_selection(self) -> None:
+        """Re-populate the properties panel after a wiring change."""
+        selected = self._scene.selectedItems()
+        if len(selected) == 1 and hasattr(selected[0], "component"):
+            self._props.show_component(selected[0].component, self._design)
 
     # ── Mode helpers ──────────────────────────────────────────────────────────
 

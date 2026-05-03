@@ -24,7 +24,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray
 from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QDrag, QMouseEvent
 
 from ui.theme import Colors, Fonts, Geometry
-from core.model import GDSComponent, ComponentKind, dbu_to_um, um_to_dbu
+from core.model import GDSComponent, ComponentKind, PortSide, dbu_to_um, um_to_dbu
 
 
 # ── Helper widgets ────────────────────────────────────────────────────────────
@@ -360,6 +360,12 @@ class PropertiesPanel(QWidget):
         self._row_bbox = ValueRow("Extents")
         cl.addWidget(self._row_bbox)
 
+        cl.addWidget(Separator())
+        
+        cl.addWidget(SectionLabel("Connections"))
+        self._row_connections = ValueRow("Connected")
+        cl.addWidget(self._row_connections)
+
         cl.addStretch()
 
         scroll = QScrollArea()
@@ -427,8 +433,9 @@ class PropertiesPanel(QWidget):
         for r in [self._row_id, self._row_kind, self._row_x, self._row_y,
                   self._row_verts, self._row_bbox]:
             r.set_value("—")
+        self._row_connections.set_value("—")
 
-    def show_component(self, comp: GDSComponent) -> None:
+    def show_component(self, comp: GDSComponent, design=None) -> None:
         self._current_comp_id = comp.id
         bb = comp.bbox
 
@@ -481,6 +488,25 @@ class PropertiesPanel(QWidget):
             f"({dbu_to_um(bb.x_min):.1f}, {dbu_to_um(bb.y_min):.1f})"
             f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f})"
         )
+
+        # Connections — requires design to resolve port→side mapping
+        if design is not None:
+            sides = design.connected_sides(comp.id)
+            if sides:
+                # e.g. "N · E"
+                order = [PortSide.NORTH, PortSide.SOUTH, PortSide.EAST, PortSide.WEST]
+                labels = {
+                    PortSide.NORTH: "N",
+                    PortSide.SOUTH: "S",
+                    PortSide.EAST:  "E",
+                    PortSide.WEST:  "W",
+                }
+                text = "  ·  ".join(labels[s] for s in order if s in sides)
+                self._row_connections.set_value(text)
+            else:
+                self._row_connections.set_value("None")
+        else:
+            self._row_connections.set_value("—")
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 

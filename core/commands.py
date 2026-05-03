@@ -14,7 +14,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
-from core.model import DesignScene, GDSComponent, Point
+from core.model import DesignScene, GDSComponent, Point, Connection
 
 # Fields that EditComponent is allowed to mutate.
 # A typo in a key name silently creates a new attribute on the dataclass,
@@ -157,6 +157,54 @@ class SetPolygonPoints(Command):
     @property
     def description(self) -> str:
         return "Edit polygon vertices"
+
+
+class ConnectPorts(Command):
+    """Create a connection between two (component, port) pairs."""
+
+    def __init__(self, comp_a_id: str, port_a_id: str,
+                 comp_b_id: str, port_b_id: str) -> None:
+        self._comp_a = comp_a_id
+        self._port_a = port_a_id
+        self._comp_b = comp_b_id
+        self._port_b = port_b_id
+        self._conn_id: Optional[str] = None
+
+    def execute(self, design: DesignScene) -> None:
+        conn = design.connect(self._comp_a, self._port_a,
+                              self._comp_b, self._port_b)
+        self._conn_id = conn.id
+        design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        if self._conn_id:
+            design.disconnect(self._conn_id)
+
+    @property
+    def description(self) -> str:
+        return "Connect ports"
+
+
+class DisconnectPorts(Command):
+    """Remove an existing connection."""
+
+    def __init__(self, connection: Connection) -> None:
+        self._snap = Connection(
+            comp_a=connection.comp_a, port_a=connection.port_a,
+            comp_b=connection.comp_b, port_b=connection.port_b,
+            id=connection.id,
+        )
+
+    def execute(self, design: DesignScene) -> None:
+        design.disconnect(self._snap.id)
+
+    def undo(self, design: DesignScene) -> None:
+        design.connect(self._snap.comp_a, self._snap.port_a,
+                       self._snap.comp_b, self._snap.port_b)
+
+    @property
+    def description(self) -> str:
+        return "Disconnect ports"
 
 
 # ── Command Stack ─────────────────────────────────────────────────────────────

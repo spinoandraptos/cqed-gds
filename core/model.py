@@ -20,7 +20,7 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import List, Optional, Callable
+from typing import Dict, List, Optional, Callable, Set
 
 
 # ── Unit conversion ───────────────────────────────────────────────────────────
@@ -208,6 +208,25 @@ class GDSComponent:
         ]
 
 
+# ── Connection ────────────────────────────────────────────────────────────────
+
+@dataclass
+class Connection:
+    """
+    An undirected bond between exactly two (component, port) pairs.
+    Stores IDs only — no live object references.
+    """
+    comp_a: str = ""
+    port_a: str = ""
+    comp_b: str = ""
+    port_b: str = ""
+    id:     str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    @property
+    def _key(self) -> frozenset:
+        return frozenset({(self.comp_a, self.port_a), (self.comp_b, self.port_b)})
+
+
 # ── Design scene ──────────────────────────────────────────────────────────────
 
 class DesignScene:
@@ -220,6 +239,7 @@ class DesignScene:
         self.name = name
         self.is_dirty = False
         self._components: List[GDSComponent] = []
+        self._connections: List[Connection]  = []
 
     @property
     def components(self) -> List[GDSComponent]:
@@ -233,6 +253,11 @@ class DesignScene:
         for i, c in enumerate(self._components):
             if c.id == comp_id:
                 self.is_dirty = True
+                # Purge connections involving this component
+                self._connections = [
+                    cn for cn in self._connections
+                    if cn.comp_a != comp_id and cn.comp_b != comp_id
+                ]
                 return self._components.pop(i)
         return None
 
@@ -244,7 +269,58 @@ class DesignScene:
 
     def clear(self) -> None:
         self._components.clear()
+        self._connections.clear()
         self.is_dirty = False
 
     def __len__(self) -> int:
         return len(self._components)
+
+    # ── Connection API ────────────────────────────────────────────────────────
+
+    @property
+    def connections(self) -> List[Connection]:
+        return list(self._connections)
+
+    def connect(self, comp_a_id: str, port_a_id: str,
+                comp_b_id: str, port_b_id: str) -> Connection:
+        """Create a bond between two ports. Idempotent — returns existing if already connected."""
+        new_key = frozenset({(comp_a_id, port_a_id), (comp_b_id, port_b_id)})
+        for existing in self._connections:
+            if existing._key == new_key:
+                return existing
+        conn = Connection(comp_a=comp_a_id, port_a=port_a_id,
+                          comp_b=comp_b_id, port_b=port_b_id)
+        self._connections.append(conn)
+        self.is_dirty = True
+        return conn
+
+    def disconnect(self, connection_id: str) -> bool:
+        for i, cn in enumerate(self._connections):
+            if cn.id == connection_id:
+                self._connections.pop(i)
+                self.is_dirty = True
+                return True
+        return False
+
+    def connections_for(self, comp_id: str) -> List[Connection]:
+        return [cn for cn in self._connections
+                if cn.comp_a == comp_id or cn.comp_b == comp_id]
+
+    def connected_sides(self, comp_id: str) -> List[PortSide]:
+        """Return which PortSides on comp_id currently have a connection."""
+        comp = self.get(comp_id)
+        if comp is None:
+            return []
+        port_map: Dict[str, Port] = {p.id: p for p in comp.ports}
+        occupied: Set[str] = set()
+        for cn in self.connections_for(comp_id):
+            if cn.comp_a == comp_id:
+                occupied.add(cn.port_a)
+            else:
+                occupied.add(cn.port_b)
+        return [port_map[pid].side for pid in occupied if pid in port_map]
+
+    def are_connected(self, comp_a_id: str, port_a_id: str,
+                      comp_b_id: str, port_b_id: str) -> bool:
+        key = frozenset({(comp_a_id, port_a_id), (comp_b_id, port_b_id)})
+        return any(cn._key == key for cn in self._connections)

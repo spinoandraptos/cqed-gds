@@ -36,7 +36,7 @@ from core.model import (
     DesignScene, GDSComponent, ComponentKind,
     Point, Port, PortSide, dbu_to_um, um_to_dbu,
 )
-from core.commands import CommandStack, AddComponent, MoveComponent
+from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts
 from ui.theme import Colors
 
 
@@ -51,6 +51,10 @@ DEFAULT_PW_DBU  = um_to_dbu(1)
 MIN_POLY_PTS    = 3
 VERTEX_DOT_R    = um_to_dbu(0.4)
 PORT_SNAP_RADIUS = um_to_dbu(8)   # snap kicks in within 8 µm
+
+# Connection edge indicator colours
+_CONN_FILL   = "#4ade80"   # green fill
+_CONN_BORDER = "#166534"   # dark green border
 
 
 # ── Placement FSM state ───────────────────────────────────────────────────────
@@ -126,9 +130,9 @@ class PortItem(QGraphicsItem):
         self._active  = False
         self.setZValue(8)
         self.setAcceptHoverEvents(False)
-        # Position relative to parent item's coordinate system.
-        # Parent (ComponentItem) lives at scene origin (pos = 0,0), so
-        # port offset IS the scene position.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         abs_pos = port.abs_pos(origin)
         self.setPos(abs_pos.x, abs_pos.y)
 
@@ -162,6 +166,68 @@ class PortItem(QGraphicsItem):
         painter.drawLine(QPointF(0, 0), QPointF(dx * tick, dy * tick))
 
 
+# ── Connection Edge Indicator ─────────────────────────────────────────────────
+
+_INDICATOR_SIZE = um_to_dbu(1.6)   # half-width of triangle base
+
+_ARROW_DIR_INDICATOR = {
+    PortSide.NORTH: (0, -1),
+    PortSide.SOUTH: (0,  1),
+    PortSide.EAST:  (1,  0),
+    PortSide.WEST:  (-1, 0),
+}
+
+
+class EdgeIndicatorItem(QGraphicsItem):
+    """
+    Small filled triangle on an occupied edge of a ComponentItem.
+    Base sits on the edge; apex points inward so it reads as 'docked here'.
+    One instance per connected PortSide, parented to ComponentItem.
+    """
+
+    def __init__(self, side: PortSide, bbox_local: QRectF,
+                 parent: QGraphicsItem) -> None:
+        super().__init__(parent)
+        self._side = side
+        self.setZValue(9)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+        self._poly = self._build_poly(side, bbox_local)
+
+    @staticmethod
+    def _build_poly(side: PortSide, r: QRectF) -> QPolygonF:
+        s  = float(_INDICATOR_SIZE)
+        cx = (r.left() + r.right())  / 2.0
+        cy = (r.top()  + r.bottom()) / 2.0
+        if side == PortSide.NORTH:
+            return QPolygonF([QPointF(cx - s, r.top()),
+                               QPointF(cx + s, r.top()),
+                               QPointF(cx,     r.top() + s * 1.8)])
+        elif side == PortSide.SOUTH:
+            return QPolygonF([QPointF(cx - s, r.bottom()),
+                               QPointF(cx + s, r.bottom()),
+                               QPointF(cx,     r.bottom() - s * 1.8)])
+        elif side == PortSide.WEST:
+            return QPolygonF([QPointF(r.left(), cy - s),
+                               QPointF(r.left(), cy + s),
+                               QPointF(r.left() + s * 1.8, cy)])
+        else:  # EAST
+            return QPolygonF([QPointF(r.right(), cy - s),
+                               QPointF(r.right(), cy + s),
+                               QPointF(r.right() - s * 1.8, cy)])
+
+    def boundingRect(self) -> QRectF:
+        return self._poly.boundingRect()
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        painter.setPen(_cosmetic(_CONN_BORDER, 0.6))
+        fill = QColor(_CONN_FILL)
+        fill.setAlpha(220)
+        painter.setBrush(QBrush(fill))
+        painter.drawPolygon(self._poly)
+
+
 # ── Component Graphics Item ───────────────────────────────────────────────────
 
 class ComponentItem(QGraphicsItem):
@@ -193,6 +259,7 @@ class ComponentItem(QGraphicsItem):
         self._delegate: QGraphicsItem = self._make_delegate()
         self._apply_style(selected=False, hovered=False)
         self._port_items: List[PortItem] = self._build_port_items()
+        self._edge_indicators: List[EdgeIndicatorItem] = []
 
     # ── Delegate factory ──────────────────────────────────────────────────────
 
@@ -280,14 +347,41 @@ class ComponentItem(QGraphicsItem):
     def _build_port_items(self) -> List[PortItem]:
         return [PortItem(p, self._comp.origin, self) for p in self._comp.ports]
 
+    # In ComponentItem — replace rebuild_ports() entirely:
+
     def rebuild_ports(self) -> None:
-        """Recreate port items after model ports change (e.g. after move)."""
+        """
+        Update port positions from the current bbox WITHOUT replacing Port objects.
+        Preserving port IDs is critical — Connection records store IDs, so
+        regenerating them silently breaks all existing wiring.
+        """
+        if not self._comp.ports:
+            # First time only: generate ports and build items
+            self._comp.build_default_ports()
+            self._port_items = self._build_port_items()
+            return
+
+        # Ports already exist — recompute offsets in-place, keep IDs
+        bb = self._comp.bbox
+        cx = (bb.x_min + bb.x_max) // 2
+        cy = (bb.y_min + bb.y_max) // 2
+        ox, oy = self._comp.origin.x, self._comp.origin.y
+
+        new_offsets = {
+            "N": Point(cx - ox, bb.y_min - oy),
+            "S": Point(cx - ox, bb.y_max - oy),
+            "W": Point(bb.x_min - ox, cy - oy),
+            "E": Point(bb.x_max - ox, cy - oy),
+        }
+
+        for port in self._comp.ports:
+            if port.name in new_offsets:
+                port.offset = new_offsets[port.name]
+
+        # Reposition existing PortItems to match — no new objects, no new IDs
         for pi in self._port_items:
-            pi.setParentItem(None)
-            if self.scene():
-                self.scene().removeItem(pi)
-        self._comp.build_default_ports()
-        self._port_items = self._build_port_items()
+            abs_pos = pi.port.abs_pos(self._comp.origin)
+            pi.setPos(abs_pos.x, abs_pos.y)
 
     def set_port_active(self, port_id: str, active: bool) -> None:
         for pi in self._port_items:
@@ -302,6 +396,27 @@ class ComponentItem(QGraphicsItem):
     @property
     def port_items(self) -> "List[PortItem]":
         return self._port_items
+
+    def refresh_connection_state(self, design: DesignScene) -> None:
+        """Rebuild edge indicator children to match current wiring."""
+        for ind in self._edge_indicators:
+            ind.setParentItem(None)
+            if self.scene():
+                self.scene().removeItem(ind)
+        self._edge_indicators = []
+
+        occupied_sides = design.connected_sides(self._comp.id)
+        if not occupied_sides:
+            return
+
+        bbox = self._delegate.boundingRect()
+        seen: set = set()
+        for side in occupied_sides:
+            if side in seen:
+                continue
+            seen.add(side)
+            ind = EdgeIndicatorItem(side, bbox, self)
+            self._edge_indicators.append(ind)
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -358,19 +473,33 @@ class ComponentItem(QGraphicsItem):
                     self._orig_pos.x + int(round(delta.x())),
                     self._orig_pos.y + int(round(delta.y())),
                 )
-                final = self._scene_ref.snap(raw)
+                moved = abs(delta.x()) > 1.0 or abs(delta.y()) > 1.0
+                final = self._scene_ref.snap(raw) if moved else self._orig_pos
 
             self.setPos(0, 0)
 
-            if final != self._orig_pos:
+            actually_moved = final != self._orig_pos
+
+            # ── Disconnect before any move ─────────────────────────────────────
+            # Must happen regardless of whether we're re-snapping to a new port
+            # or just dragging free — either way the old wiring is broken.
+            if actually_moved:
+                self._scene_ref.disconnect_component(self._comp.id)
+
+            if actually_moved:
                 cmd = MoveComponent(self._comp.id, self._orig_pos, final)
                 self._scene_ref.cmd_stack.execute(cmd)
-            else:
+
+            if self._snap_offset is not None:
+                self._scene_ref._try_connect_snapped(self._comp, final)
+            elif final == self._orig_pos:
                 self.sync_from_model()
 
             self._drag_start  = None
             self._orig_pos    = None
             self._snap_offset = None
+            event.accept()
+            return
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change, value):
@@ -386,11 +515,12 @@ class ComponentItem(QGraphicsItem):
 class CanvasScene(QGraphicsScene):
     """Master scene. Owns all ComponentItems, the CommandStack, and placement FSM."""
 
-    item_selected = pyqtSignal(str)
-    item_hovered  = pyqtSignal(str)
-    cursor_moved  = pyqtSignal(float, float)
-    scene_changed = pyqtSignal()
-    mode_changed  = pyqtSignal(str)   # emits PlacementMode.status_label
+    item_selected      = pyqtSignal(str)
+    item_hovered       = pyqtSignal(str)
+    cursor_moved       = pyqtSignal(float, float)
+    scene_changed      = pyqtSignal()
+    mode_changed       = pyqtSignal(str)
+    connections_changed = pyqtSignal()   # fired after any wiring change
 
     def __init__(self, design: DesignScene, parent=None) -> None:
         super().__init__(parent)
@@ -525,6 +655,36 @@ class CanvasScene(QGraphicsScene):
         for item in self._items.values():
             item.clear_port_highlights()
 
+    def _try_connect_snapped(self, moving_comp: GDSComponent,
+                              final_origin: Point) -> None:
+        """Called after snap-move committed. Find the flush port pair and wire it."""
+        result = self.find_port_snap(moving_comp, final_origin)
+        if result is None:
+            return
+        _, my_port_id, their_port_id, their_comp_id = result
+
+        if self._design.are_connected(
+            moving_comp.id, my_port_id, their_comp_id, their_port_id
+        ):
+            return  # already wired — idempotent
+
+        self.cmd_stack.execute(
+            ConnectPorts(moving_comp.id, my_port_id, their_comp_id, their_port_id)
+        )
+        self._refresh_indicators(moving_comp.id)
+        self._refresh_indicators(their_comp_id)
+        self.connections_changed.emit()
+
+    def _refresh_indicators(self, comp_id: str) -> None:
+        item = self._items.get(comp_id)
+        if item:
+            item.refresh_connection_state(self._design)
+
+    def refresh_all_indicators(self) -> None:
+        """Rebuild all edge indicators — call after undo/redo."""
+        for comp_id, item in self._items.items():
+            item.refresh_connection_state(self._design)
+
     def find_port_snap(
         self,
         moving_comp: GDSComponent,
@@ -577,6 +737,14 @@ class CanvasScene(QGraphicsScene):
                                 other_port.id, other_comp.id)
 
         return best
+    
+    def disconnect_component(self, comp_id: str) -> None:
+        """
+        Sever every connection on comp_id via undo-aware commands.
+        Called before a move commits so stale wiring is never left behind.
+        """
+        for conn in self._design.connections_for(comp_id):
+            self.cmd_stack.execute(DisconnectPorts(conn))
 
     # ── Mouse events ──────────────────────────────────────────────────────────
 
@@ -790,5 +958,6 @@ class CanvasScene(QGraphicsScene):
         for comp in self._design.components:
             self._items[comp.id].sync_from_model()
 
+        self.refresh_all_indicators()
         self.scene_changed.emit()
         self.update()
