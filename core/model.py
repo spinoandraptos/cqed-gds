@@ -1,74 +1,63 @@
 """
-core/model.py — Immutable data model for GDS canvas elements.
+core/model.py — Data model for GDS Canvas Designer.
 
-Design principles:
-  - All coordinates stored as integers in database units (1 DBU = 1 nm by default)
-  - No floats in the model; floating point only lives in the view layer
-  - Components are Python dataclasses for clean repr and easy serialization
-  - Layer is a simple integer (GDS layer number, 0-255)
+Design rules:
+  - Pure Python dataclasses; zero Qt dependency.
+  - All lengths in DBU (database units = nm). Conversion helpers at bottom.
+  - GDSComponent is the single union type for all primitives.
+    Kind-specific fields are Optional; unused fields stay None.
+  - DesignScene owns the component list and dirty flag.
+
+Phase 2 additions (backward-compatible):
+  - GDSComponent.points  — polygon vertex list (None for rect)
+  - GDSComponent.path_width — path half-width in DBU (None for rect/polygon)
+  - ComponentKind.POLYGON and PATH were already in the enum stub
+  - BBox now handles polygon bounding box from points list
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
-from typing import List, Optional, Tuple
-from enum import IntEnum, auto
+
 import uuid
+from dataclasses import dataclass, field
+from enum import Enum, auto
+from typing import List, Optional, Callable
 
 
-# ── Units ─────────────────────────────────────────────────────────────────────
+# ── Unit conversion ───────────────────────────────────────────────────────────
 
-DBU_PER_UM = 1_000          # 1 µm = 1000 DBUs  (1 DBU = 1 nm)
-DBU_PER_MM = 1_000_000      # 1 mm = 1,000,000 DBUs
+DBU_PER_UM = 1_000   # 1 µm = 1000 nm (DBU)
 
-def um_to_dbu(microns: float) -> int:
-    """Convert micrometers to database units."""
-    return int(round(microns * DBU_PER_UM))
+def um_to_dbu(um: float) -> int:
+    return int(round(um * DBU_PER_UM))
 
 def dbu_to_um(dbu: int) -> float:
-    """Convert database units to micrometers."""
     return dbu / DBU_PER_UM
 
 
-# ── Enumerations ──────────────────────────────────────────────────────────────
-
-class ComponentKind(IntEnum):
-    RECTANGLE = auto()
-    POLYGON   = auto()
-    PATH      = auto()
-
-
-# ── Data classes ──────────────────────────────────────────────────────────────
+# ── Primitives ────────────────────────────────────────────────────────────────
 
 @dataclass
 class Point:
-    """2D integer point in database units."""
-    x: int = 0
-    y: int = 0
+    x: int   # DBU
+    y: int   # DBU
 
-    def __add__(self, other: Point) -> Point:
-        return Point(self.x + other.x, self.y + other.y)
+    @staticmethod
+    def from_um(x_um: float, y_um: float) -> "Point":
+        return Point(um_to_dbu(x_um), um_to_dbu(y_um))
 
-    def __sub__(self, other: Point) -> Point:
-        return Point(self.x - other.x, self.y - other.y)
+    def __eq__(self, other) -> bool:
+        return isinstance(other, Point) and self.x == other.x and self.y == other.y
 
-    def to_tuple(self) -> Tuple[int, int]:
-        return (self.x, self.y)
-
-    def to_um(self) -> Tuple[float, float]:
-        return (dbu_to_um(self.x), dbu_to_um(self.y))
-
-    @classmethod
-    def from_um(cls, x_um: float, y_um: float) -> Point:
-        return cls(um_to_dbu(x_um), um_to_dbu(y_um))
+    def __repr__(self) -> str:
+        return f"Point({dbu_to_um(self.x):.3f}µm, {dbu_to_um(self.y):.3f}µm)"
 
 
 @dataclass
 class BBox:
-    """Axis-aligned bounding box in database units."""
-    x_min: int = 0
-    y_min: int = 0
-    x_max: int = 0
-    y_max: int = 0
+    x_min: int
+    y_min: int
+    x_max: int
+    y_max: int
 
     @property
     def width(self) -> int:
@@ -78,37 +67,53 @@ class BBox:
     def height(self) -> int:
         return self.y_max - self.y_min
 
-    @property
-    def center(self) -> Point:
-        return Point((self.x_min + self.x_max) // 2,
-                     (self.y_min + self.y_max) // 2)
+    @staticmethod
+    def from_points(pts: List[Point]) -> "BBox":
+        xs = [p.x for p in pts]
+        ys = [p.y for p in pts]
+        return BBox(min(xs), min(ys), max(xs), max(ys))
 
+
+# ── Component kinds ───────────────────────────────────────────────────────────
+
+class ComponentKind(Enum):
+    RECTANGLE = auto()
+    POLYGON   = auto()
+    PATH      = auto()
+
+
+# ── GDS Component ─────────────────────────────────────────────────────────────
 
 @dataclass
 class GDSComponent:
     """
-    A single geometric component on the canvas.
+    Union type for all canvas primitives.
 
-    Coordinates are always in DBUs. The canvas view layer is responsible
-    for converting to screen pixels using the current zoom/pan state.
+    Rectangle:  origin + width + height (points=None, path_width=None)
+    Polygon:    points (closed, ≥3 vertices); origin = points[0] for snap reference
+                width/height are ignored (use bbox)
+    Path:       points (open polyline) + path_width
+                origin = points[0]; width/height ignored
+
+    The id is a short UUID4 hex prefix — unique enough for a single session.
     """
-    id:       str          = field(default_factory=lambda: str(uuid.uuid4())[:8])
-    kind:     ComponentKind = ComponentKind.RECTANGLE
-    layer:    int           = 0
-    datatype: int           = 0
 
-    # For RECTANGLE: use origin + width/height
-    origin:   Point        = field(default_factory=Point)
-    width:    int          = um_to_dbu(10)   # 10 µm default
-    height:   int          = um_to_dbu(5)    # 5 µm default
+    kind:       ComponentKind
+    layer:      int
+    origin:     Point
 
-    # For POLYGON / PATH: list of vertices
-    vertices: List[Point]  = field(default_factory=list)
+    # Rectangle fields
+    width:      int = 0
+    height:     int = 0
 
-    # Display / metadata
-    label:    str          = ""
-    locked:   bool         = False
-    visible:  bool         = True
+    # Polygon / Path fields
+    points:     Optional[List[Point]] = None   # vertex list (includes origin)
+    path_width: Optional[int]         = None   # path half-width in DBU
+
+    # Identity
+    id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+
+    # ── Derived geometry ──────────────────────────────────────────────────────
 
     @property
     def bbox(self) -> BBox:
@@ -119,49 +124,66 @@ class GDSComponent:
                 self.origin.x + self.width,
                 self.origin.y + self.height,
             )
-        elif self.vertices:
-            xs = [p.x for p in self.vertices]
-            ys = [p.y for p in self.vertices]
-            return BBox(min(xs), min(ys), max(xs), max(ys))
-        return BBox()
+        elif self.points:
+            bb = BBox.from_points(self.points)
+            if self.kind == ComponentKind.PATH and self.path_width:
+                hw = self.path_width // 2
+                return BBox(bb.x_min - hw, bb.y_min - hw,
+                            bb.x_max + hw, bb.y_max + hw)
+            return bb
+        # Fallback: empty bbox at origin
+        return BBox(self.origin.x, self.origin.y, self.origin.x, self.origin.y)
+
+    @property
+    def vertex_count(self) -> int:
+        if self.kind == ComponentKind.RECTANGLE:
+            return 4
+        return len(self.points) if self.points else 0
 
     def move_by(self, dx: int, dy: int) -> None:
-        """Translate component in-place."""
+        """Translate in-place by (dx, dy) DBU."""
         self.origin = Point(self.origin.x + dx, self.origin.y + dy)
-        self.vertices = [Point(p.x + dx, p.y + dy) for p in self.vertices]
+        if self.points:
+            self.points = [Point(p.x + dx, p.y + dy) for p in self.points]
 
 
-# ── Scene ─────────────────────────────────────────────────────────────────────
+# ── Design scene ──────────────────────────────────────────────────────────────
 
-@dataclass
 class DesignScene:
     """
-    Top-level container for all components on the canvas.
-    Analogous to a GDS top-level cell.
+    Top-level container. Owns the ordered component list and dirty state.
+    Intentionally not a dataclass so we control mutation.
     """
-    name:       str                   = "TOP"
-    dbu:        int                   = 1          # 1 DBU = 1 nm
-    components: List[GDSComponent]    = field(default_factory=list)
-    is_dirty:   bool                  = False      # unsaved changes flag
+
+    def __init__(self, name: str = "TOP") -> None:
+        self.name = name
+        self.is_dirty = False
+        self._components: List[GDSComponent] = []
+
+    @property
+    def components(self) -> List[GDSComponent]:
+        return list(self._components)   # return copy so callers can't mutate
 
     def add(self, comp: GDSComponent) -> None:
-        self.components.append(comp)
+        self._components.append(comp)
         self.is_dirty = True
 
-    def remove(self, comp_id: str) -> bool:
-        for i, c in enumerate(self.components):
+    def remove(self, comp_id: str) -> Optional[GDSComponent]:
+        for i, c in enumerate(self._components):
             if c.id == comp_id:
-                del self.components[i]
                 self.is_dirty = True
-                return True
-        return False
+                return self._components.pop(i)
+        return None
 
     def get(self, comp_id: str) -> Optional[GDSComponent]:
-        for c in self.components:
+        for c in self._components:
             if c.id == comp_id:
                 return c
         return None
 
     def clear(self) -> None:
-        self.components.clear()
-        self.is_dirty = True
+        self._components.clear()
+        self.is_dirty = False
+
+    def __len__(self) -> int:
+        return len(self._components)

@@ -71,15 +71,22 @@ class CanvasView(QGraphicsView):
         self.setMouseTracking(True)
         self.setCursor(Qt.CursorShape.CrossCursor)
         self.setBackgroundBrush(QColor(Colors.CANVAS_BG))
+        self.setAcceptDrops(True)
 
     def _fit_all(self) -> None:
-        """Zoom-to-fit the entire scene rect."""
-        ext = um_to_dbu(200)   # show ±200 µm on startup
-        self.fitInView(
-            QRectF(-ext, -ext, ext * 2, ext * 2),
-            Qt.AspectRatioMode.KeepAspectRatio,
-        )
+        """Zoom-to-fit all items on the canvas, or a default rect if empty."""
+        items_rect = self.scene().itemsBoundingRect()
+        if items_rect.isNull() or items_rect.isEmpty():
+            ext = um_to_dbu(200)
+            fit_rect = QRectF(-ext, -ext, ext * 2, ext * 2)
+        else:
+            # Add 10% padding on each side so shapes aren't flush to the edge
+            pad_x = items_rect.width()  * 0.10 if items_rect.width()  > 0 else um_to_dbu(10)
+            pad_y = items_rect.height() * 0.10 if items_rect.height() > 0 else um_to_dbu(10)
+            fit_rect = items_rect.adjusted(-pad_x, -pad_y, pad_x, pad_y)
+        self.fitInView(fit_rect, Qt.AspectRatioMode.KeepAspectRatio)
         self._current_zoom = self.transform().m11()
+        self.zoom_changed.emit(self._current_zoom)
 
     # ── Zoom ──────────────────────────────────────────────────────────────────
 
@@ -121,6 +128,39 @@ class CanvasView(QGraphicsView):
         self.verticalScrollBar().setValue(
             self.verticalScrollBar().value() - int(delta.y())
         )
+
+    # ── Drag-and-drop (receive from palette) ──────────────────────────────────
+
+    _MIME = "application/x-gds-shape"
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasFormat(self._MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasFormat(self._MIME):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dropEvent(self, event) -> None:
+        if not event.mimeData().hasFormat(self._MIME):
+            event.ignore()
+            return
+        raw     = event.mimeData().data(self._MIME).data().decode()
+        parts   = raw.split(":")
+        if len(parts) != 2:
+            event.ignore()
+            return
+        kind_val = int(parts[0])
+        layer    = int(parts[1])
+        # Convert viewport pixel position → scene coordinates
+        scene_pos = self.mapToScene(event.position().toPoint())
+        # Delegate to scene — it owns placement logic
+        self.scene().drop_shape(kind_val, layer, scene_pos)
+        event.acceptProposedAction()
 
     # ── Event overrides ───────────────────────────────────────────────────────
 

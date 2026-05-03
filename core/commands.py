@@ -1,148 +1,216 @@
 """
 core/commands.py — Command pattern for undo/redo.
 
-Every user action that mutates the scene is wrapped in a Command subclass.
-The CommandStack manages history with configurable depth.
+Every user action that mutates the model is wrapped in a Command.
+CommandStack owns the undo/redo stacks and calls on_change after each mutation.
 
-This is Phase 1 scaffolding — only AddComponent and MoveComponent are
-fully implemented. More commands follow in Phase 2+.
+Phase 1 commands:  AddComponent, RemoveComponent, MoveComponent
+Phase 2 additions: EditComponent (change layer, width, height, path_width)
+                   SetPolygonPoints (replace vertex list after vertex edit)
 """
 
 from __future__ import annotations
+
 from abc import ABC, abstractmethod
-from collections import deque
-from typing import Deque, Optional, Callable
-from dataclasses import dataclass
+from typing import Callable, List, Optional
 
 from core.model import DesignScene, GDSComponent, Point
 
+# Fields that EditComponent is allowed to mutate.
+# A typo in a key name silently creates a new attribute on the dataclass,
+# which is a silent data-corruption bug — validate against this set instead.
+_EDITABLE_FIELDS = frozenset({"layer", "width", "height", "path_width", "origin", "points"})
 
-# ── Abstract base ─────────────────────────────────────────────────────────────
+
+# ── Base ──────────────────────────────────────────────────────────────────────
 
 class Command(ABC):
-    """A reversible mutation of the design scene."""
+    @abstractmethod
+    def execute(self, design: DesignScene) -> None: ...
 
     @abstractmethod
-    def execute(self, scene: DesignScene) -> None: ...
-
-    @abstractmethod
-    def undo(self, scene: DesignScene) -> None: ...
+    def undo(self, design: DesignScene) -> None: ...
 
     @property
-    def description(self) -> str:
-        return self.__class__.__name__
+    @abstractmethod
+    def description(self) -> str: ...
 
 
 # ── Concrete commands ─────────────────────────────────────────────────────────
 
-@dataclass
 class AddComponent(Command):
-    component: GDSComponent
+    def __init__(self, comp: GDSComponent) -> None:
+        self._comp = comp
 
-    def execute(self, scene: DesignScene) -> None:
-        scene.add(self.component)
+    def execute(self, design: DesignScene) -> None:
+        design.add(self._comp)
 
-    def undo(self, scene: DesignScene) -> None:
-        scene.remove(self.component.id)
+    def undo(self, design: DesignScene) -> None:
+        design.remove(self._comp.id)
 
     @property
     def description(self) -> str:
-        return f"Add {self.component.kind.name.lower()} on layer {self.component.layer}"
+        return f"Add {self._comp.kind.name.lower()} on layer {self._comp.layer}"
 
 
-@dataclass
 class RemoveComponent(Command):
-    component: GDSComponent
+    def __init__(self, comp: GDSComponent) -> None:
+        self._comp = comp
 
-    def execute(self, scene: DesignScene) -> None:
-        scene.remove(self.component.id)
+    def execute(self, design: DesignScene) -> None:
+        design.remove(self._comp.id)
 
-    def undo(self, scene: DesignScene) -> None:
-        scene.add(self.component)
+    def undo(self, design: DesignScene) -> None:
+        design.add(self._comp)
 
     @property
     def description(self) -> str:
-        return f"Remove {self.component.id}"
+        return f"Delete {self._comp.kind.name.lower()}"
 
 
-@dataclass
 class MoveComponent(Command):
-    comp_id: str
-    old_origin: Point
-    new_origin: Point
+    def __init__(self, comp_id: str, old_origin: Point, new_origin: Point) -> None:
+        self._comp_id   = comp_id
+        self._old_origin = old_origin
+        self._new_origin = new_origin
 
-    def execute(self, scene: DesignScene) -> None:
-        c = scene.get(self.comp_id)
-        if c:
-            dx = self.new_origin.x - self.old_origin.x
-            dy = self.new_origin.y - self.old_origin.y
-            c.move_by(dx, dy)
+    def execute(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp:
+            dx = self._new_origin.x - comp.origin.x
+            dy = self._new_origin.y - comp.origin.y
+            comp.move_by(dx, dy)
 
-    def undo(self, scene: DesignScene) -> None:
-        c = scene.get(self.comp_id)
-        if c:
-            dx = self.old_origin.x - self.new_origin.x
-            dy = self.old_origin.y - self.new_origin.y
-            c.move_by(dx, dy)
+    def undo(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp:
+            dx = self._old_origin.x - comp.origin.x
+            dy = self._old_origin.y - comp.origin.y
+            comp.move_by(dx, dy)
 
     @property
     def description(self) -> str:
-        return f"Move {self.comp_id}"
+        return "Move component"
 
 
-# ── Stack ─────────────────────────────────────────────────────────────────────
+class EditComponent(Command):
+    """
+    Phase 2: mutate a component's properties (layer, dimensions).
+    Stores a snapshot of all mutable fields for clean undo.
+    """
+
+    def __init__(self, comp: GDSComponent, **new_values) -> None:
+        unknown = set(new_values) - _EDITABLE_FIELDS
+        if unknown:
+            raise ValueError(f"EditComponent: unknown field(s) {unknown}. "
+                             f"Allowed: {_EDITABLE_FIELDS}")
+        self._comp_id = comp.id
+        self._new     = new_values
+        # Snapshot current state for undo
+        self._old = {k: getattr(comp, k) for k in new_values}
+
+    def execute(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp:
+            for k, v in self._new.items():
+                setattr(comp, k, v)
+            design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp:
+            for k, v in self._old.items():
+                setattr(comp, k, v)
+            design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        keys = ", ".join(self._new.keys())
+        return f"Edit {keys}"
+
+
+class SetPolygonPoints(Command):
+    """Phase 2: replace the vertex list of a polygon/path after interactive editing."""
+
+    def __init__(self, comp: GDSComponent, new_points: List[Point]) -> None:
+        self._comp_id   = comp.id
+        self._new_points = list(new_points)
+        self._old_points = list(comp.points) if comp.points else []
+        self._old_origin = Point(comp.origin.x, comp.origin.y)
+
+    def execute(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp and self._new_points:
+            comp.points = list(self._new_points)
+            comp.origin = self._new_points[0]
+            design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if comp:
+            comp.points = list(self._old_points)
+            comp.origin = self._old_origin
+            design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        return "Edit polygon vertices"
+
+
+# ── Command Stack ─────────────────────────────────────────────────────────────
 
 class CommandStack:
     """
-    Manages undo/redo history.
-    on_change is fired after every execute/undo/redo so the UI can update.
+    Owns the undo/redo stacks.
+
+    Observers register via connect_change(callable) — called after every
+    mutation (execute, undo, redo, clear).  Multiple listeners are supported.
+    Using a list rather than a single Callable lets Qt slots connect naturally
+    without wrapping everything in a lambda.
     """
 
-    MAX_DEPTH = 200
+    def __init__(self, design: DesignScene) -> None:
+        self._design      = design
+        self._listeners:  List[Callable[[], None]] = []
+        self._undo_stack: List[Command] = []
+        self._redo_stack: List[Command] = []
 
-    def __init__(
-        self,
-        scene: DesignScene,
-        on_change: Optional[Callable[[], None]] = None,
-    ) -> None:
-        self._scene    = scene
-        self._undo_stack: Deque[Command] = deque(maxlen=self.MAX_DEPTH)
-        self._redo_stack: Deque[Command] = deque(maxlen=self.MAX_DEPTH)
-        self._on_change = on_change or (lambda: None)
+    def connect_change(self, listener: Callable[[], None]) -> None:
+        """Register a zero-argument callable called after every stack mutation."""
+        self._listeners.append(listener)
 
-    # ── Public API ────────────────────────────────────────────────────────────
+    def _notify(self) -> None:
+        for fn in self._listeners:
+            fn()
 
     def execute(self, cmd: Command) -> None:
-        """Execute a command and push it onto the undo stack."""
-        cmd.execute(self._scene)
+        cmd.execute(self._design)
         self._undo_stack.append(cmd)
-        self._redo_stack.clear()   # new action clears redo history
-        self._on_change()
+        self._redo_stack.clear()
+        self._notify()
 
     def undo(self) -> Optional[str]:
-        """Undo the last command. Returns its description or None."""
         if not self._undo_stack:
             return None
         cmd = self._undo_stack.pop()
-        cmd.undo(self._scene)
+        cmd.undo(self._design)
         self._redo_stack.append(cmd)
-        self._on_change()
+        self._notify()
         return cmd.description
 
     def redo(self) -> Optional[str]:
-        """Redo the last undone command."""
         if not self._redo_stack:
             return None
         cmd = self._redo_stack.pop()
-        cmd.execute(self._scene)
+        cmd.execute(self._design)
         self._undo_stack.append(cmd)
-        self._on_change()
+        self._notify()
         return cmd.description
 
     def clear(self) -> None:
         self._undo_stack.clear()
         self._redo_stack.clear()
-        self._on_change()
+        self._notify()
 
     @property
     def can_undo(self) -> bool:
