@@ -267,6 +267,72 @@ class UngroupComponents(Command):
         return f"Ungroup '{self._group.name}'"
 
 
+class MergeGroups(Command):
+    """
+    Flatten N groups (and optionally loose components) into one new group.
+
+    No nesting: every source group is dissolved and all their member_ids
+    — plus any extra loose component IDs — are collected into a single
+    flat ComponentGroup.  The operation is fully reversible: undo re-creates
+    each source group with its original name/id and removes the merged group.
+
+    Parameters
+    ----------
+    source_groups : list[ComponentGroup]
+        Existing groups to dissolve.  Snapshots are taken at construction time.
+    extra_comp_ids : list[str]
+        IDs of individually-selected components that are not already in any
+        source group (can be empty).
+    name : str
+        Display name for the new merged group.
+    """
+
+    def __init__(
+        self,
+        source_groups: List["ComponentGroup"],
+        extra_comp_ids: List[str],
+        name: str,
+    ) -> None:
+        # Snapshot source groups so undo can recreate them exactly
+        self._source_snapshots: List[ComponentGroup] = [
+            ComponentGroup(name=g.name, member_ids=list(g.member_ids), id=g.id)
+            for g in source_groups
+        ]
+        # Flat union of all member IDs (preserves order, deduplicates)
+        seen: set = set()
+        flat_ids: List[str] = []
+        for g in source_groups:
+            for cid in g.member_ids:
+                if cid not in seen:
+                    seen.add(cid)
+                    flat_ids.append(cid)
+        for cid in extra_comp_ids:
+            if cid not in seen:
+                seen.add(cid)
+                flat_ids.append(cid)
+
+        self._merged = ComponentGroup(name=name, member_ids=flat_ids)
+
+    def execute(self, design: DesignScene) -> None:
+        # Dissolve every source group
+        for snap in self._source_snapshots:
+            design.remove_group(snap.id)
+        # Add the flat merged group
+        design.add_group(self._merged)
+
+    def undo(self, design: DesignScene) -> None:
+        # Remove the merged group
+        design.remove_group(self._merged.id)
+        # Recreate each source group with its original id and membership
+        for snap in self._source_snapshots:
+            design.add_group(snap)
+
+    @property
+    def description(self) -> str:
+        n = len(self._source_snapshots)
+        return f"Merge {n} group{'s' if n != 1 else ''} → '{self._merged.name}'"
+
+
 class MoveGroup(Command):
     """Translate all members of a group by (dx, dy)."""
 

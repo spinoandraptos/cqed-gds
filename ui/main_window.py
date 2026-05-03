@@ -31,11 +31,11 @@ from ui.canvas_scene import CanvasScene, PlacementMode, GroupItem
 from ui.canvas_view import CanvasView
 from ui.panels import ComponentPalette, PropertiesPanel
 from core.model import DesignScene, GDSComponent, ComponentKind, ComponentGroup
-from core.commands import CommandStack, EditComponent, GroupComponents, UngroupComponents
+from core.commands import CommandStack, EditComponent, GroupComponents, UngroupComponents, MergeGroups
 from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
 from core.serialiser import save, load, SerialisationError
-from ui.sweep_dialog import SweepDialog, GroupSweepDialog
+from ui.sweep_dialog import SweepDialog
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -375,40 +375,14 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _sweep(self) -> None:
-        selected_items = self._scene.selectedItems()
-
-        # ── Group sweep: a GroupItem is selected ──────────────────────────────
-        group_items = [item for item in selected_items if isinstance(item, GroupItem)]
-        if group_items:
-            if len(group_items) > 1:
-                QMessageBox.information(
-                    self, "Sweep", "Select exactly one group to sweep."
-                )
-                return
-            group = self._design.get_group(group_items[0].group.id)
-            if group is None:
-                return
-            members = [self._design.get(cid) for cid in group.member_ids
-                       if self._design.get(cid)]
-            if not members:
-                QMessageBox.warning(
-                    self, "Sweep", "The selected group has no valid members."
-                )
-                return
-            dlg = GroupSweepDialog(group, self._design, self._scene.cmd_stack, self)
-            dlg.exec()
-            return
-
-        # ── Single component sweep (original behaviour) ───────────────────────
         selected = [
             item.component
-            for item in selected_items
+            for item in self._scene.selectedItems()
             if hasattr(item, "component")
         ]
         if len(selected) != 1:
             QMessageBox.information(
-                self, "Sweep",
-                "Select exactly one component — or one group — to sweep."
+                self, "Sweep", "Select exactly one component to sweep."
             )
             return
         dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
@@ -423,19 +397,70 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _group_selected(self) -> None:
-        selected = [
+        from PyQt6.QtWidgets import QInputDialog
+
+        selected_items = self._scene.selectedItems()
+
+        # Partition selection into GroupItems and bare ComponentItems
+        selected_groups: list = [
+            self._design.get_group(item.group.id)
+            for item in selected_items
+            if isinstance(item, GroupItem)
+        ]
+        selected_groups = [g for g in selected_groups if g is not None]
+
+        selected_comps = [
             item.component
-            for item in self._scene.selectedItems()
+            for item in selected_items
             if hasattr(item, "component")
         ]
-        if len(selected) < 2:
-            QMessageBox.information(
-                self, "Group", "Select two or more components to group."
+
+        # ── Case 1: groups present → merge into one flat group ────────────────
+        if selected_groups:
+            total_items = len(selected_groups) + len(selected_comps)
+            if total_items < 2 and not selected_comps:
+                # Only one group selected and nothing else — nothing to merge
+                QMessageBox.information(
+                    self, "Group",
+                    "Select two or more groups (or groups + components) to merge."
+                )
+                return
+
+            # Components already inside a selected group don't need special
+            # handling — MergeGroups will absorb their groups.
+            # Collect IDs of loose components (not already inside a selected group)
+            grouped_ids = {
+                cid for g in selected_groups for cid in g.member_ids
+            }
+            extra_ids = [c.id for c in selected_comps if c.id not in grouped_ids]
+
+            name, ok = QInputDialog.getText(
+                self, "Merge Groups", "New group name:",
+                text=f"group_{len(self._design.groups) + 1}"
+            )
+            if not ok or not name.strip():
+                return
+
+            self._scene.cmd_stack.execute(
+                MergeGroups(selected_groups, extra_ids, name.strip())
+            )
+            n_src = len(selected_groups)
+            self._flash_status(
+                f"Merged {n_src} group{'s' if n_src != 1 else ''}"
+                + (f" + {len(extra_ids)} component{'s' if len(extra_ids) != 1 else ''}"
+                   if extra_ids else "")
+                + f" → '{name.strip()}'"
             )
             return
 
-        # Validate: all must share the same layer
-        layers = {c.layer for c in selected}
+        # ── Case 2: only bare components selected → original group logic ──────
+        if len(selected_comps) < 2:
+            QMessageBox.information(
+                self, "Group", "Select two or more components — or two or more groups — to group."
+            )
+            return
+
+        layers = {c.layer for c in selected_comps}
         if len(layers) > 1:
             QMessageBox.warning(
                 self, "Group",
@@ -444,8 +469,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # Name: ask or auto-generate
-        from PyQt6.QtWidgets import QInputDialog
         name, ok = QInputDialog.getText(
             self, "Group Name", "Group name:",
             text=f"group_{len(self._design.groups) + 1}"
@@ -453,9 +476,9 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
 
-        comp_ids = [c.id for c in selected]
+        comp_ids = [c.id for c in selected_comps]
         self._scene.cmd_stack.execute(GroupComponents(comp_ids, name.strip()))
-        self._flash_status(f"Grouped {len(selected)} components as '{name.strip()}'")
+        self._flash_status(f"Grouped {len(selected_comps)} components as '{name.strip()}'")
 
     @pyqtSlot()
     def _ungroup_selected(self) -> None:
