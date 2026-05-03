@@ -17,6 +17,7 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QHBoxLayout, QMainWindow, QToolBar, QLabel, QVBoxLayout,
     QWidget, QSizePolicy, QMessageBox, QApplication, QToolButton,
+    QDialog, QDialogButtonBox
 )
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QFont, QColor,
@@ -31,7 +32,6 @@ from ui.canvas_view import CanvasView
 from ui.panels import ComponentPalette, PropertiesPanel
 from core.model import DesignScene, GDSComponent, ComponentKind
 from core.commands import CommandStack, EditComponent
-
 
 class MainWindow(QMainWindow):
 
@@ -96,19 +96,13 @@ class MainWindow(QMainWindow):
         for a in [self._act_fit, None, self._act_zin, self._act_zout]:
             view_menu.addSeparator() if a is None else view_menu.addAction(a)
 
-        # Place  (new in Phase 2)
-        place_menu = mb.addMenu("Place")
-        self._act_place_rect = self._action("Rectangle",  "R", lambda: self._enter_mode(PlacementMode.PLACE_RECT))
-        self._act_place_poly = self._action("Polygon",    "P", lambda: self._enter_mode(PlacementMode.PLACE_POLYGON))
-        self._act_place_path = self._action("Path",       "L", lambda: self._enter_mode(PlacementMode.PLACE_PATH))
-        for a in [self._act_place_rect, self._act_place_poly, self._act_place_path]:
-            place_menu.addAction(a)
-
         # Help
         help_menu = mb.addMenu("Help")
-        help_menu.addAction(self._action("About…",             "", self._about))
-        help_menu.addAction(self._action("Keyboard Shortcuts", "?", self._shortcuts_help))
-
+        self._about = self._action("About…", "", self._about)
+        self._shortcuts = self._action("Keyboard Shortcuts", "Ctrl+H", self._shortcuts_help)
+        for a in [self._about, None, self._shortcuts]:
+            help_menu.addSeparator() if a is None else help_menu.addAction(a)
+            
     @staticmethod
     def _action(label: str, shortcut: str, slot) -> QAction:
         act = QAction(label)
@@ -426,26 +420,33 @@ class MainWindow(QMainWindow):
         )
 
     def _shortcuts_help(self) -> None:
-        QMessageBox.information(
-            self, "Keyboard Shortcuts",
-            "<b>Tools</b><br>"
-            "Esc — Select mode / cancel placement<br>"
-            "R — Place Rectangle<br>"
-            "P — Place Polygon<br>"
-            "L — Place Path<br><br>"
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Keyboard Shortcuts")
+        dlg.setMinimumWidth(400)
+        layout = QVBoxLayout(dlg)
+        lbl = QLabel(
+            "<b>Placing Shapes</b><br>"
+            "Drag Rectangle / Polygon / Path from the left panel onto the canvas<br><br>"
             "<b>Polygon / Path placement</b><br>"
-            "Left-click — add vertex<br>"
-            "Double-click or Enter — commit shape<br>"
-            "Right-click — commit shape<br>"
-            "Esc — cancel<br><br>"
+            "Left-click - add vertex<br>"
+            "Double-click or Enter - commit shape<br>"
+            "Esc - cancel<br><br>"
             "<b>Navigation</b><br>"
-            "F — Fit all &nbsp;&nbsp; + / − — Zoom<br>"
-            "Ctrl+Scroll — Zoom<br>"
-            "Middle-drag or Space+drag — Pan<br><br>"
+            "F - Fit all | + / - Zoom<br>"
+            "Ctrl+Scroll - Zoom<br>"
+            "Middle-drag or Space+drag - Pan<br><br>"
             "<b>Edit</b><br>"
-            "Ctrl+Z / Ctrl+Shift+Z — Undo / Redo<br>"
-            "Ctrl+A — Select all &nbsp;&nbsp; Delete — Delete selected<br>",
+            "Ctrl+Z / Ctrl+Shift+Z - Undo / Redo<br>"
+            "Ctrl+A - Select all | Delete - Delete selected<br>"
         )
+        lbl.setTextFormat(Qt.TextFormat.RichText)
+        lbl.setWordWrap(True)
+        lbl.setContentsMargins(12, 12, 12, 12)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        layout.addWidget(lbl)
+        layout.addWidget(buttons)
+        dlg.exec()
 
     # ── Close guard ───────────────────────────────────────────────────────────
 
