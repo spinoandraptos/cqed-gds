@@ -35,7 +35,7 @@ from core.commands import CommandStack, EditComponent, GroupComponents, UngroupC
 from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
 from core.serialiser import save, load, SerialisationError
-from ui.sweep_dialog import SweepDialog
+from ui.sweep_dialog import SweepDialog, GroupSweepDialog
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -375,14 +375,40 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _sweep(self) -> None:
+        selected_items = self._scene.selectedItems()
+
+        # ── Group sweep: a GroupItem is selected ──────────────────────────────
+        group_items = [item for item in selected_items if isinstance(item, GroupItem)]
+        if group_items:
+            if len(group_items) > 1:
+                QMessageBox.information(
+                    self, "Sweep", "Select exactly one group to sweep."
+                )
+                return
+            group = self._design.get_group(group_items[0].group.id)
+            if group is None:
+                return
+            members = [self._design.get(cid) for cid in group.member_ids
+                       if self._design.get(cid)]
+            if not members:
+                QMessageBox.warning(
+                    self, "Sweep", "The selected group has no valid members."
+                )
+                return
+            dlg = GroupSweepDialog(group, self._design, self._scene.cmd_stack, self)
+            dlg.exec()
+            return
+
+        # ── Single component sweep (original behaviour) ───────────────────────
         selected = [
             item.component
-            for item in self._scene.selectedItems()
+            for item in selected_items
             if hasattr(item, "component")
         ]
         if len(selected) != 1:
             QMessageBox.information(
-                self, "Sweep", "Select exactly one component to sweep."
+                self, "Sweep",
+                "Select exactly one component — or one group — to sweep."
             )
             return
         dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
