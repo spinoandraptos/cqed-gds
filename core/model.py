@@ -74,6 +74,46 @@ class BBox:
         return BBox(min(xs), min(ys), max(xs), max(ys))
 
 
+# ── Port ──────────────────────────────────────────────────────────────────────
+
+class PortSide(Enum):
+    """Cardinal direction a port faces (outward normal)."""
+    NORTH = auto()
+    SOUTH = auto()
+    EAST  = auto()
+    WEST  = auto()
+
+    @property
+    def opposite(self) -> "PortSide":
+        return {
+            PortSide.NORTH: PortSide.SOUTH,
+            PortSide.SOUTH: PortSide.NORTH,
+            PortSide.EAST:  PortSide.WEST,
+            PortSide.WEST:  PortSide.EAST,
+        }[self]
+
+
+@dataclass
+class Port:
+    """
+    A named connection point on a component.
+
+    - `offset` is in DBU, relative to the component's origin.
+      It moves with the component automatically — no extra bookkeeping.
+    - `side` is the outward-facing direction (the direction signal leaves).
+      Snap is valid only when two ports face each other (side == other.opposite).
+    - `name` is user-visible ("in", "out", "A", "B", …).
+    """
+    name:   str
+    offset: Point          # relative to component origin, DBU
+    side:   PortSide
+    id:     str = field(default_factory=lambda: uuid.uuid4().hex[:6])
+
+    def abs_pos(self, origin: Point) -> Point:
+        """Absolute scene position given the component's current origin."""
+        return Point(origin.x + self.offset.x, origin.y + self.offset.y)
+
+
 # ── Component kinds ───────────────────────────────────────────────────────────
 
 class ComponentKind(Enum):
@@ -110,6 +150,9 @@ class GDSComponent:
     points:     Optional[List[Point]] = None   # vertex list (includes origin)
     path_width: Optional[int]         = None   # path half-width in DBU
 
+    # Ports
+    ports:      List[Port] = field(default_factory=list)
+
     # Identity
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
@@ -145,6 +188,24 @@ class GDSComponent:
         self.origin = Point(self.origin.x + dx, self.origin.y + dy)
         if self.points:
             self.points = [Point(p.x + dx, p.y + dy) for p in self.points]
+
+    def build_default_ports(self) -> None:
+        """
+        Auto-generate four edge-centre ports from the bounding box.
+        Called once after the component is fully constructed.
+        Safe to call again — replaces existing auto-ports.
+        """
+        bb = self.bbox
+        cx = (bb.x_min + bb.x_max) // 2
+        cy = (bb.y_min + bb.y_max) // 2
+        # Offsets are relative to self.origin
+        ox, oy = self.origin.x, self.origin.y
+        self.ports = [
+            Port("N", Point(cx - ox, bb.y_min - oy), PortSide.NORTH),
+            Port("S", Point(cx - ox, bb.y_max - oy), PortSide.SOUTH),
+            Port("W", Point(bb.x_min - ox, cy - oy), PortSide.WEST),
+            Port("E", Point(bb.x_max - ox, cy - oy), PortSide.EAST),
+        ]
 
 
 # ── Design scene ──────────────────────────────────────────────────────────────

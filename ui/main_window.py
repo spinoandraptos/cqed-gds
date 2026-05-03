@@ -259,6 +259,9 @@ class MainWindow(QMainWindow):
         # Phase 2: properties panel layer edit
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
 
+        # Phase 3: properties panel geometry edits (width / height / path_width)
+        self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
+
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -317,6 +320,25 @@ class MainWindow(QMainWindow):
             # Use the public API — never reach into _items directly.
             self._scene.refresh_item_style(comp_id)
             self._flash_status(f"Layer → {new_layer}")
+
+    @pyqtSlot(str, str, int)
+    def _on_geometry_change_requested(self, comp_id: str, field: str, value_dbu: int) -> None:
+        """Properties panel dimension spinbox committed — wrap in undo-able command."""
+        comp = self._design.get(comp_id)
+        if comp is None:
+            return
+        # Guard: editingFinished fires even when nothing changed (click in, click out).
+        if getattr(comp, field, None) == value_dbu:
+            return
+        self._scene.cmd_stack.execute(EditComponent(comp, **{field: value_dbu}))
+        # Tell the Qt delegate to re-read the model — geometry changed.
+        item = self._scene.item_for(comp_id)
+        if item:
+            item.sync_from_model()
+        # Refresh the panel so bbox and spinbox values reflect the new state.
+        self._props.show_component(comp)
+        label = field.replace("_", " ").title()
+        self._flash_status(f"{label} → {value_dbu / 1000:.3f} µm")
 
     @pyqtSlot(float)
     def _on_zoom_changed(self, zoom: float) -> None:

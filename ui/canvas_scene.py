@@ -34,7 +34,7 @@ from dataclasses import dataclass, field
 
 from core.model import (
     DesignScene, GDSComponent, ComponentKind,
-    Point, dbu_to_um, um_to_dbu,
+    Point, Port, PortSide, dbu_to_um, um_to_dbu,
 )
 from core.commands import CommandStack, AddComponent, MoveComponent
 from ui.theme import Colors
@@ -50,6 +50,7 @@ DEFAULT_H_DBU   = um_to_dbu(5)
 DEFAULT_PW_DBU  = um_to_dbu(1)
 MIN_POLY_PTS    = 3
 VERTEX_DOT_R    = um_to_dbu(0.4)
+PORT_SNAP_RADIUS = um_to_dbu(8)   # snap kicks in within 8 µm
 
 
 # ── Placement FSM state ───────────────────────────────────────────────────────
@@ -97,6 +98,70 @@ def _cosmetic(color: str, width: float = 1.0,
     return pen
 
 
+# ── Port Graphics Item ────────────────────────────────────────────────────────
+
+_PORT_NORMAL  = "#38bdf8"   # teal — idle
+_PORT_ACTIVE  = "#4ade80"   # green — snap candidate
+_PORT_R       = um_to_dbu(0.8)   # dot radius in DBU
+
+# Arrow tip offsets per side (in DBU, pointing outward)
+_ARROW_DIR = {
+    PortSide.NORTH: (0, -1),
+    PortSide.SOUTH: (0,  1),
+    PortSide.EAST:  (1,  0),
+    PortSide.WEST:  (-1, 0),
+}
+
+
+class PortItem(QGraphicsItem):
+    """
+    Small directional dot drawn at a port's position.
+    Parent is the ComponentItem so it moves for free.
+    Highlights green when this port is the active snap target.
+    """
+
+    def __init__(self, port: Port, origin: Point, parent: QGraphicsItem) -> None:
+        super().__init__(parent)
+        self._port    = port
+        self._active  = False
+        self.setZValue(8)
+        self.setAcceptHoverEvents(False)
+        # Position relative to parent item's coordinate system.
+        # Parent (ComponentItem) lives at scene origin (pos = 0,0), so
+        # port offset IS the scene position.
+        abs_pos = port.abs_pos(origin)
+        self.setPos(abs_pos.x, abs_pos.y)
+
+    @property
+    def port(self) -> Port:
+        return self._port
+
+    def set_active(self, active: bool) -> None:
+        if active != self._active:
+            self._active = active
+            self.update()
+
+    def boundingRect(self) -> QRectF:
+        r = float(_PORT_R) 
+        return QRectF(-r, -r, r * 2, r * 2)
+
+    def paint(self, painter: QPainter, option, widget=None) -> None:
+        color = QColor(_PORT_ACTIVE if self._active else _PORT_NORMAL)
+        r     = float(_PORT_R)
+
+        # Filled circle
+        painter.setPen(_cosmetic(color.name(), 0.8))
+        fill = QColor(color); fill.setAlpha(200)
+        painter.setBrush(QBrush(fill))
+        painter.drawEllipse(QPointF(0, 0), r, r)
+
+        # Outward tick line
+        dx, dy = _ARROW_DIR[self._port.side]
+        tick   = r * 2.5
+        painter.setPen(_cosmetic(color.name(), 1.0))
+        painter.drawLine(QPointF(0, 0), QPointF(dx * tick, dy * tick))
+
+
 # ── Component Graphics Item ───────────────────────────────────────────────────
 
 class ComponentItem(QGraphicsItem):
@@ -112,8 +177,9 @@ class ComponentItem(QGraphicsItem):
         super().__init__()
         self._comp      = component
         self._scene_ref = scene_ref
-        self._drag_start: Optional[QPointF] = None
-        self._orig_pos:   Optional[Point]   = None
+        self._drag_start:  Optional[QPointF] = None
+        self._orig_pos:    Optional[Point]   = None
+        self._snap_offset: Optional[Point]   = None   # set during drag when port snap active
 
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
@@ -126,6 +192,7 @@ class ComponentItem(QGraphicsItem):
 
         self._delegate: QGraphicsItem = self._make_delegate()
         self._apply_style(selected=False, hovered=False)
+        self._port_items: List[PortItem] = self._build_port_items()
 
     # ── Delegate factory ──────────────────────────────────────────────────────
 
@@ -204,10 +271,37 @@ class ComponentItem(QGraphicsItem):
         elif isinstance(self._delegate, QGraphicsPathItem):
             self._delegate.setPath(self._build_path())
         self.prepareGeometryChange()
+        self.rebuild_ports()
 
     @property
     def component(self) -> GDSComponent:
         return self._comp
+
+    def _build_port_items(self) -> List[PortItem]:
+        return [PortItem(p, self._comp.origin, self) for p in self._comp.ports]
+
+    def rebuild_ports(self) -> None:
+        """Recreate port items after model ports change (e.g. after move)."""
+        for pi in self._port_items:
+            pi.setParentItem(None)
+            if self.scene():
+                self.scene().removeItem(pi)
+        self._comp.build_default_ports()
+        self._port_items = self._build_port_items()
+
+    def set_port_active(self, port_id: str, active: bool) -> None:
+        for pi in self._port_items:
+            if pi.port.id == port_id:
+                pi.set_active(active)
+                return
+
+    def clear_port_highlights(self) -> None:
+        for pi in self._port_items:
+            pi.set_active(False)
+
+    @property
+    def port_items(self) -> "List[PortItem]":
+        return self._port_items
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -223,38 +317,60 @@ class ComponentItem(QGraphicsItem):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start = event.scenePos()
-            self._orig_pos   = Point(self._comp.origin.x, self._comp.origin.y)
+            self._drag_start  = event.scenePos()
+            self._orig_pos    = Point(self._comp.origin.x, self._comp.origin.y)
+            self._snap_offset = None
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        super().mouseMoveEvent(event)
+        if self._drag_start is None:
+            return
+        delta = event.scenePos() - self._drag_start
+        tentative = Point(
+            self._orig_pos.x + int(round(delta.x())),
+            self._orig_pos.y + int(round(delta.y())),
+        )
+        snap_result = self._scene_ref.find_port_snap(self._comp, tentative)
+        self._scene_ref.clear_all_port_highlights()
+        if snap_result:
+            snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
+            self._snap_offset = snap_origin
+            self.set_port_active(my_port_id, True)
+            other_item = self._scene_ref.item_for(their_comp_id)
+            if other_item:
+                other_item.set_port_active(their_port_id, True)
+        else:
+            self._snap_offset = None
 
     def mouseReleaseEvent(self, event) -> None:
         if (event.button() == Qt.MouseButton.LeftButton
                 and self._drag_start is not None
                 and self._orig_pos is not None):
 
-            # self.pos() is the accumulated scene-offset Qt applied during drag.
-            # The true new origin is the original origin displaced by that offset.
-            offset  = self.pos()
-            new_origin = Point(
-                self._orig_pos.x + int(round(offset.x())),
-                self._orig_pos.y + int(round(offset.y())),
-            )
-            snapped = self._scene_ref.snap(new_origin)
+            self._scene_ref.clear_all_port_highlights()
 
-            # Reset Qt's item position BEFORE mutating the model so
-            # sync_from_model() draws from the correct scene-space coordinates.
+            if self._snap_offset is not None:
+                final = self._snap_offset
+            else:
+                delta = event.scenePos() - self._drag_start
+                raw = Point(
+                    self._orig_pos.x + int(round(delta.x())),
+                    self._orig_pos.y + int(round(delta.y())),
+                )
+                final = self._scene_ref.snap(raw)
+
             self.setPos(0, 0)
 
-            if snapped != self._orig_pos:
-                # MoveComponent.execute() calls comp.move_by() — don't do it here.
-                cmd = MoveComponent(self._comp.id, self._orig_pos, snapped)
+            if final != self._orig_pos:
+                cmd = MoveComponent(self._comp.id, self._orig_pos, final)
                 self._scene_ref.cmd_stack.execute(cmd)
             else:
-                # No net movement — just redraw in place.
                 self.sync_from_model()
 
-            self._drag_start = None
-            self._orig_pos   = None
+            self._drag_start  = None
+            self._orig_pos    = None
+            self._snap_offset = None
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change, value):
@@ -325,38 +441,6 @@ class CanvasScene(QGraphicsScene):
         self._clear_ghosts()
         self._on_model_changed()
 
-    def drop_shape(self, kind_val: int, layer: int, scene_pos) -> None:
-        """
-        Called by CanvasView.dropEvent when a shape is dragged from the palette.
-        Stamps the shape centred on the drop position and snaps to grid.
-        Polygons and paths fall back to entering placement mode so the user
-        can click vertices (a full drag-out-polygon UX is out of scope here).
-        """
-        from core.model import ComponentKind, GDSComponent, Point
-        from core.commands import AddComponent
-
-        kind = ComponentKind(kind_val)
-        snapped = self.snap_f(scene_pos.x(), scene_pos.y())
-        cx, cy  = int(snapped.x()), int(snapped.y())
-
-        if kind == ComponentKind.RECTANGLE:
-            hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
-            comp = GDSComponent(
-                kind=ComponentKind.RECTANGLE, layer=layer,
-                origin=Point(cx - hw, cy - hh),
-                width=DEFAULT_W_DBU, height=DEFAULT_H_DBU,
-            )
-            self.cmd_stack.execute(AddComponent(comp))
-        else:
-            # For polygon/path, enter placement mode at the drop point so the
-            # user immediately starts laying vertices from there.
-            self.set_mode(
-                PlacementMode.PLACE_POLYGON if kind == ComponentKind.POLYGON
-                else PlacementMode.PLACE_PATH,
-                layer,
-            )
-            self._add_vertex(snapped)
-
     def place_rectangle(self, origin_x_um: float, origin_y_um: float,
                         width_um: float, height_um: float, layer: int = 0) -> GDSComponent:
         """Programmatic rect placement (toolbar quick-place, tests)."""
@@ -368,6 +452,64 @@ class CanvasScene(QGraphicsScene):
         self.cmd_stack.execute(AddComponent(comp))
         return comp
 
+    def drop_shape(self, kind_val: int, layer: int, scene_pos: QPointF) -> None:
+        """
+        Called by CanvasView.dropEvent after a drag from the shape palette.
+
+        kind_val  — the raw ComponentKind enum value (int) carried in the MIME data
+        layer     — the target layer number
+        scene_pos — drop position in scene (DBU) coordinates, snapped to grid below
+        """
+        try:
+            kind = ComponentKind(kind_val)
+        except ValueError:
+            return  # unknown kind; ignore silently rather than crash
+
+        snapped = self.snap_f(scene_pos.x(), scene_pos.y())
+        cx, cy  = int(snapped.x()), int(snapped.y())
+
+        if kind == ComponentKind.RECTANGLE:
+            hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
+            comp = GDSComponent(
+                kind   = ComponentKind.RECTANGLE,
+                layer  = layer,
+                origin = Point(cx - hw, cy - hh),
+                width  = DEFAULT_W_DBU,
+                height = DEFAULT_H_DBU,
+            )
+
+        elif kind == ComponentKind.POLYGON:
+            # Default: equilateral-ish triangle centred on the drop point
+            hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
+            pts = [
+                Point(cx,      cy - hh),   # top
+                Point(cx + hw, cy + hh),   # bottom-right
+                Point(cx - hw, cy + hh),   # bottom-left
+            ]
+            comp = GDSComponent(
+                kind   = ComponentKind.POLYGON,
+                layer  = layer,
+                origin = pts[0],
+                points = pts,
+            )
+
+        elif kind == ComponentKind.PATH:
+            # Default: short horizontal segment
+            hw = DEFAULT_W_DBU // 2
+            pts = [Point(cx - hw, cy), Point(cx + hw, cy)]
+            comp = GDSComponent(
+                kind       = ComponentKind.PATH,
+                layer      = layer,
+                origin     = pts[0],
+                points     = pts,
+                path_width = DEFAULT_PW_DBU,
+            )
+
+        else:
+            return  # future kinds; ignore
+
+        self.cmd_stack.execute(AddComponent(comp))
+
     def snap(self, pt: Point) -> Point:
         g = GRID_MINOR_DBU
         return Point(round(pt.x / g) * g, round(pt.y / g) * g)
@@ -375,6 +517,66 @@ class CanvasScene(QGraphicsScene):
     def snap_f(self, x: float, y: float) -> QPointF:
         g = float(GRID_MINOR_DBU)
         return QPointF(round(x / g) * g, round(y / g) * g)
+
+    def item_for(self, comp_id: str) -> Optional["ComponentItem"]:
+        return self._items.get(comp_id)
+
+    def clear_all_port_highlights(self) -> None:
+        for item in self._items.values():
+            item.clear_port_highlights()
+
+    def find_port_snap(
+        self,
+        moving_comp: GDSComponent,
+        tentative_origin: Point,
+    ) -> Optional[tuple]:
+        """
+        Check whether any port on *moving_comp* (placed at *tentative_origin*)
+        is within PORT_SNAP_RADIUS of a compatible port on another component.
+
+        Compatibility rule: ports must face each other
+        (moving.side == stationary.side.opposite).
+
+        Returns (snapped_origin, my_port_id, their_port_id, their_comp_id)
+        or None if no snap candidate found.
+
+        The returned snapped_origin is the exact origin that places my_port
+        flush against their_port — guaranteeing perfect edge alignment.
+        """
+        best_dist  = PORT_SNAP_RADIUS
+        best       = None
+
+        for port in moving_comp.ports:
+            # Absolute position of this port at the tentative location
+            my_abs = Point(
+                tentative_origin.x + port.offset.x,
+                tentative_origin.y + port.offset.y,
+            )
+
+            for other_comp in self._design.components:
+                if other_comp.id == moving_comp.id:
+                    continue
+                for other_port in other_comp.ports:
+                    # Compatibility: must face each other
+                    if other_port.side != port.side.opposite:
+                        continue
+
+                    their_abs = other_port.abs_pos(other_comp.origin)
+                    dx = my_abs.x - their_abs.x
+                    dy = my_abs.y - their_abs.y
+                    dist = math.sqrt(dx * dx + dy * dy)
+
+                    if dist < best_dist:
+                        best_dist = dist
+                        # Exact origin that places my port ON their port
+                        snapped_origin = Point(
+                            tentative_origin.x - dx,
+                            tentative_origin.y - dy,
+                        )
+                        best = (snapped_origin, port.id,
+                                other_port.id, other_comp.id)
+
+        return best
 
     # ── Mouse events ──────────────────────────────────────────────────────────
 

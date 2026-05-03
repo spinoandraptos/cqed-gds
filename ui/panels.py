@@ -8,6 +8,7 @@ Phase 2 changes:
   - PropertiesPanel: shows vertex count for polygons, path width for paths.
     Added an editable layer spinbox (read-only in Phase 1 → editable in Phase 2).
     layer_change_requested(comp_id, new_layer) signal for undo-aware edit.
+    geometry_change_requested(comp_id, field, value_dbu) signal for width/height/path_width edits.
 """
 
 from __future__ import annotations
@@ -23,7 +24,7 @@ from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray
 from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QDrag, QMouseEvent
 
 from ui.theme import Colors, Fonts, Geometry
-from core.model import GDSComponent, ComponentKind, dbu_to_um
+from core.model import GDSComponent, ComponentKind, dbu_to_um, um_to_dbu
 
 
 # ── Helper widgets ────────────────────────────────────────────────────────────
@@ -279,9 +280,14 @@ class PropertiesPanel(QWidget):
     Phase 2: Layer is now an editable spinbox (emits layer_change_requested
     so MainWindow can wrap it in an EditComponent command for undo).
     Vertex count row shown for polygon/path; path width row for paths.
+
+    Phase 3: Width, Height, and Path Width are now editable QDoubleSpinBoxes.
+    Each emits geometry_change_requested(comp_id, field, value_dbu) on commit
+    (editingFinished — fires on Enter or focus-out, not on every keystroke).
     """
 
-    layer_change_requested = pyqtSignal(str, int)   # comp_id, new_layer
+    layer_change_requested    = pyqtSignal(str, int)       # comp_id, new_layer
+    geometry_change_requested = pyqtSignal(str, str, int)  # comp_id, field, value_dbu
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -329,15 +335,23 @@ class PropertiesPanel(QWidget):
 
         # ── Geometry ──────────────────────────────────────────────────────────
         cl.addWidget(SectionLabel("Geometry"))
-        self._row_x      = ValueRow("X origin")
-        self._row_y      = ValueRow("Y origin")
-        self._row_w      = ValueRow("Width")
-        self._row_h      = ValueRow("Height")
-        self._row_verts  = ValueRow("Vertices")   # polygon/path only
-        self._row_pw     = ValueRow("Path width")  # path only
-        for r in [self._row_x, self._row_y, self._row_w, self._row_h,
-                  self._row_verts, self._row_pw]:
-            cl.addWidget(r)
+        self._row_x = ValueRow("X origin")
+        self._row_y = ValueRow("Y origin")
+        cl.addWidget(self._row_x)
+        cl.addWidget(self._row_y)
+
+        # Width — editable spinbox, rect only
+        _, self._row_w_spin = self._make_dim_row("Width", "width", cl)
+
+        # Height — editable spinbox, rect only
+        _, self._row_h_spin = self._make_dim_row("Height", "height", cl)
+
+        # Vertices — read-only, polygon/path only
+        self._row_verts = ValueRow("Vertices")
+        cl.addWidget(self._row_verts)
+
+        # Path width — editable spinbox, path only
+        _, self._row_pw_spin = self._make_dim_row("Path width", "path_width", cl)
 
         cl.addWidget(Separator())
 
@@ -357,17 +371,61 @@ class PropertiesPanel(QWidget):
 
         self.clear()
 
+    # ── Dim row factory ───────────────────────────────────────────────────────
+
+    def _make_dim_row(self, label_text: str, field: str, layout) -> tuple:
+        """
+        Build a label + QDoubleSpinBox row, add it to layout, return (row_widget, spinbox).
+        The spinbox emits geometry_change_requested on editingFinished (Enter or focus-out),
+        not on every keystroke — so the undo stack stays clean.
+        """
+        row = QWidget()
+        hl  = QHBoxLayout(row)
+        hl.setContentsMargins(0, 2, 0, 2)
+        hl.setSpacing(8)
+
+        lbl = QLabel(label_text)
+        lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
+        lbl.setFixedWidth(84)
+
+        sb = QDoubleSpinBox()
+        sb.setRange(0.001, 10_000.0)   # µm: 1 nm minimum, 10 mm maximum
+        sb.setDecimals(3)
+        sb.setSuffix(" µm")
+        sb.setSingleStep(0.5)
+        sb.setFixedWidth(110)
+        sb.setEnabled(False)
+        sb.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {Colors.BG_BASE};
+                border: 1px solid {Colors.BG_BORDER};
+                border-radius: 4px;
+                color: {Colors.TEXT_PRIMARY};
+                font-size: {Fonts.SIZE_SM}px;
+                padding: 3px 6px;
+            }}
+            QDoubleSpinBox:enabled:hover {{ border-color: {Colors.ACCENT_DIM}; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 16px; }}
+        """)
+        sb.editingFinished.connect(lambda f=field, s=sb: self._on_dim_changed(f, s))
+
+        hl.addWidget(lbl)
+        hl.addWidget(sb)
+        hl.addStretch()
+        layout.addWidget(row)
+        return row, sb
+
     # ── Public API ────────────────────────────────────────────────────────────
 
     def clear(self) -> None:
         self._current_comp_id = None
-        self._layer_spin.blockSignals(True)
-        self._layer_spin.setValue(0)
-        self._layer_spin.setEnabled(False)
-        self._layer_spin.blockSignals(False)
+        for sb in (self._layer_spin, self._row_w_spin, self._row_h_spin, self._row_pw_spin):
+            sb.blockSignals(True)
+            sb.setValue(0)
+            sb.setEnabled(False)
+            sb.blockSignals(False)
         for r in [self._row_id, self._row_kind, self._row_x, self._row_y,
-                  self._row_w, self._row_h, self._row_verts,
-                  self._row_pw, self._row_bbox]:
+                  self._row_verts, self._row_bbox]:
             r.set_value("—")
 
     def show_component(self, comp: GDSComponent) -> None:
@@ -377,31 +435,48 @@ class PropertiesPanel(QWidget):
         self._row_id.set_value(comp.id)
         self._row_kind.set_value(comp.kind.name.capitalize())
 
+        # Layer spinbox
         self._layer_spin.blockSignals(True)
         self._layer_spin.setValue(comp.layer)
         self._layer_spin.setEnabled(True)
         self._layer_spin.blockSignals(False)
 
+        # Origin (read-only — move via drag)
         self._row_x.set_value(f"{dbu_to_um(comp.origin.x):.3f} µm")
         self._row_y.set_value(f"{dbu_to_um(comp.origin.y):.3f} µm")
 
-        if comp.kind == ComponentKind.RECTANGLE:
-            self._row_w.set_value(f"{dbu_to_um(comp.width):.3f} µm")
-            self._row_h.set_value(f"{dbu_to_um(comp.height):.3f} µm")
-            self._row_verts.set_value("—")
-            self._row_pw.set_value("—")
-        elif comp.kind == ComponentKind.POLYGON:
-            self._row_w.set_value("—")
-            self._row_h.set_value("—")
-            self._row_verts.set_value(str(comp.vertex_count))
-            self._row_pw.set_value("—")
-        else:  # PATH
-            self._row_w.set_value("—")
-            self._row_h.set_value("—")
-            self._row_verts.set_value(str(comp.vertex_count))
-            pw = comp.path_width or 0
-            self._row_pw.set_value(f"{dbu_to_um(pw):.3f} µm")
+        # Width / Height — rectangle only
+        for sb in (self._row_w_spin, self._row_h_spin):
+            sb.blockSignals(True)
+        is_rect = comp.kind == ComponentKind.RECTANGLE
+        self._row_w_spin.setEnabled(is_rect)
+        self._row_h_spin.setEnabled(is_rect)
+        if is_rect:
+            self._row_w_spin.setValue(dbu_to_um(comp.width))
+            self._row_h_spin.setValue(dbu_to_um(comp.height))
+        else:
+            self._row_w_spin.setValue(0.0)
+            self._row_h_spin.setValue(0.0)
+        for sb in (self._row_w_spin, self._row_h_spin):
+            sb.blockSignals(False)
 
+        # Vertices — polygon and path only
+        if comp.kind in (ComponentKind.POLYGON, ComponentKind.PATH):
+            self._row_verts.set_value(str(comp.vertex_count))
+        else:
+            self._row_verts.set_value("—")
+
+        # Path width — path only
+        self._row_pw_spin.blockSignals(True)
+        is_path = comp.kind == ComponentKind.PATH
+        self._row_pw_spin.setEnabled(is_path)
+        if is_path:
+            self._row_pw_spin.setValue(dbu_to_um(comp.path_width or 0))
+        else:
+            self._row_pw_spin.setValue(0.0)
+        self._row_pw_spin.blockSignals(False)
+
+        # Bounding box
         self._row_bbox.set_value(
             f"({dbu_to_um(bb.x_min):.1f}, {dbu_to_um(bb.y_min):.1f})"
             f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f})"
@@ -412,3 +487,8 @@ class PropertiesPanel(QWidget):
     def _on_layer_changed(self, value: int) -> None:
         if self._current_comp_id:
             self.layer_change_requested.emit(self._current_comp_id, value)
+
+    def _on_dim_changed(self, field: str, spinbox: QDoubleSpinBox) -> None:
+        if self._current_comp_id:
+            value_dbu = um_to_dbu(spinbox.value())
+            self.geometry_change_requested.emit(self._current_comp_id, field, value_dbu)

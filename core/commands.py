@@ -43,6 +43,8 @@ class AddComponent(Command):
         self._comp = comp
 
     def execute(self, design: DesignScene) -> None:
+        if not self._comp.ports:
+            self._comp.build_default_ports()
         design.add(self._comp)
 
     def undo(self, design: DesignScene) -> None:
