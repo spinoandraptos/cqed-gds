@@ -25,7 +25,7 @@ from PyQt6.QtGui import (
 )
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
 import qtawesome as qta
-
+from pathlib import Path
 from ui.theme import Colors, Fonts, Geometry, apply_theme
 from ui.canvas_scene import CanvasScene, PlacementMode
 from ui.canvas_view import CanvasView
@@ -34,6 +34,7 @@ from core.model import DesignScene, GDSComponent, ComponentKind
 from core.commands import CommandStack, EditComponent
 from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
+from core.serialiser import save, load, SerialisationError
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -41,7 +42,8 @@ class MainWindow(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
 
-        self._design = DesignScene(name="TOP")
+        self._design = DesignScene(name="layout")
+        self._current_file: Optional[Path] = None
         self._scene  = CanvasScene(self._design)
         self._view   = CanvasView(self._scene)
 
@@ -70,12 +72,14 @@ class MainWindow(QMainWindow):
         # File
         file_menu = mb.addMenu("File")
         self._act_new    = self._action("New Design",      "Ctrl+N",         self._new_design)
+        self._act_open = self._action("Open…", "Ctrl+O", self._open)
         self._act_save   = self._action("Save",            "Ctrl+S",         self._save)
         self._act_saveas = self._action("Save As…",        "Ctrl+Shift+S",   self._save_as)
         self._act_export = self._action("Export GDS…",     "Ctrl+E",         self._export_gds)
         self._act_quit   = self._action("Quit",            "Ctrl+Q",         self.close)
-        for a in [self._act_new, self._act_save, self._act_saveas, None,
-                  self._act_export, None, self._act_quit]:
+        for a in [self._act_new, self._act_open, None,
+                self._act_save, self._act_saveas, None,
+                self._act_export, None, self._act_quit]:
             file_menu.addSeparator() if a is None else file_menu.addAction(a)
 
         # Edit
@@ -419,24 +423,101 @@ class MainWindow(QMainWindow):
             )
 
     # ── File actions ──────────────────────────────────────────────────────────
-
     def _new_design(self) -> None:
-        if self._design.is_dirty:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                "Discard unsaved changes and start a new design?",
-                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QMessageBox.StandardButton.Discard:
-                return
+        if not self._maybe_save_before("start a new design"):
+            return
         self._design.clear()
         self._scene.cmd_stack.clear()
-        self._scene.reset()          # public API — no private member access
+        self._scene.reset()
+        self._current_file = None
+        self._update_title()
         self._flash_status("New design created")
 
-    def _save(self)    -> None: self._flash_status("Save — coming Phase 4")
-    def _save_as(self) -> None: self._flash_status("Save As — coming Phase 4")
+    def _save(self) -> None:
+        if self._current_file:
+            self._do_save(self._current_file)
+        else:
+            self._save_as()
 
+    def _save_as(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Design",
+            str(self._current_file or f"{self._design.name}.json"),
+            "GDS Canvas Files (*.json);;All Files (*)",
+        )
+        if path:
+            self._do_save(Path(path))
+
+    def _do_save(self, path: Path) -> None:
+        try:
+            save(self._design, path)
+            self._current_file  = path
+            self._design.is_dirty = False
+            self._update_title()
+            self._flash_status(f"Saved → {path.name}")
+        except SerialisationError as exc:
+            QMessageBox.critical(self, "Save Failed", str(exc))
+
+    def _open(self) -> None:
+        if not self._maybe_save_before("open a file"):
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open Design", "",
+            "GDS Canvas Files (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            new_design = load(path)
+        except SerialisationError as exc:
+            QMessageBox.critical(self, "Open Failed", str(exc))
+            return
+
+        # Swap in the loaded design
+        self._design = new_design
+        self._scene._design = new_design
+        self._scene.cmd_stack = type(self._scene.cmd_stack)(new_design)
+        self._scene.cmd_stack.connect_change(self._scene._on_model_changed)
+        self._scene._on_model_changed()
+
+        self._current_file = Path(path)
+        self._update_title()
+        self._flash_status(f"Opened {Path(path).name}")
+        self._view.zoom_fit()
+
+    def _maybe_save_before(self, action: str) -> bool:
+        """
+        If the design is dirty, prompt Save / Discard / Cancel.
+        Returns True if the caller should proceed, False if the user cancelled.
+        """
+        if not self._design.is_dirty:
+            return True
+        reply = QMessageBox.question(
+            self, "Unsaved Changes",
+            f"Save changes before you {action}?",
+            QMessageBox.StandardButton.Save |
+            QMessageBox.StandardButton.Discard |
+            QMessageBox.StandardButton.Cancel,
+        )
+        if reply == QMessageBox.StandardButton.Save:
+            self._save()
+            # If save was cancelled (e.g. no path chosen yet and user dismissed dialog)
+            return not self._design.is_dirty
+        if reply == QMessageBox.StandardButton.Discard:
+            return True
+        return False   # Cancel
+
+    def _update_title(self) -> None:
+        name  = self._current_file.name if self._current_file else self._design.name
+        dirty = " •" if self._design.is_dirty else ""
+        self.setWindowTitle(f"{self.TITLE_BASE} — {name}{dirty}")
+
+    def closeEvent(self, event) -> None:
+        if self._maybe_save_before("quit"):
+            event.accept()
+        else:
+            event.ignore()
+        
     def _export_gds(self) -> None:
         if not self._design.components:
             QMessageBox.warning(self, "Export GDS", "Nothing to export — add some shapes first.")
@@ -462,11 +543,6 @@ class MainWindow(QMainWindow):
         self._flash_status(f"Exported {summary['shapes']} shapes to {path}")
         result_dlg = ExportResultDialog(summary, self)
         result_dlg.exec()
-        # ── Title ─────────────────────────────────────────────────────────────────
-
-    def _update_title(self) -> None:
-        dirty = " •" if self._design.is_dirty else ""
-        self.setWindowTitle(f"{self.TITLE_BASE} — {self._design.name}{dirty}")
 
     # ── About / help ──────────────────────────────────────────────────────────
 
