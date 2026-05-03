@@ -256,6 +256,7 @@ class GroupItem(QGraphicsItem):
         self._last_drag_pos: Optional[QPointF] = None   # previous frame position
         self._total_dx = 0   # accumulated DBU delta this drag gesture
         self._total_dy = 0
+        self._snap_adjust: Optional[tuple] = None   # (extra_dx, extra_dy) snap nudge
 
         self.setZValue(1)
         self.setFlags(
@@ -335,12 +336,19 @@ class GroupItem(QGraphicsItem):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._editing:
+            self._scene_ref.group_selected.emit(self._group.id)
+            if not self.isSelected():
+                # First press: select only, don't arm drag
+                self.setSelected(True)
+                event.accept()
+                return
+            # Already selected: arm drag normally
             self._drag_start    = event.scenePos()
             self._last_drag_pos = event.scenePos()
             self._total_dx      = 0
             self._total_dy      = 0
+            self._snap_adjust   = None
             event.accept()
-            self._scene_ref.group_selected.emit(self._group.id)
             return
         super().mousePressEvent(event)
 
@@ -373,6 +381,21 @@ class GroupItem(QGraphicsItem):
             # Invalidate group border so it redraws at new position
             self.prepareGeometryChange()
 
+        # ── Port snap probe (runs every move, zero-cost when no near port) ────
+        self._scene_ref.clear_all_port_highlights()
+        snap = self._scene_ref.find_group_port_snap(self._group)
+        if snap:
+            self._snap_adjust = (snap[0], snap[1])   # extra_dx, extra_dy
+            my_comp_id, my_port_id, their_comp_id, their_port_id = snap[2:]
+            my_item    = self._scene_ref._items.get(my_comp_id)
+            their_item = self._scene_ref._items.get(their_comp_id)
+            if my_item:
+                my_item.set_port_active(my_port_id, True)
+            if their_item:
+                their_item.set_port_active(their_port_id, True)
+        else:
+            self._snap_adjust = None
+
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
@@ -380,25 +403,38 @@ class GroupItem(QGraphicsItem):
                 and self._drag_start is not None
                 and not self._editing):
 
+            self._scene_ref.clear_all_port_highlights()
+
             total_dx = self._total_dx
             total_dy = self._total_dy
 
+            # Incorporate any snap nudge into the total displacement
+            snap_adjust = self._snap_adjust
+            if snap_adjust:
+                total_dx += snap_adjust[0]
+                total_dy += snap_adjust[1]
+
             if total_dx != 0 or total_dy != 0:
-                # Reverse the live moves so the model is back at start,
-                # then re-apply via the command stack for a clean undo entry
+                # Reverse only the live-dragged portion — snap nudge was never
+                # applied to the model, so only undo _total_dx / _total_dy
                 for cid in self._group.member_ids:
                     comp = self._scene_ref._design.get(cid)
                     if comp:
-                        comp.move_by(-total_dx, -total_dy)
+                        comp.move_by(-self._total_dx, -self._total_dy)
 
                 self._scene_ref.cmd_stack.execute(
                     MoveGroup(self._group.id, total_dx, total_dy)
                 )
 
+            # Wire snapped ports via undo-aware commands
+            if snap_adjust:
+                self._scene_ref._try_connect_group_snap(self._group)
+
             self._drag_start    = None
             self._last_drag_pos = None
             self._total_dx      = 0
             self._total_dy      = 0
+            self._snap_adjust   = None
             event.accept()
             return
 
@@ -427,11 +463,13 @@ class ComponentItem(QGraphicsItem):
         self._scene_ref = scene_ref
         self._drag_start:  Optional[QPointF] = None
         self._orig_pos:    Optional[Point]   = None
-        self._snap_offset: Optional[Point]   = None   # set during drag when port snap active
+        self._snap_offset: Optional[Point]   = None
+        self._orig_positions: dict             = {}    
+        self._drag_committed: bool             = False  
+        self._was_selected:   bool             = False  
 
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
-            QGraphicsItem.GraphicsItemFlag.ItemIsMovable |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges |
             QGraphicsItem.GraphicsItemFlag.ItemSendsScenePositionChanges,
         )
@@ -614,80 +652,106 @@ class ComponentItem(QGraphicsItem):
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start  = event.scenePos()
-            self._orig_pos    = Point(self._comp.origin.x, self._comp.origin.y)
+            self._was_selected = self.isSelected()
+            self._drag_start   = event.scenePos()
+            self._drag_committed = False
+            # Snapshot origins of ALL currently-selected items (including self)
+            super().mousePressEvent(event)   # lets Qt handle selection logic
+            self._orig_positions = {
+                item: Point(item._comp.origin.x, item._comp.origin.y)
+                for item in self._scene_ref.selectedItems()
+                if isinstance(item, ComponentItem)
+            }
             self._snap_offset = None
-        super().mousePressEvent(event)
+        else:
+            super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        super().mouseMoveEvent(event)
         if self._drag_start is None:
+            super().mouseMoveEvent(event)
             return
         delta = event.scenePos() - self._drag_start
-        tentative = Point(
-            self._orig_pos.x + int(round(delta.x())),
-            self._orig_pos.y + int(round(delta.y())),
-        )
-        snap_result = self._scene_ref.find_port_snap(self._comp, tentative)
+        if not self._drag_committed:
+            # Require a minimum movement threshold before starting drag
+            if abs(delta.x()) < 2.0 and abs(delta.y()) < 2.0:
+                return
+            self._drag_committed = True
+
+        # Move all selected items together
+        for item, orig in self._orig_positions.items():
+            tentative = Point(
+                orig.x + int(round(delta.x())),
+                orig.y + int(round(delta.y())),
+            )
+            dx = tentative.x - item._comp.origin.x
+            dy = tentative.y - item._comp.origin.y
+            item._comp.move_by(dx, dy)
+            item.sync_from_model()
+
+        # Port snap only for the item under the cursor
+        my_tentative = Point(
+            self._orig_positions[self]._comp_x() + int(round(delta.x())),
+            self._orig_positions[self]._comp_y() + int(round(delta.y())),
+        ) if self in self._orig_positions else None
         self._scene_ref.clear_all_port_highlights()
-        if snap_result:
-            snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
-            self._snap_offset = snap_origin
-            self.set_port_active(my_port_id, True)
-            other_item = self._scene_ref.item_for(their_comp_id)
-            if other_item:
-                other_item.set_port_active(their_port_id, True)
-        else:
-            self._snap_offset = None
+        if len(self._orig_positions) == 1 and self in self._orig_positions:
+            orig_self = self._orig_positions[self]
+            tentative = Point(
+                orig_self.x + int(round(delta.x())),
+                orig_self.y + int(round(delta.y())),
+            )
+            snap_result = self._scene_ref.find_port_snap(self._comp, tentative)
+            if snap_result:
+                snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
+                self._snap_offset = snap_origin
+                self.set_port_active(my_port_id, True)
+                other_item = self._scene_ref.item_for(their_comp_id)
+                if other_item:
+                    other_item.set_port_active(their_port_id, True)
+                return
+        self._snap_offset = None
 
     def mouseReleaseEvent(self, event) -> None:
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._drag_start is not None
-                and self._orig_pos is not None):
-
+        if event.button() == Qt.MouseButton.LeftButton and self._drag_start is not None:
             self._scene_ref.clear_all_port_highlights()
-
-            if self._snap_offset is not None:
-                final = self._snap_offset
-            else:
+            if self._drag_committed:
                 delta = event.scenePos() - self._drag_start
-                raw = Point(
-                    self._orig_pos.x + int(round(delta.x())),
-                    self._orig_pos.y + int(round(delta.y())),
-                )
-                moved = abs(delta.x()) > 1.0 or abs(delta.y()) > 1.0
-                final = self._scene_ref.snap(raw) if moved else self._orig_pos
-
-            self.setPos(0, 0)
-
-            actually_moved = final != self._orig_pos
-
-            # ── Disconnect before any move ─────────────────────────────────────
-            # Must happen regardless of whether we're re-snapping to a new port
-            # or just dragging free — either way the old wiring is broken.
-            if actually_moved:
-                self._scene_ref.disconnect_component(self._comp.id)
-
-            if actually_moved:
-                cmd = MoveComponent(self._comp.id, self._orig_pos, final)
-                self._scene_ref.cmd_stack.execute(cmd)
-
-            if self._snap_offset is not None:
-                self._scene_ref._try_connect_snapped(self._comp, final)
-            elif final == self._orig_pos:
-                self.sync_from_model()
-
-            self._drag_start  = None
-            self._orig_pos    = None
-            self._snap_offset = None
+                for item, orig in self._orig_positions.items():
+                    if self._snap_offset is not None and item is self and len(self._orig_positions) == 1:
+                        final = self._snap_offset
+                    else:
+                        raw = Point(
+                            orig.x + int(round(delta.x())),
+                            orig.y + int(round(delta.y())),
+                        )
+                        final = self._scene_ref.snap(raw)
+                    if final != orig:
+                        self._scene_ref.disconnect_component(item._comp.id)
+                        # Reset to original so MoveComponent sees correct old pos
+                        dx = orig.x - item._comp.origin.x
+                        dy = orig.y - item._comp.origin.y
+                        item._comp.move_by(dx, dy)
+                        self._scene_ref.cmd_stack.execute(
+                            MoveComponent(item._comp.id, orig, final)
+                        )
+                    else:
+                        item.sync_from_model()
+                if self._snap_offset is not None and len(self._orig_positions) == 1:
+                    self._scene_ref._try_connect_snapped(self._comp, self._snap_offset)
+            self._drag_start     = None
+            self._orig_positions = {}
+            self._drag_committed = False
+            self._snap_offset    = None
             event.accept()
             return
         super().mouseReleaseEvent(event)
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
-            self._apply_style(bool(value), hovered=False)
-            if bool(value):
+            selected = bool(value)
+            self._apply_style(selected, hovered=False)
+            self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, selected)
+            if selected:
                 self._scene_ref.item_selected.emit(self._comp.id)
         return super().itemChange(change, value)
 
@@ -927,6 +991,89 @@ class CanvasScene(QGraphicsScene):
 
         return best
     
+    def find_group_port_snap(
+        self,
+        moving_group: "ComponentGroup",
+    ) -> Optional[tuple]:
+        """
+        Check whether any port on any member of *moving_group* is within
+        PORT_SNAP_RADIUS of a compatible port on a component outside the group.
+
+        'Outside the group' means: not in moving_group.member_ids.  This
+        includes both standalone components and members of other groups —
+        cross-group snapping is fully supported.
+
+        Compatibility rule: ports must face each other
+        (moving.side == stationary.side.opposite).
+
+        Returns:
+            (extra_dx, extra_dy, my_comp_id, my_port_id,
+             their_comp_id, their_port_id)
+
+            extra_dx / extra_dy  — the additional DBU translation needed to
+                                   place the snapping port exactly flush.
+            my_comp_id           — the member of moving_group whose port snapped.
+
+        Returns None if no snap candidate found.
+        """
+        member_id_set = set(moving_group.member_ids)
+        best_dist = PORT_SNAP_RADIUS
+        best      = None
+
+        for my_comp in self._design.components:
+            if my_comp.id not in member_id_set:
+                continue
+            for my_port in my_comp.ports:
+                my_abs = my_port.abs_pos(my_comp.origin)
+
+                for other_comp in self._design.components:
+                    if other_comp.id in member_id_set:
+                        continue   # skip own group members
+                    for other_port in other_comp.ports:
+                        if other_port.side != my_port.side.opposite:
+                            continue
+
+                        their_abs = other_port.abs_pos(other_comp.origin)
+                        dx = my_abs.x - their_abs.x
+                        dy = my_abs.y - their_abs.y
+                        dist = math.sqrt(dx * dx + dy * dy)
+
+                        if dist < best_dist:
+                            best_dist = dist
+                            # Nudge that would place my_port exactly on their_port
+                            best = (
+                                -dx, -dy,
+                                my_comp.id, my_port.id,
+                                other_comp.id, other_port.id,
+                            )
+
+        return best
+
+    def _try_connect_group_snap(self, group: "ComponentGroup") -> None:
+        """
+        After a snapped group drop: find the flush port pair and wire it.
+        Disconnects any stale wiring on the snapping member first.
+        """
+        snap = self.find_group_port_snap(group)
+        if snap is None:
+            return
+        _, _, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
+
+        # Sever existing connections on the snapping member before rewiring
+        self.disconnect_component(my_comp_id)
+
+        if self._design.are_connected(
+            my_comp_id, my_port_id, their_comp_id, their_port_id
+        ):
+            return  # already wired — idempotent
+
+        self.cmd_stack.execute(
+            ConnectPorts(my_comp_id, my_port_id, their_comp_id, their_port_id)
+        )
+        self._refresh_indicators(my_comp_id)
+        self._refresh_indicators(their_comp_id)
+        self.connections_changed.emit()
+
     def disconnect_component(self, comp_id: str) -> None:
         """
         Sever every connection on comp_id via undo-aware commands.

@@ -136,22 +136,22 @@ class MainWindow(QMainWindow):
         self._tb_redo = self._tb_button("fa5s.redo",  "Redo  Ctrl+Shift+Z", self._redo)
         self._toolbar.addSeparator()
 
-        # ── Tool group: Select | Rect | Polygon | Path ────────────────────────
-        # Checkable buttons, mutually exclusive via QActionGroup
-        self._tool_group = QActionGroup(self)
-        self._tool_group.setExclusive(True)
-
-        self._tb_select = self._tb_tool_button(
+        # ── Tool Select  ────────────────────────
+        self._tb_select = self._tb_button(
             "fa5s.mouse-pointer", "Select  (Esc)",
             lambda: self._enter_mode(PlacementMode.SELECT)
         )
-        self._tb_select.setChecked(True)
         self._toolbar.addSeparator()
 
         # ── Zoom ─────────────────────────────────────────────────────────────
         self._tb_button("fa5s.search-plus",       "Zoom In  (+)",  self._view.zoom_in)
         self._tb_button("fa5s.search-minus",      "Zoom Out  (−)", self._view.zoom_out)
         self._tb_button("fa5s.expand-arrows-alt", "Fit All  (F)",  self._view.zoom_fit)
+        self._toolbar.addSeparator()
+
+        # ── Grouping ─────────────────────────────────────────────────────────────
+        self._tb_group   = self._tb_button("fa5s.object-group",   "Group Selected  (Ctrl+G)",         self._group_selected)
+        self._tb_ungroup = self._tb_button("fa5s.object-ungroup", "Ungroup Selected  (Ctrl+Shift+G)", self._ungroup_selected)
         self._toolbar.addSeparator()
 
         # ── Delete ────────────────────────────────────────────────────────────
@@ -184,20 +184,6 @@ class MainWindow(QMainWindow):
         act  = QAction(icon, "", self)
         act.setToolTip(tip)
         act.triggered.connect(slot)
-        self._toolbar.addAction(act)
-        return act
-
-    def _tb_tool_button(self, icon_name: str, tip: str, slot) -> QAction:
-        """Checkable exclusive tool button."""
-        icon = qta.icon(icon_name,
-                        color=Colors.TEXT_SECONDARY,
-                        color_active=Colors.ACCENT,
-                        color_checked=Colors.ACCENT)
-        act = QAction(icon, "", self)
-        act.setToolTip(tip)
-        act.setCheckable(True)
-        act.triggered.connect(slot)
-        self._tool_group.addAction(act)
         self._toolbar.addAction(act)
         return act
 
