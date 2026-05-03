@@ -206,6 +206,24 @@ class DisconnectPorts(Command):
     def description(self) -> str:
         return "Disconnect ports"
 
+class BatchCommand(Command):
+    """Execute multiple commands as a single undo/redo unit."""
+
+    def __init__(self, commands: List[Command], label: str) -> None:
+        self._commands = commands
+        self._label    = label
+
+    def execute(self, design: DesignScene) -> None:
+        for cmd in self._commands:
+            cmd.execute(design)
+
+    def undo(self, design: DesignScene) -> None:
+        for cmd in reversed(self._commands):
+            cmd.undo(design)
+
+    @property
+    def description(self) -> str:
+        return self._label
 
 # ── Command Stack ─────────────────────────────────────────────────────────────
 

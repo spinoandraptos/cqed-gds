@@ -35,6 +35,7 @@ from core.commands import CommandStack, EditComponent
 from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
 from core.serialiser import save, load, SerialisationError
+from ui.sweep_dialog import SweepDialog
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -88,9 +89,11 @@ class MainWindow(QMainWindow):
         self._act_redo   = self._action("Redo",            "Ctrl+Shift+Z",   self._redo)
         self._act_selall = self._action("Select All",      "Ctrl+A",         self._select_all)
         self._act_delete = self._action("Delete",          "Delete",         self._delete_selected)
+        self._act_sweep = self._action("Sweep Parameter…", "Ctrl+W", self._sweep)
         self._act_escape = self._action("Cancel / Select", "Escape",         self._escape)
         for a in [self._act_undo, self._act_redo, None,
-                  self._act_selall, self._act_delete, None, self._act_escape]:
+                self._act_selall, self._act_delete,
+                self._act_sweep, None, self._act_escape]:
             edit_menu.addSeparator() if a is None else edit_menu.addAction(a)
 
         # View
@@ -151,6 +154,11 @@ class MainWindow(QMainWindow):
         # ── Delete ────────────────────────────────────────────────────────────
         self._tb_button("fa5s.trash-alt", "Delete Selected  (Del)",
                         self._delete_selected, color=Colors.ERROR)
+        
+        # ── Sweep Parameter ────────────────────────────────────────────────────────────
+        self._toolbar.addSeparator()
+        self._tb_button("fa5s.sliders-h", "Sweep Parameter  (Ctrl+W)", self._sweep,
+                color=Colors.ACCENT)
         
         # ── Export GDS ────────────────────────────────────────────────────────────
         self._toolbar.addSeparator()
@@ -352,6 +360,22 @@ class MainWindow(QMainWindow):
         self._sb_zoom.setText(label)
         self._tb_zoom_label.setText(f"{zoom * 1000:.2f} px/µm")
 
+    @pyqtSlot()
+    def _sweep(self) -> None:
+        selected = [
+            item.component
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        ]
+        if len(selected) != 1:
+            QMessageBox.information(
+                self, "Sweep", "Select exactly one component to sweep."
+            )
+            return
+        dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
+        dlg.exec()
+
+    @pyqtSlot()
     def _refresh_props_for_selection(self) -> None:
         """Re-populate the properties panel after a wiring change."""
         selected = self._scene.selectedItems()
