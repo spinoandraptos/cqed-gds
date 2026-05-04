@@ -363,7 +363,187 @@ class MoveGroup(Command):
     @property
     def description(self) -> str:
         return "Move group"
-    
+
+
+# ── Rotation helpers ──────────────────────────────────────────────────────────
+
+def _rotate_point(px: int, py: int,
+                  cx: int, cy: int,
+                  steps: int) -> tuple[int, int]:
+    """
+    Rotate point (px, py) around centre (cx, cy) by `steps` × 90° CCW.
+    steps=1 → 90° CCW, steps=-1 → 90° CW (equivalent to 270° CCW).
+    Pure integer arithmetic — no floating point, no rounding drift.
+    """
+    steps = steps % 4
+    dx, dy = px - cx, py - cy
+    for _ in range(steps):
+        dx, dy = -dy, dx          # 90° CCW: (dx, dy) → (−dy, dx)
+    return cx + dx, cy + dy
+
+
+def _rotate_component_in_place(comp: "GDSComponent",
+                                cx: int, cy: int,
+                                steps: int) -> None:
+    """
+    Bake a rotation into comp's coordinates around world centre (cx, cy).
+
+    Rectangles are converted to polygons (4 vertices) on the first rotation
+    because a rotated axis-aligned rectangle is no longer axis-aligned.
+    Polygons and paths simply rotate every vertex.
+    steps: +1 = 90° CCW, -1 = 90° CW.
+    """
+    from core.model import ComponentKind, Point
+
+    if comp.kind == ComponentKind.RECTANGLE:
+        # Explode to 4 explicit corners, then rotate to a polygon
+        x0, y0 = comp.origin.x, comp.origin.y
+        x1, y1 = x0 + comp.width, y0 + comp.height
+        corners = [(x0, y0), (x1, y0), (x1, y1), (x0, y1)]
+        rotated = [_rotate_point(px, py, cx, cy, steps) for px, py in corners]
+        # Re-use the component as a POLYGON — keeps the same id / ports intact
+        comp.kind   = ComponentKind.POLYGON
+        comp.points = [Point(rx, ry) for rx, ry in rotated]
+        comp.origin = comp.points[0]
+        comp.width  = 0
+        comp.height = 0
+    else:
+        # POLYGON or PATH — rotate every vertex
+        pts = comp.points or []
+        comp.points = [
+            Point(*_rotate_point(p.x, p.y, cx, cy, steps)) for p in pts
+        ]
+        if comp.points:
+            comp.origin = comp.points[0]
+
+
+class RotateComponent(Command):
+    """
+    Rotate one component by `steps` × 90° around its own bounding-box centre.
+
+    steps = +1  →  90° CCW
+    steps = -1  →  90° CW   (stored as 3 so undo is symmetric)
+
+    Rotation is baked into the DBU coordinates — no Qt transform is used.
+    Rectangles are promoted to polygons on first rotation (axis-aligned
+    rect is no longer representable as a rect after a 90° turn unless it
+    is perfectly square, and even then we keep it as a polygon for simplicity
+    so the model stays consistent).
+
+    Undo: rotate by (4 - steps) which is the complementary turn back to 0°.
+    """
+
+    def __init__(self, comp: "GDSComponent", steps: int = 1) -> None:
+        from core.model import ComponentKind
+        self._comp_id = comp.id
+        self._steps   = steps % 4      # normalise to 0-3
+        self._undo_steps = (4 - self._steps) % 4
+        # Snapshot the FULL component state for a clean undo
+        # (kind may change rect→polygon, so we must snapshot it)
+        self._snap_kind   = comp.kind
+        self._snap_origin = Point(comp.origin.x, comp.origin.y)
+        self._snap_width  = comp.width
+        self._snap_height = comp.height
+        self._snap_points = list(comp.points) if comp.points else None
+
+    def _centre_of(self, comp: "GDSComponent") -> tuple[int, int]:
+        bb = comp.bbox
+        return (bb.x_min + bb.x_max) // 2, (bb.y_min + bb.y_max) // 2
+
+    def execute(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if not comp or self._steps == 0:
+            return
+        cx, cy = self._centre_of(comp)
+        _rotate_component_in_place(comp, cx, cy, self._steps)
+        design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        comp = design.get(self._comp_id)
+        if not comp:
+            return
+        # Restore the exact snapshot — simpler and safer than rotating back
+        comp.kind   = self._snap_kind
+        comp.origin = Point(self._snap_origin.x, self._snap_origin.y)
+        comp.width  = self._snap_width
+        comp.height = self._snap_height
+        comp.points = list(self._snap_points) if self._snap_points is not None else None
+        design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        deg = self._steps * 90
+        return f"Rotate component {deg}° CCW"
+
+
+class RotateGroup(Command):
+    """
+    Rotate all members of a group by `steps` × 90° CCW around the group's
+    bounding-box centre.
+
+    All members rotate around the SAME centre (the group bbox centre), so
+    the group retains its overall shape — members don't spin individually.
+
+    Undo: restore every member's exact coordinate snapshot taken at construction.
+    """
+
+    def __init__(self, group: "ComponentGroup",
+                 components: List["GDSComponent"],
+                 steps: int = 1) -> None:
+        self._group_id = group.id
+        self._steps    = steps % 4
+        # Compute the group bbox centre now (before any rotation)
+        if components:
+            x_min = min(c.bbox.x_min for c in components)
+            y_min = min(c.bbox.y_min for c in components)
+            x_max = max(c.bbox.x_max for c in components)
+            y_max = max(c.bbox.y_max for c in components)
+            self._cx = (x_min + x_max) // 2
+            self._cy = (y_min + y_max) // 2
+        else:
+            self._cx = self._cy = 0
+
+        # Deep snapshot every member for clean undo (kind may change)
+        self._snaps: List[dict] = []
+        for comp in components:
+            self._snaps.append({
+                "id":     comp.id,
+                "kind":   comp.kind,
+                "origin": Point(comp.origin.x, comp.origin.y),
+                "width":  comp.width,
+                "height": comp.height,
+                "points": list(comp.points) if comp.points else None,
+            })
+
+    def execute(self, design: DesignScene) -> None:
+        if self._steps == 0:
+            return
+        group = design.get_group(self._group_id)
+        if not group:
+            return
+        for cid in group.member_ids:
+            comp = design.get(cid)
+            if comp:
+                _rotate_component_in_place(comp, self._cx, self._cy, self._steps)
+        design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        for snap in self._snaps:
+            comp = design.get(snap["id"])
+            if comp:
+                comp.kind   = snap["kind"]
+                comp.origin = Point(snap["origin"].x, snap["origin"].y)
+                comp.width  = snap["width"]
+                comp.height = snap["height"]
+                comp.points = list(snap["points"]) if snap["points"] is not None else None
+        design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        deg = self._steps * 90
+        return f"Rotate group {deg}° CCW"
+
+
 # ── Cell library commands ─────────────────────────────────────────────────────
 
 class PlaceCellCommand(Command):

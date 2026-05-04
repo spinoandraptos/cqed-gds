@@ -36,7 +36,12 @@ from core.model import (
     DesignScene, GDSComponent, ComponentKind,
     Point, Port, PortSide, dbu_to_um, um_to_dbu, ComponentGroup
 )
-from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts, MoveGroup, BatchCommand
+from core.commands import (
+    CommandStack, AddComponent, MoveComponent,
+    ConnectPorts, DisconnectPorts,
+    MoveGroup, BatchCommand,
+    RotateComponent, RotateGroup,
+)
 from ui.theme import Colors
 from core.cell_library import place_cell
 from core.commands import PlaceCellCommand
@@ -1308,13 +1313,123 @@ class CanvasScene(QGraphicsScene):
         self._snap_offset    = None
 
     def keyPressEvent(self, event) -> None:
-        if event.key() == Qt.Key.Key_Escape:
+        key  = event.key()
+        mods = event.modifiers()
+
+        if key == Qt.Key.Key_Escape:
             self.cancel_placement()
-        elif event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             if self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
                 self._commit_poly_or_path()
+
+        elif key == Qt.Key.Key_R and self._pl.mode == PlacementMode.SELECT:
+            # R      → 90° CW  (steps=-1, i.e. 270° CCW)
+            # Shift+R → 90° CCW (steps=+1)
+            ccw = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+            self.rotate_selection(ccw=ccw)
+
         else:
             super().keyPressEvent(event)
+
+    # ── Rotation ──────────────────────────────────────────────────────────────
+
+    def rotate_selection(self, ccw: bool = False) -> None:
+        """
+        Rotate all selected items by 90°.
+
+        ccw=False  →  90° CW   (the natural default; matches most EDA tools)
+        ccw=True   →  90° CCW
+
+        Design rules
+        ------------
+        • steps = +1  means 90° CCW in our convention (matching _rotate_point).
+          CW is steps = -1 ≡ 3 (mod 4).
+        • Groups rotate as a UNIT around their shared bbox centre, so members
+          don't spin individually — the whole cell pivots as one.
+        • Loose components (not in any group) rotate around their own bbox centre.
+        • A mixed selection (groups + loose items) each rotates around its own
+          centre independently — this matches how move works (each item moves
+          from its own origin) and avoids surprising galaxy-spin behaviour.
+        • The entire operation is pushed as ONE BatchCommand so Ctrl+Z undoes
+          all rotations in the selection atomically.
+        • After rotate we call _on_model_changed() (via cmd_stack notify) so the
+          scene re-syncs. ComponentItem.sync_from_model() already handles the
+          rect→polygon promotion because it rebuilds the delegate from scratch.
+        """
+        steps = 1 if ccw else 3   # 3 ≡ −1 (mod 4) → 90° CW
+
+        sel        = self.selectedItems()
+        comp_items = [i for i in sel if isinstance(i, ComponentItem)]
+        group_items = [i for i in sel if isinstance(i, GroupItem)]
+
+        if not comp_items and not group_items:
+            return
+
+        cmds: List = []
+
+        # ── 1. Groups ─────────────────────────────────────────────────────────
+        # Collect member components for each selected group.
+        # Skip members that are also individually selected — they belong to their
+        # group rotation, not a separate lone rotation.
+        grouped_ids: set = set()
+        for gi in group_items:
+            member_comps = [
+                c for c in self._design.components
+                if c.id in gi.group.member_ids
+            ]
+            grouped_ids.update(gi.group.member_ids)
+            if member_comps:
+                cmds.append(RotateGroup(gi.group, member_comps, steps=steps))
+
+        # ── 2. Loose components (not covered by a selected group) ──────────────
+        for ci in comp_items:
+            if ci.component.id not in grouped_ids:
+                cmds.append(RotateComponent(ci.component, steps=steps))
+
+        if not cmds:
+            return
+
+        if len(cmds) == 1:
+            self.cmd_stack.execute(cmds[0])
+        else:
+            deg = steps * 90 % 360
+            self.cmd_stack.execute(
+                BatchCommand(cmds, f"Rotate {len(cmds)} item(s) {deg}°")
+            )
+
+        # Rebuild delegates for any item whose kind changed rect→polygon.
+        # sync_from_model() checks the delegate type and replaces it if needed.
+        for ci in comp_items:
+            if ci.component.id not in grouped_ids:
+                self._rebuild_delegate_if_needed(ci)
+        for gi in group_items:
+            for cid in gi.group.member_ids:
+                item = self._items.get(cid)
+                if item:
+                    self._rebuild_delegate_if_needed(item)
+
+    def _rebuild_delegate_if_needed(self, item: "ComponentItem") -> None:
+        """
+        If a rectangle was promoted to a polygon by rotation, its Qt delegate
+        (QGraphicsRectItem) is now the wrong type. Replace it with a fresh one.
+        sync_from_model() handles in-place coordinate updates for unchanged types;
+        this method handles the rect→polygon type promotion that rotation causes.
+        """
+        comp       = item._comp
+        wrong_type = (
+            isinstance(item._delegate, QGraphicsRectItem)
+            and comp.kind != ComponentKind.RECTANGLE
+        )
+        if wrong_type:
+            # Detach the stale rect delegate (child of `item`, not a top-level item)
+            item._delegate.setParentItem(None)
+            # Build the correct polygon delegate and attach it
+            item._delegate = item._make_delegate()
+            item._apply_style(item.isSelected(), hovered=False)
+            item.prepareGeometryChange()
+        else:
+            item.sync_from_model()
 
     # ── Placement helpers ─────────────────────────────────────────────────────
 

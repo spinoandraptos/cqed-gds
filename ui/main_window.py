@@ -94,10 +94,13 @@ class MainWindow(QMainWindow):
         self._act_sweep = self._action("Sweep Parameter…", "Ctrl+W", self._sweep)
         self._act_group   = self._action("Group",   "Ctrl+G",       self._group_selected)
         self._act_ungroup = self._action("Ungroup", "Ctrl+Shift+G", self._ungroup_selected)
+        self._act_rot_cw  = self._action("Rotate 90° CW",  "R",             lambda: self._scene.rotate_selection(ccw=False))
+        self._act_rot_ccw = self._action("Rotate 90° CCW", "Shift+R",       lambda: self._scene.rotate_selection(ccw=True))
         self._act_escape = self._action("Cancel / Select", "Escape",         self._escape)
         for a in [self._act_undo, self._act_redo, None,
                 self._act_selall, self._act_delete,
                 self._act_sweep, self._act_group, self._act_ungroup,
+                self._act_rot_cw, self._act_rot_ccw,
                 None, self._act_escape]:
             edit_menu.addSeparator() if a is None else edit_menu.addAction(a)
 
@@ -154,6 +157,20 @@ class MainWindow(QMainWindow):
         # ── Grouping ─────────────────────────────────────────────────────────────
         self._tb_group   = self._tb_button("fa5s.object-group",   "Group Selected  (Ctrl+G)",         self._group_selected)
         self._tb_ungroup = self._tb_button("fa5s.object-ungroup", "Ungroup Selected  (Ctrl+Shift+G)", self._ungroup_selected)
+        self._toolbar.addSeparator()
+
+        # ── Rotation ──────────────────────────────────────────────────────────
+        # R = 90° CW, Shift+R = 90° CCW (matches keyPressEvent in canvas_scene)
+        self._tb_rot_cw  = self._tb_button(
+            "fa5s.redo-alt",
+            "Rotate 90° CW  (R)",
+            lambda: self._scene.rotate_selection(ccw=False),
+        )
+        self._tb_rot_ccw = self._tb_button(
+            "fa5s.undo-alt",
+            "Rotate 90° CCW  (Shift+R)",
+            lambda: self._scene.rotate_selection(ccw=True),
+        )
         self._toolbar.addSeparator()
 
         # ── Delete ────────────────────────────────────────────────────────────
@@ -816,6 +833,7 @@ class MainWindow(QMainWindow):
             "<b>Edit</b><br>"
             "Ctrl+Z / Ctrl+Shift+Z - Undo / Redo<br>"
             "Ctrl+A - Select all | Delete - Delete selected<br>"
+            "R - Rotate 90° CW | Shift+R - Rotate 90° CCW<br>"
         )
         lbl.setTextFormat(Qt.TextFormat.RichText)
         lbl.setWordWrap(True)
