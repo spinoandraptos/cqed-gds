@@ -1045,14 +1045,6 @@ class CanvasScene(QGraphicsScene):
         if event.button() == Qt.MouseButton.LeftButton:
             comp_item = self._hit_component_item(event.scenePos())
             if comp_item is not None:
-                # _on_item_press owns all selection logic and snapshots origins.
-                # We must ALSO call super() so Qt delivers the press down to the
-                # item — without this, ComponentItem.mousePressEvent is never
-                # called, so Qt never arms the item's mouseMoveEvent, and only
-                # the directly-clicked item would move during a multi-select drag.
-                # Qt will not stomp our selection because the item's
-                # mousePressEvent accepts the event without calling its own
-                # super(), preventing Qt's built-in selection handling from running.
                 self._on_item_press(comp_item, event)
                 return
             else:
@@ -1207,6 +1199,15 @@ class CanvasScene(QGraphicsScene):
                 self.cmd_stack.execute(
                     BatchCommand(move_cmds, f"Move {len(move_cmds)} components")
                 )
+
+        if self._snap_offset is not None and len(self._orig_positions) == 1:
+            item = next(iter(self._orig_positions))
+            self._try_connect_snapped(item._comp, self._snap_offset)
+
+        self._drag_start     = None
+        self._orig_positions = {}
+        self._drag_committed = False
+        self._snap_offset    = None
 
         if self._snap_offset is not None and len(self._orig_positions) == 1:
             item = next(iter(self._orig_positions))
@@ -1388,7 +1389,9 @@ class CanvasScene(QGraphicsScene):
                 self._items[comp.id] = item
 
         for dead_id in scene_ids - model_ids:
-            self.removeItem(self._items.pop(dead_id))
+            dead_item = self._items.pop(dead_id)
+            dead_item.setSelected(False)
+            self.removeItem(dead_item)
 
         for comp in self._design.components:
             self._items[comp.id].sync_from_model()
@@ -1402,9 +1405,26 @@ class CanvasScene(QGraphicsScene):
                 gi = GroupItem(group, self)
                 self.addItem(gi)
                 self._group_items[group.id] = gi
+                # Lock members immediately — they must not be individually
+                # selectable/draggable until the group enters edit mode.
+                # Without this, sweep-generated groups leave members selectable,
+                # causing Qt to hold simultaneous selected-item references to both
+                # the GroupItem and its ComponentItems during a merge, which
+                # produces a segfault when the GroupItem is removed mid-selection.
+                self._set_group_members_movable(group.id, False)
 
         for dead_id in scene_gids - model_gids:
-            self.removeItem(self._group_items.pop(dead_id))
+            dead_item = self._group_items.pop(dead_id)
+            dead_item.setSelected(False)
+            self.removeItem(dead_item)
+            # Re-enable former members so they're individually selectable
+            # again now that the group is dissolved (ungroup / merge).
+            for cid in dead_item.group.member_ids:
+                item = self._items.get(cid)
+                if item:
+                    item.setSelected(False)
+                    item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
+                    item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
         # Invalidate group geometry after any model change
         for gi in self._group_items.values():
