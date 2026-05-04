@@ -681,6 +681,7 @@ class CanvasScene(QGraphicsScene):
     scene_changed      = pyqtSignal()
     mode_changed       = pyqtSignal(str)
     connections_changed = pyqtSignal()   # fired after any wiring change
+    multi_selection_changed = pyqtSignal(list)  # comp_ids when >1 selected
     group_edit_entered = pyqtSignal(str)   # group_id
     group_edit_exited  = pyqtSignal()
     group_selected = pyqtSignal(str)
@@ -1046,6 +1047,13 @@ class CanvasScene(QGraphicsScene):
             comp_item = self._hit_component_item(event.scenePos())
             if comp_item is not None:
                 self._on_item_press(comp_item, event)
+                # Call super() so Qt delivers the press to the item and
+                # establishes a mouse grabber. Without a grabber,
+                # QGraphicsView will not forward mouseMoveEvents to the scene,
+                # so _on_item_move never fires. ComponentItem.mousePressEvent
+                # accepts without calling its own super(), so Qt's built-in
+                # selection logic does not run and our selection is preserved.
+                super().mousePressEvent(event)
                 return
             else:
                 # Empty canvas — clear selection unless modifier held,
@@ -1115,11 +1123,13 @@ class CanvasScene(QGraphicsScene):
         }
 
         # Fire selection signal once, cleanly, after we're done
-        sel = self.selectedItems()
-        if not sel:
+        comp_items = [i for i in self.selectedItems() if isinstance(i, ComponentItem)]
+        if not comp_items:
             self.item_selected.emit("")
-        elif len(sel) == 1 and hasattr(sel[0], "component"):
-            self.item_selected.emit(sel[0].component.id)
+        elif len(comp_items) == 1:
+            self.item_selected.emit(comp_items[0].component.id)
+        else:
+            self.multi_selection_changed.emit([i.component.id for i in comp_items])
 
     def _on_item_move(self, event) -> None:
         """Called by ComponentItem.mouseMoveEvent during drag."""
@@ -1363,17 +1373,25 @@ class CanvasScene(QGraphicsScene):
 
     def _on_selection_changed(self) -> None:
         """
-        Emitted by Qt whenever the selection set changes.
-        When nothing is selected we emit item_selected("") so the properties
-        panel clears — previously it would stay populated with stale data.
+        Fired by Qt on every selection change (rubber-band, programmatic).
+        - GroupItem selected → do nothing; group_selected signal from GroupItem handles it.
+        - 0 ComponentItems  → clear panel via item_selected("")
+        - 1 ComponentItem   → show single component via item_selected(id)
+        - 2+ ComponentItems → show multi-select panel via multi_selection_changed
         """
         sel = self.selectedItems()
-        if not sel:
+        comp_items  = [i for i in sel if isinstance(i, ComponentItem)]
+        group_items = [i for i in sel if isinstance(i, GroupItem)]
+
+        if group_items:
+            return  # GroupItem.mousePressEvent already emitted group_selected
+
+        if not comp_items:
             self.item_selected.emit("")
-        elif len(sel) == 1:
-            item = sel[0]
-            if hasattr(item, "component"):
-                self.item_selected.emit(item.component.id)
+        elif len(comp_items) == 1:
+            self.item_selected.emit(comp_items[0].component.id)
+        else:
+            self.multi_selection_changed.emit([i.component.id for i in comp_items])
 
     def _on_group_edit_entered(self, group_id: str) -> None:
         self._editing_group_id = group_id

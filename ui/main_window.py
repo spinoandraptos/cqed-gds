@@ -446,14 +446,6 @@ class MainWindow(QMainWindow):
             )
             return
 
-        layers = {c.layer for c in selected_comps}
-        if len(layers) > 1:
-            QMessageBox.warning(
-                self, "Group",
-                "All components must be on the same layer to group.\n"
-                f"Selected layers: {sorted(layers)}"
-            )
-            return
 
         name, ok = QInputDialog.getText(
             self, "Group Name", "Group name:",

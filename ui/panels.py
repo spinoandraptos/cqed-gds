@@ -437,11 +437,12 @@ class PropertiesPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Stack: page 0 = single component, page 1 = group ─────────────────
+        # ── Stack: page 0 = single component, page 1 = group, page 2 = multi ─
         from PyQt6.QtWidgets import QStackedWidget
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_single_page())
         self._stack.addWidget(self._build_group_page())
+        self._stack.addWidget(self._build_multi_page())
         root.addWidget(self._stack)
 
         self.clear()
@@ -718,6 +719,79 @@ class PropertiesPanel(QWidget):
             self._cards_layout.insertWidget(
                 self._cards_layout.count() - 1, card
             )
+
+    # ── Multi-selection page ──────────────────────────────────────────────────
+
+    def _build_multi_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        root = QVBoxLayout(page)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(0)
+
+        header = QWidget()
+        header.setStyleSheet(
+            f"background: {Colors.BG_ELEVATED}; "
+            f"border-bottom: 1px solid {Colors.BG_BORDER};"
+        )
+        hl = QVBoxLayout(header)
+        hl.setContentsMargins(Geometry.PANEL_PADDING, 10,
+                              Geometry.PANEL_PADDING, 10)
+        hl.setSpacing(3)
+        self._multi_title = QLabel("Multiple Selected")
+        self._multi_title.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: 14px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        self._multi_subtitle = QLabel("")
+        self._multi_subtitle.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+            f"background: transparent; border: none;"
+        )
+        hl.addWidget(self._multi_title)
+        hl.addWidget(self._multi_subtitle)
+        root.addWidget(header)
+
+        self._multi_scroll = QScrollArea()
+        self._multi_scroll.setWidgetResizable(True)
+        self._multi_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._multi_scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+
+        self._multi_container = QWidget()
+        self._multi_container.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        self._multi_layout = QVBoxLayout(self._multi_container)
+        self._multi_layout.setContentsMargins(
+            Geometry.PANEL_PADDING, Geometry.PANEL_PADDING,
+            Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
+        self._multi_layout.setSpacing(6)
+        self._multi_layout.addStretch()
+
+        self._multi_scroll.setWidget(self._multi_container)
+        root.addWidget(self._multi_scroll)
+        return page
+
+    def show_multi_selection(self, components: list, design=None) -> None:
+        """Switch to multi-select page and show a compact card per component."""
+        self._stack.setCurrentIndex(2)
+        self._current_comp_id = None
+
+        n = len(components)
+        self._multi_title.setText(f"{n} Components Selected")
+        layers = sorted({c.layer for c in components})
+        self._multi_subtitle.setText(
+            f"Layers: {', '.join(f'L{l}' for l in layers)}"
+        )
+
+        while self._multi_layout.count() > 1:
+            item = self._multi_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        for comp in components:
+            card = MemberCard(comp, design)
+            card.layer_change_requested.connect(self.layer_change_requested)
+            card.geometry_change_requested.connect(self.geometry_change_requested)
+            self._multi_layout.insertWidget(self._multi_layout.count() - 1, card)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
 
