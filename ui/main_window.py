@@ -17,7 +17,7 @@ from typing import Optional
 from PyQt6.QtWidgets import (
     QHBoxLayout, QMainWindow, QToolBar, QLabel, QVBoxLayout,
     QWidget, QSizePolicy, QMessageBox, QApplication, QToolButton,
-    QDialog, QDialogButtonBox, QFileDialog
+    QDialog, QDialogButtonBox, QFileDialog, QTabWidget,
 )
 from PyQt6.QtGui import (
     QAction, QActionGroup, QKeySequence, QFont, QColor,
@@ -36,6 +36,8 @@ from ui.export_dialog import ExportResultDialog
 from core.exporter import export_gds, ExportError
 from core.serialiser import save, load, SerialisationError
 from ui.sweep_dialog import SweepDialog
+from ui.cell_palette import CellLibraryPanel
+
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -224,9 +226,20 @@ class MainWindow(QMainWindow):
     # ── Central widget ────────────────────────────────────────────────────────
 
     def _build_central_widget(self) -> None:
-        self._palette = ComponentPalette()
-        self._props   = PropertiesPanel()
+        self._palette      = ComponentPalette()
+        self._cell_palette = CellLibraryPanel()
+        self._props        = PropertiesPanel()
         self._build_toolbar()
+
+        # ── Left dock: tabbed panel (Shapes | Cells) ──────────────────────────
+        self._left_tabs = QTabWidget()
+        self._left_tabs.setFixedWidth(220)
+        self._left_tabs.setStyleSheet(
+            "QTabWidget::pane { border: none; margin: 0; padding: 0; }"
+            "QTabBar::tab { padding: 6px 12px; font-size: 11px; }"
+        )
+        self._left_tabs.addTab(self._palette,      "Shapes")
+        self._left_tabs.addTab(self._cell_palette, "Cells")
 
         center = QWidget()
         cl = QVBoxLayout(center)
@@ -239,7 +252,7 @@ class MainWindow(QMainWindow):
         rl = QHBoxLayout(root)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
-        rl.addWidget(self._palette)
+        rl.addWidget(self._left_tabs)
         rl.addWidget(center)
         rl.addWidget(self._props)
 
@@ -268,6 +281,10 @@ class MainWindow(QMainWindow):
 
         # Phase 2: palette requests a mode, not an immediate placement
         self._palette.place_mode_requested.connect(self._on_place_mode_requested)
+
+        # Cell library: no longer emits a signal — placement is pure drag-and-drop.
+        # Cell parameter edits from the Properties panel:
+        self._props.cell_param_change_requested.connect(self._on_cell_param_change_requested)
 
         # Phase 2: properties panel layer edit
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
@@ -312,6 +329,97 @@ class MainWindow(QMainWindow):
             ComponentKind.PATH:      PlacementMode.PLACE_PATH,
         }
         self._enter_mode(mode_map[kind], layer)
+
+    @pyqtSlot(str, str, str, object)
+    def _on_cell_param_change_requested(self, group_id: str, cell_id: str,
+                                         param_key: str, new_value) -> None:
+        """
+        A cell parameter spinbox in the Properties panel changed.
+
+        Strategy: store the updated params on the group object as metadata
+        and show a flash hint.  Full re-place requires the user to drag again
+        with the updated defaults — or we re-place in-place here via a
+        compound undo command.
+
+        Implementation uses the existing cmd_stack: push a RemoveCellCommand
+        (ungroup + delete all members) then a PlaceCellCommand with updated
+        params at the same origin.  Both operations are atomic from the
+        undo stack's perspective via a BatchCommand.
+        """
+        from core.cell_library import place_cell, CELL_BY_ID, CellResult
+        from core.commands import BatchCommand, PlaceCellCommand
+        from core.model import Point, ComponentGroup
+
+        group = self._design.get_group(group_id)
+        if group is None:
+            return
+        cdef = CELL_BY_ID.get(cell_id)
+        if cdef is None:
+            return
+
+        # Snapshot: current params + updated key
+        params = dict(cdef.defaults)
+        # Carry over any previously stored param overrides on the group
+        if hasattr(group, "_cell_params"):
+            params.update(group._cell_params)
+        params[param_key] = new_value
+
+        # Origin = bbox min corner of the existing group
+        bb     = group.bbox_from(self._design.components)
+        origin = Point(bb.x_min, bb.y_min)
+
+        try:
+            new_result = place_cell(cell_id, origin, params=params)
+        except (KeyError, ValueError) as exc:
+            from PyQt6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Cell Parameter", str(exc))
+            return
+
+        # Snapshot old state for the undo command
+        old_comp_ids = list(group.member_ids)
+        old_comps    = [self._design.get(cid) for cid in old_comp_ids]
+        old_comps    = [c for c in old_comps if c is not None]
+        old_group_id = group_id
+        old_group_name = group.name
+
+        class _ReplaceCellCmd:
+            """Atomic remove-old + place-new, fully undo-able."""
+            def __init__(self, design_ref, scene_ref):
+                self._design = design_ref
+                self._scene  = scene_ref
+                self._new_cmd = PlaceCellCommand(new_result, cell_id=cell_id, cell_params=params)
+
+            @property
+            def description(self):
+                return f"Edit {cdef.name} parameter '{param_key}'"
+
+            def execute(self, design):
+                # Remove old group + members
+                design.remove_group(old_group_id)
+                for cid in old_comp_ids:
+                    design.remove(cid)
+                # Place rebuilt cell
+                self._new_cmd.execute(design)
+                # Tag new group with param overrides
+                if self._new_cmd._group is not None:
+                    self._new_cmd._group._cell_params = params
+
+            def undo(self, design):
+                # Undo new placement
+                self._new_cmd.undo(design)
+                # Restore old components
+                for comp in old_comps:
+                    design.add(comp)
+                old_g = ComponentGroup(
+                    name=old_group_name,
+                    member_ids=old_comp_ids,
+                    id=old_group_id,
+                )
+                design.add_group(old_g)
+
+        cmd = _ReplaceCellCmd(self._design, self._scene)
+        self._scene.cmd_stack.execute(cmd)
+        self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
 
     @pyqtSlot(str)
     def _on_item_hovered(self, comp_id: str) -> None:

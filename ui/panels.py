@@ -25,6 +25,7 @@ from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QDrag, QMouseEv
 
 from ui.theme import Colors, Fonts, Geometry
 from core.model import GDSComponent, ComponentKind, PortSide, dbu_to_um, um_to_dbu
+from core.cell_library import CELL_BY_ID
 
 
 # ── Helper widgets ────────────────────────────────────────────────────────────
@@ -426,12 +427,17 @@ class PropertiesPanel(QWidget):
 
     layer_change_requested    = pyqtSignal(str, int)
     geometry_change_requested = pyqtSignal(str, str, int)
+    # Emitted when a cell-group parameter spinbox changes:
+    # (group_id, cell_id, param_key, new_value_as_float_or_str)
+    cell_param_change_requested = pyqtSignal(str, str, str, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedWidth(Geometry.PROPERTIES_WIDTH)
         self.setStyleSheet(f"background: {Colors.BG_SURFACE};")
         self._current_comp_id: Optional[str] = None
+        self._current_group_id: Optional[str] = None
+        self._cell_params_widget = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -614,7 +620,12 @@ class PropertiesPanel(QWidget):
 
     def clear(self) -> None:
         self._stack.setCurrentIndex(0)
-        self._current_comp_id = None
+        self._current_comp_id  = None
+        self._current_group_id = None
+        if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
+            self._cell_params_widget.setParent(None)
+            self._cell_params_widget.deleteLater()
+            self._cell_params_widget = None
         for sb in (self._layer_spin, self._row_w_spin,
                    self._row_h_spin, self._row_pw_spin):
             sb.blockSignals(True); sb.setValue(0)
@@ -686,9 +697,10 @@ class PropertiesPanel(QWidget):
             self._row_connections.set_value("—")
 
     def show_group(self, group, design) -> None:
-        """Switch to group view and populate member cards."""
+        """Switch to group view and populate member cards + optional cell params."""
         self._stack.setCurrentIndex(1)
         self._current_comp_id = None
+        self._current_group_id = group.id
 
         # Header
         members = [design.get(cid) for cid in group.member_ids
@@ -705,8 +717,10 @@ class PropertiesPanel(QWidget):
             f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f}) µm"
         )
 
+        # ── Cell params section (shown when group matches a catalogue cell) ───
+        self._rebuild_cell_params(group)
+
         # Rebuild member cards
-        # Remove all except the trailing stretch
         while self._cards_layout.count() > 1:
             item = self._cards_layout.takeAt(0)
             if item.widget():
@@ -719,6 +733,138 @@ class PropertiesPanel(QWidget):
             self._cards_layout.insertWidget(
                 self._cards_layout.count() - 1, card
             )
+
+    def _rebuild_cell_params(self, group) -> None:
+        """
+        If the group was created by a catalogue cell (group.cell_id is set),
+        render an editable parameter section above the member cards.
+        Otherwise hides the section cleanly.
+        """
+        # Clear any existing params widget
+        if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
+            self._cell_params_widget.setParent(None)
+            self._cell_params_widget.deleteLater()
+            self._cell_params_widget = None
+
+        # Match via the cell_id attribute stamped by PlaceCellCommand
+        cell_id = getattr(group, "cell_id", None)
+        if not cell_id:
+            return
+        matched_cdef = CELL_BY_ID.get(cell_id)
+        if matched_cdef is None:
+            return
+
+        # Current param values: start from catalogue defaults, overlay stored overrides
+        current_params = dict(matched_cdef.defaults)
+        stored = getattr(group, "_cell_params", {})
+        current_params.update(stored)
+
+        # ── Build the params widget ───────────────────────────────────────────
+        w = QWidget()
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: {Colors.BG_ELEVATED};
+                border-bottom: 1px solid {Colors.BG_BORDER};
+            }}
+        """)
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(Geometry.PANEL_PADDING, 10,
+                               Geometry.PANEL_PADDING, 10)
+        lay.setSpacing(6)
+
+        header_lbl = QLabel("Cell Parameters")
+        header_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SM}px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        hint_lbl = QLabel("Edit then re-place to apply")
+        hint_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+            f"background: transparent; border: none;"
+        )
+        lay.addWidget(header_lbl)
+        lay.addWidget(hint_lbl)
+
+        spin_style = f"""
+            QDoubleSpinBox, QSpinBox, QComboBox {{
+                background: {Colors.BG_BASE};
+                border: 1px solid {Colors.BG_BORDER};
+                border-radius: 3px;
+                color: {Colors.TEXT_PRIMARY};
+                font-size: {Fonts.SIZE_XS}px;
+                padding: 2px 4px;
+            }}
+            QDoubleSpinBox:hover, QComboBox:hover {{ border-color: {Colors.ACCENT_DIM}; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 14px; }}
+        """
+
+        _STRING_OPTIONS: dict[str, list[str]] = {
+            "cap_style":      ["top", "side"],
+            "undercut_style": ["right", "top"],
+        }
+
+        group_id  = group.id
+        cell_id   = matched_cdef.cell_id
+
+        for key, default in matched_cdef.defaults.items():
+            current_val = current_params.get(key, default)
+            row = QHBoxLayout()
+            lbl = QLabel(key.replace("_", " "))
+            lbl.setStyleSheet(
+                f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+                f"background: transparent; border: none;"
+            )
+            lbl.setFixedWidth(90)
+
+            if isinstance(default, float):
+                sb = QDoubleSpinBox()
+                sb.setDecimals(3)
+                sb.setRange(0.001, 1000.0)
+                sb.setSingleStep(0.1)
+                sb.setSuffix(" µm")
+                sb.setValue(current_val)
+                sb.setFixedWidth(110)
+                sb.setStyleSheet(spin_style)
+                sb.editingFinished.connect(
+                    lambda _k=key, _sb=sb, _gid=group_id, _cid=cell_id:
+                        self.cell_param_change_requested.emit(_gid, _cid, _k, _sb.value())
+                )
+                row.addWidget(lbl)
+                row.addWidget(sb)
+                row.addStretch()
+
+            elif isinstance(default, str):
+                options = _STRING_OPTIONS.get(key)
+                if options:
+                    combo = QComboBox()
+                    combo.addItems(options)
+                    combo.setCurrentText(str(current_val))
+                    combo.setFixedWidth(110)
+                    combo.setStyleSheet(spin_style)
+                    combo.currentTextChanged.connect(
+                        lambda val, _k=key, _gid=group_id, _cid=cell_id:
+                            self.cell_param_change_requested.emit(_gid, _cid, _k, val)
+                    )
+                    row.addWidget(lbl)
+                    row.addWidget(combo)
+                    row.addStretch()
+                else:
+                    val_lbl = QLabel(str(default))
+                    val_lbl.setStyleSheet(
+                        f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px; "
+                        f"background: transparent; border: none;"
+                    )
+                    row.addWidget(lbl)
+                    row.addWidget(val_lbl)
+                    row.addStretch()
+
+            lay.addLayout(row)
+
+        self._cell_params_widget = w
+        # Insert above the scrollable cards area (index 1 = after the fixed header)
+        # The group page root layout is: [0]=grp_header  [1]=cards_scroll
+        grp_page = self._stack.widget(1)
+        grp_page.layout().insertWidget(1, w)
 
     # ── Multi-selection page ──────────────────────────────────────────────────
 

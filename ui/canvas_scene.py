@@ -38,6 +38,8 @@ from core.model import (
 )
 from core.commands import CommandStack, AddComponent, MoveComponent, ConnectPorts, DisconnectPorts, MoveGroup, BatchCommand
 from ui.theme import Colors
+from core.cell_library import place_cell
+from core.commands import PlaceCellCommand
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -104,11 +106,15 @@ def _cosmetic(color: str, width: float = 1.0,
 
 # ── Port Graphics Item ────────────────────────────────────────────────────────
 
-_PORT_NORMAL  = "#38bdf8"   # teal — idle
+_PORT_NORMAL  = "#38bdf8"   # teal — idle / visible
 _PORT_ACTIVE  = "#4ade80"   # green — snap candidate
-_PORT_R       = um_to_dbu(0.8)   # dot radius in DBU
 
-# Arrow tip offsets per side (in DBU, pointing outward)
+# Screen-space sizes (pixels).  Ports use ItemIgnoresTransformations so these
+# are always exactly this many pixels on screen regardless of zoom level.
+_PORT_R_PX    = 4.0    # dot radius in screen pixels
+_PORT_TICK_PX = 8.0    # outward tick length in screen pixels
+
+# Arrow tip offsets per side (unit vectors, pointing outward)
 _ARROW_DIR = {
     PortSide.NORTH: (0, -1),
     PortSide.SOUTH: (0,  1),
@@ -119,56 +125,101 @@ _ARROW_DIR = {
 
 class PortItem(QGraphicsItem):
     """
-    Small directional dot drawn at a port's position.
-    Parent is the ComponentItem so it moves for free.
-    Highlights green when this port is the active snap target.
+    Fixed screen-size port dot — always 4 px radius, never blocked by zoom.
+
+    Key design decisions
+    --------------------
+    • ItemIgnoresTransformations: the item is positioned in scene space (so it
+      follows the component when it moves) but painted in screen space, so it
+      never grows when the user zooms in.  No more port blobs eating the cell.
+
+    • Visibility gated on parent state: hidden by default; shown only while the
+      parent ComponentItem is hovered or selected, or while the port is the
+      active snap target.  This keeps the canvas clean at a glance.
+
+    • Zero mouse interaction: NoButton + no hover so it never steals clicks from
+      the component beneath it.
     """
 
     def __init__(self, port: Port, origin: Point, parent: QGraphicsItem) -> None:
         super().__init__(parent)
-        self._port    = port
-        self._active  = False
+        self._port   = port
+        self._active = False
+
         self.setZValue(8)
         self.setAcceptHoverEvents(False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        # Render at a fixed screen size — immune to zoom transforms.
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+
         abs_pos = port.abs_pos(origin)
         self.setPos(abs_pos.x, abs_pos.y)
+
+        # Hidden at rest; shown by ComponentItem on hover/select or snap-active.
+        self.setVisible(False)
 
     @property
     def port(self) -> Port:
         return self._port
 
     def set_active(self, active: bool) -> None:
+        """Highlight this port as the current snap target (shows it regardless of parent state)."""
         if active != self._active:
             self._active = active
+            if active:
+                self.setVisible(True)
+            # Visibility when deactivating is restored by set_visible_for_state()
             self.update()
 
+    def set_visible_for_state(self, hovered_or_selected: bool) -> None:
+        """Show/hide based on parent component's hover/selection state."""
+        # Always keep visible if actively snapping
+        self.setVisible(hovered_or_selected or self._active)
+
     def boundingRect(self) -> QRectF:
-        r = float(_PORT_R) 
-        return QRectF(-r, -r, r * 2, r * 2)
+        # In screen-space (ItemIgnoresTransformations), units ARE pixels.
+        r    = _PORT_R_PX
+        tick = _PORT_TICK_PX
+        dx, dy = _ARROW_DIR[self._port.side]
+        # Bounding rect must cover both the circle and the tick line.
+        min_x = min(-r, dx * tick - 1)
+        min_y = min(-r, dy * tick - 1)
+        max_x = max( r, dx * tick + 1)
+        max_y = max( r, dy * tick + 1)
+        return QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         color = QColor(_PORT_ACTIVE if self._active else _PORT_NORMAL)
-        r     = float(_PORT_R)
+        r     = _PORT_R_PX
 
-        # Filled circle
-        painter.setPen(_cosmetic(color.name(), 0.8))
-        fill = QColor(color); fill.setAlpha(200)
+        # Filled circle with a crisp 1 px border
+        pen = QPen(color, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
+        fill = QColor(color)
+        fill.setAlpha(210)
         painter.setBrush(QBrush(fill))
-        painter.drawEllipse(QPointF(0, 0), r, r)
+        painter.drawEllipse(QPointF(0.0, 0.0), r, r)
 
-        # Outward tick line
+        # Short outward tick — shows directionality without eating real estate
         dx, dy = _ARROW_DIR[self._port.side]
-        tick   = r * 2.5
-        painter.setPen(_cosmetic(color.name(), 1.0))
-        painter.drawLine(QPointF(0, 0), QPointF(dx * tick, dy * tick))
+        tick_pen = QPen(color, 1.5)
+        tick_pen.setCosmetic(True)
+        painter.setPen(tick_pen)
+        painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+        painter.drawLine(
+            QPointF(dx * r, dy * r),                          # circle edge
+            QPointF(dx * _PORT_TICK_PX, dy * _PORT_TICK_PX), # tick tip
+        )
 
 
 # ── Connection Edge Indicator ─────────────────────────────────────────────────
 
-_INDICATOR_SIZE = um_to_dbu(1.6)   # half-width of triangle base
+# Screen-space pip size — fixed pixels, zoom-immune, unobtrusive.
+_INDICATOR_R_PX   = 3.0   # dot radius in screen pixels
+_INDICATOR_GAP_PX = 6.0   # outward offset from edge so it sits just outside
 
 _ARROW_DIR_INDICATOR = {
     PortSide.NORTH: (0, -1),
@@ -180,9 +231,13 @@ _ARROW_DIR_INDICATOR = {
 
 class EdgeIndicatorItem(QGraphicsItem):
     """
-    Small filled triangle on an occupied edge of a ComponentItem.
-    Base sits on the edge; apex points inward so it reads as 'docked here'.
-    One instance per connected PortSide, parented to ComponentItem.
+    Tiny fixed-pixel dot sitting just outside the component edge to signal
+    a live connection on that side.
+
+    Uses ItemIgnoresTransformations so it's always _INDICATOR_R_PX regardless
+    of zoom — informational at a glance, never obstructing the view.
+    The item is positioned at the scene-space edge midpoint so it moves with
+    the parent component automatically.
     """
 
     def __init__(self, side: PortSide, bbox_local: QRectF,
@@ -192,40 +247,43 @@ class EdgeIndicatorItem(QGraphicsItem):
         self.setZValue(9)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
-        self._poly = self._build_poly(side, bbox_local)
 
-    @staticmethod
-    def _build_poly(side: PortSide, r: QRectF) -> QPolygonF:
-        s  = float(_INDICATOR_SIZE)
-        cx = (r.left() + r.right())  / 2.0
-        cy = (r.top()  + r.bottom()) / 2.0
+        # Anchor at the scene-space midpoint of the relevant edge.
+        # Paint is then done in screen-space (pixels) around (0, 0).
+        cx = (bbox_local.left() + bbox_local.right())  / 2.0
+        cy = (bbox_local.top()  + bbox_local.bottom()) / 2.0
+        dx, dy = _ARROW_DIR_INDICATOR[side]
         if side == PortSide.NORTH:
-            return QPolygonF([QPointF(cx - s, r.top()),
-                               QPointF(cx + s, r.top()),
-                               QPointF(cx,     r.top() + s * 1.8)])
+            self.setPos(cx, bbox_local.top())
         elif side == PortSide.SOUTH:
-            return QPolygonF([QPointF(cx - s, r.bottom()),
-                               QPointF(cx + s, r.bottom()),
-                               QPointF(cx,     r.bottom() - s * 1.8)])
+            self.setPos(cx, bbox_local.bottom())
         elif side == PortSide.WEST:
-            return QPolygonF([QPointF(r.left(), cy - s),
-                               QPointF(r.left(), cy + s),
-                               QPointF(r.left() + s * 1.8, cy)])
+            self.setPos(bbox_local.left(), cy)
         else:  # EAST
-            return QPolygonF([QPointF(r.right(), cy - s),
-                               QPointF(r.right(), cy + s),
-                               QPointF(r.right() - s * 1.8, cy)])
+            self.setPos(bbox_local.right(), cy)
 
     def boundingRect(self) -> QRectF:
-        return self._poly.boundingRect()
+        r = _INDICATOR_R_PX + _INDICATOR_GAP_PX + 2.0
+        return QRectF(-r, -r, r * 2, r * 2)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        painter.setPen(_cosmetic(_CONN_BORDER, 0.6))
+        dx, dy = _ARROW_DIR_INDICATOR[self._side]
+        # Centre the pip just outside the edge
+        cx = dx * _INDICATOR_GAP_PX
+        cy = dy * _INDICATOR_GAP_PX
+        r  = _INDICATOR_R_PX
+
         fill = QColor(_CONN_FILL)
-        fill.setAlpha(220)
+        fill.setAlpha(180)
+        border = QColor(_CONN_BORDER)
+
+        pen = QPen(border, 1.0)
+        pen.setCosmetic(True)
+        painter.setPen(pen)
         painter.setBrush(QBrush(fill))
-        painter.drawPolygon(self._poly)
+        painter.drawEllipse(QPointF(cx, cy), r, r)
 
 # ── Group Graphics Item ───────────────────────────────────────────────────────
 
@@ -477,9 +535,9 @@ class ComponentItem(QGraphicsItem):
         self.setCursor(Qt.CursorShape.SizeAllCursor)
 
         self._delegate: QGraphicsItem = self._make_delegate()
-        self._apply_style(selected=False, hovered=False)
         self._port_items: List[PortItem] = self._build_port_items()
         self._edge_indicators: List[EdgeIndicatorItem] = []
+        self._apply_style(selected=False, hovered=False)
 
     # ── Delegate factory ──────────────────────────────────────────────────────
 
@@ -547,6 +605,11 @@ class ComponentItem(QGraphicsItem):
             self._delegate.setPen(pen)
             self._delegate.setBrush(QBrush(fill))
 
+        # Ports only visible while hovered or selected — clean canvas at rest.
+        show_ports = selected or hovered
+        for pi in self._port_items:
+            pi.set_visible_for_state(show_ports)
+
     # ── Sync ──────────────────────────────────────────────────────────────────
 
     def sync_from_model(self) -> None:
@@ -576,6 +639,12 @@ class ComponentItem(QGraphicsItem):
         regenerating them silently breaks all existing wiring.
         """
         if not self._comp.ports:
+            # Sub-components of a parametric cell have _no_auto_ports=True —
+            # they carry no connection points intentionally.  Only generate
+            # default ports for standalone shapes that were placed directly.
+            if getattr(self._comp, "_no_auto_ports", False):
+                self._port_items = []
+                return
             # First time only: generate ports and build items
             self._comp.build_default_ports()
             self._port_items = self._build_port_items()
@@ -610,8 +679,10 @@ class ComponentItem(QGraphicsItem):
                 return
 
     def clear_port_highlights(self) -> None:
+        is_visible = self.isSelected()
         for pi in self._port_items:
             pi.set_active(False)
+            pi.set_visible_for_state(is_visible)
 
     @property
     def port_items(self) -> "List[PortItem]":
@@ -1332,6 +1403,22 @@ class CanvasScene(QGraphicsScene):
         self._pl = PlacementState()
         self._pl.mode  = mode
         self._pl.layer = layer
+
+    def drop_cell(self, cell_id: str, scene_pos: QPointF | None = None,
+                  params: dict | None = None) -> None:
+        if scene_pos is None:
+            # Default: centre of the current viewport
+            view = self.views()[0] if self.views() else None
+            if view is not None:
+                vr = view.viewport().rect()
+                scene_pos = view.mapToScene(vr.center())
+            else:
+                scene_pos = QPointF(0, 0)
+
+        origin = Point(int(scene_pos.x()), int(scene_pos.y()))
+        result = place_cell(cell_id, origin, params=params)
+        self.cmd_stack.execute(PlaceCellCommand(result, cell_id=cell_id, cell_params=params or {}))
+
 
     # ── Background ────────────────────────────────────────────────────────────
 

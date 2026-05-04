@@ -25,6 +25,8 @@ Fix (drag bug):
 
 from __future__ import annotations
 
+import json
+
 from PyQt6.QtWidgets import QGraphicsView, QFrame
 from PyQt6.QtGui import (
     QPainter, QWheelEvent, QMouseEvent, QKeyEvent,
@@ -170,36 +172,51 @@ class CanvasView(QGraphicsView):
 
     # ── Drag-and-drop (receive from palette) ──────────────────────────────────
 
-    _MIME = "application/x-gds-shape"
+    _MIME_SHAPE = "application/x-gds-shape"
+    _MIME_CELL  = "application/x-gds-cell"
+    # Legacy alias so old code that references _MIME still works
+    _MIME = _MIME_SHAPE
 
     def dragEnterEvent(self, event) -> None:
-        if event.mimeData().hasFormat(self._MIME):
+        md = event.mimeData()
+        if md.hasFormat(self._MIME_SHAPE) or md.hasFormat(self._MIME_CELL):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dragMoveEvent(self, event) -> None:
-        if event.mimeData().hasFormat(self._MIME):
+        md = event.mimeData()
+        if md.hasFormat(self._MIME_SHAPE) or md.hasFormat(self._MIME_CELL):
             event.acceptProposedAction()
         else:
             event.ignore()
 
     def dropEvent(self, event) -> None:
-        if not event.mimeData().hasFormat(self._MIME):
-            event.ignore()
-            return
-        raw     = event.mimeData().data(self._MIME).data().decode()
-        parts   = raw.split(":")
-        if len(parts) != 2:
-            event.ignore()
-            return
-        kind_val = int(parts[0])
-        layer    = int(parts[1])
-        # Convert viewport pixel position → scene coordinates
+        md        = event.mimeData()
         scene_pos = self.mapToScene(event.position().toPoint())
-        # Delegate to scene — it owns placement logic
-        self.scene().drop_shape(kind_val, layer, scene_pos)
-        event.acceptProposedAction()
+
+        if md.hasFormat(self._MIME_SHAPE):
+            raw   = md.data(self._MIME_SHAPE).data().decode()
+            parts = raw.split(":")
+            if len(parts) != 2:
+                event.ignore()
+                return
+            kind_val = int(parts[0])
+            layer    = int(parts[1])
+            self.scene().drop_shape(kind_val, layer, scene_pos)
+            event.acceptProposedAction()
+
+        elif md.hasFormat(self._MIME_CELL):
+            raw   = md.data(self._MIME_CELL).data().decode()
+            # payload: "<cell_id>:<json_params>"
+            sep   = raw.index(":")          # first colon separates id from json
+            cell_id = raw[:sep]
+            params  = json.loads(raw[sep + 1:])
+            self.scene().drop_cell(cell_id, scene_pos, params=params)
+            event.acceptProposedAction()
+
+        else:
+            event.ignore()
 
     # ── Event overrides ───────────────────────────────────────────────────────
 

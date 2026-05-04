@@ -15,6 +15,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
 from core.model import DesignScene, GDSComponent, Point, Connection, ComponentGroup
+from core.cell_library import CellResult
 
 # Fields that EditComponent is allowed to mutate.
 # A typo in a key name silently creates a new attribute on the dataclass,
@@ -43,7 +44,7 @@ class AddComponent(Command):
         self._comp = comp
 
     def execute(self, design: DesignScene) -> None:
-        if not self._comp.ports:
+        if not self._comp.ports and not getattr(self._comp, "_no_auto_ports", False):
             self._comp.build_default_ports()
         design.add(self._comp)
 
@@ -362,6 +363,53 @@ class MoveGroup(Command):
     @property
     def description(self) -> str:
         return "Move group"
+    
+# ── Cell library commands ─────────────────────────────────────────────────────
+
+class PlaceCellCommand(Command):
+    """
+    Atomically add all components from *result* and create a ComponentGroup
+    wrapping them under *result.group_name*.
+
+    execute : adds all components → builds group
+    undo    : removes group → removes all components (reverse order)
+
+    The group has two extra attributes set after execute():
+      group.cell_id    — cell_id string from the catalogue (for properties panel)
+      group._cell_params — copy of the params used to build this cell
+    These are plain Python attrs added dynamically; they survive in memory but
+    are not persisted (the group_name already encodes the key dimensions).
+    """
+
+    def __init__(self, result: CellResult, cell_id: str = "",
+                 cell_params: dict | None = None) -> None:
+        self._result      = result
+        self._cell_id     = cell_id
+        self._cell_params = dict(cell_params) if cell_params else {}
+        self._comp_ids    = [c.id for c in result.components]
+        self._group: Optional[ComponentGroup] = None
+
+    def execute(self, design: DesignScene) -> None:
+        for comp in self._result.components:
+            design.add(comp)
+        self._group = ComponentGroup(
+            name=self._result.group_name,
+            member_ids=list(self._comp_ids),
+        )
+        # Tag the group so the Properties panel can identify and edit this cell
+        self._group.cell_id     = self._cell_id
+        self._group._cell_params = dict(self._cell_params)
+        design.add_group(self._group)
+
+    def undo(self, design: DesignScene) -> None:
+        if self._group is not None:
+            design.remove_group(self._group.id)
+        for comp_id in reversed(self._comp_ids):
+            design.remove(comp_id)
+
+    @property
+    def description(self) -> str:
+        return f"Place {self._result.group_name}"
 
 # ── Command Stack ─────────────────────────────────────────────────────────────
 

@@ -156,6 +156,10 @@ class GDSComponent:
     # Identity
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
+    # When True, rebuild_ports() will never auto-generate default ports.
+    # Set on all non-anchor sub-components of a parametric cell.
+    _no_auto_ports: bool = False
+
     # ── Derived geometry ──────────────────────────────────────────────────────
 
     @property
