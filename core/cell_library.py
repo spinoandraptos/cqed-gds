@@ -31,7 +31,7 @@ Adding new cells
   2. Register it in CELL_CATALOGUE at the bottom of this file.
   3. That is all — the palette picks it up automatically.
 
-Fixes applied (v2)
+Fixes applied (v3)
 ------------------
   - Layer constants defined once here (removed duplication with component_model.py).
   - _poly() now correctly closes the polygon when last point ≠ first.
@@ -41,6 +41,14 @@ Fixes applied (v2)
     clear ValueError for unknown keys instead of letting the builder fail.
   - build_square_node() port positions computed geometrically from face centres
     instead of four hand-coded combinatorial branches — extensible to new styles.
+  - FIX: build_square_node() caps now emit TWO layers (CAP1 inner strip +
+    CAP2 outer strip) matching add_top_caps/add_side_caps in undercuts.py.
+    Previously only CAP1 was emitted; CAP2 was silently missing.
+  - FIX: build_square_node() L-undercut is now drawn OUTSIDE the body body on
+    LAYER_CAP1 (L outline) + LAYER_CAP2 (interior fill), matching
+    add_L_undercut_right / add_L_undercut_top in undercuts.py exactly.
+    Previously the undercut was drawn inside the body on LAYER_UNDERCUT_RING
+    (L2) which is the wrong layer and the wrong position entirely.
 """
 
 from __future__ import annotations
@@ -242,9 +250,9 @@ _SQ_DEFAULTS = dict(
     cap_style      = "top",  # "top" | "side"
     undercut_style = "right", # "right" | "top"
     # Cap geometry (µm) — matches reference undercuts.py defaults
-    cap_width      = 0.3,    # width of cap strip
-    cap_length     = 0.8,    # length of cap strip
-    wire_width     = 0.3,    # wire lead width (used for port offset calc)
+    cap_width      = 0.3,    # CAP1 strip thickness (= CAP_H in reference)
+    cap_length     = 0.8,    # CAP2 bar thickness   (= CAP2_H in reference)
+    wire_width     = 0.3,    # wire lead width (used for L-undercut extent calc)
 )
 
 
@@ -259,27 +267,31 @@ def build_square_node(
     wire_width:     float = _SQ_DEFAULTS["wire_width"],
 ) -> CellResult:
     """
-    Bonding square on LAYER_BIYSK_JUNCTION (L5) with cap strips on
-    LAYER_CAP1 (L4) / LAYER_CAP2 (L6) and an L-shaped undercut on
-    LAYER_UNDERCUT_RING (L2).
+    Bonding square on LAYER_BIYSK_JUNCTION (L5) with two-layer cap strips
+    (LAYER_CAP1 inner + LAYER_CAP2 outer) and an L-shaped undercut drawn
+    outside the body (LAYER_CAP1 outline + LAYER_CAP2 fill).
 
-    Coordinate origin is the **centre** of the square body, matching the
-    reference codebase convention (cx, cy passed to add_square_node).
+    Mirrors add_square_node() / add_top_caps() / add_side_caps() /
+    add_L_undercut_right() / add_L_undercut_top() from components_lib.py
+    exactly.  Origin is the **centre** of the square body (cx, cy convention).
 
-    cap_style      : "top"  — caps extend above and below (±y)
-                     "side" — caps extend left and right (±x)
-    undercut_style : "right" — L-undercut opens to the right (+x)
-                     "top"   — L-undercut opens upward (+y)
+    cap_style      : "top"  — cap extends above (+y) the body only  (add_top_caps)
+                     "side" — cap extends to the right (+x) only    (add_side_caps)
+    undercut_style : "right" — L opens rightward, anchored at body bottom-right
+                     "top"   — L opens upward,    anchored at body top-left
 
-    Ports are placed geometrically on the four free faces of the body.
-    The face blocked by the undercut arm gets its port omitted so routing
-    can't accidentally connect into the undercut.  All offsets derive from
-    the body's bbox — no hand-coded combinatorial branches.
+    cap_width  = CAP_H  in undercuts.py  (thickness of the inner CAP1 strip)
+    cap_length = CAP2_H in undercuts.py  (thickness of the outer CAP2 strip)
+    wire_width = WIRE_WIDTH              (controls the L arm extent)
+
+    Ports match _make_square_ports() in component_model.py exactly.
+    All port offsets are relative to body.origin (bbox min-corner = cx−hx, cy−hy).
     """
     hx = square_x / 2.0
     hy = square_y / 2.0
-    cw = cap_width
-    cl = cap_length
+    cw = cap_width    # CAP1 strip thickness  (= cfg.CAP_H)
+    cl = cap_length   # CAP2 strip thickness  (= cfg.CAP2_H)
+    ww = wire_width   # wire width            (= cfg.WIRE_WIDTH)
 
     components: List[GDSComponent] = []
 
@@ -287,109 +299,158 @@ def build_square_node(
     body = _rect(origin, -hx, -hy, hx, hy, LAYER_BIYSK_JUNCTION)
     components.append(body)
 
-    # ── 2. Cap strips ─────────────────────────────────────────────────────────
+    # ── 2. Cap strips — TWO layers, ONE side only ─────────────────────────────
+    #
+    # add_top_caps  → only ABOVE the body  (not above+below)
+    # add_side_caps → only to the RIGHT    (not left+right)
+    #
+    # Each emits:
+    #   CAP1 inner strip flush against the body edge  (thickness = cw = CAP_H)
+    #   CAP2 outer strip stacked beyond CAP1          (thickness = cl = CAP2_H)
+    # ─────────────────────────────────────────────────────────────────────────
     if cap_style == "top":
-        # Top cap strip (above +y edge)
-        components.append(_rect(origin, -hx, hy, hx, hy + cl, LAYER_CAP1))
-        # Bottom cap strip (below −y edge)
-        components.append(_rect(origin, -hx, -hy - cl, hx, -hy, LAYER_CAP1))
+        # add_top_caps: above only (top = cy+hy)
+        components.append(_rect(origin, -hx, hy,      hx, hy + cw,      LAYER_CAP1))
+        components.append(_rect(origin, -hx, hy + cw, hx, hy + cw + cl, LAYER_CAP2))
     else:  # "side"
-        # Right cap strip (+x edge)
-        components.append(_rect(origin, hx, -hy, hx + cl, hy, LAYER_CAP1))
-        # Left cap strip (−x edge)
-        components.append(_rect(origin, -hx - cl, -hy, -hx, hy, LAYER_CAP1))
+        # add_side_caps: right only (right = cx+hx)
+        components.append(_rect(origin, hx,      -hy, hx + cw,      hy, LAYER_CAP1))
+        components.append(_rect(origin, hx + cw, -hy, hx + cw + cl, hy, LAYER_CAP2))
 
-    # ── 3. L-undercut (L2) ────────────────────────────────────────────────────
-    # Reference add_L_undercut_right / add_L_undercut_top:
-    #   "right" undercut: horizontal arm along +y edge, vertical arm down −y side
-    #   "top"   undercut: vertical arm along +x edge, horizontal arm left −x side
-    uc_thick = cw   # undercut strip thickness equals cap_width in the reference
+    # ── 3. L-undercut — literal port of add_L_undercut_right / _top ──────────
+    #
+    # Reference uses gdspy.boolean(box, [c1_v, c1_h], "not") to cut the L arms
+    # out of the bounding box.  We decompose this into three non-overlapping
+    # rectangles instead (same result, no boolean needed).
+    #
+    # add_L_undercut_right  (undercut_style="right"):
+    #   Anchors at bottom-right corner of the body: (right=cx+hx, bottom=cy-hy)
+    #   l_vert = hy*2 - WIRE_WIDTH   ← full square height minus wire width
+    #   c1_v : vertical arm   — (right, bottom) → (right+CAP_H, bottom+l_vert)       CAP1
+    #   c1_h : horizontal arm — (right, bottom+l_vert-CAP_H) → (right+L_HORZ, bottom+l_vert)  CAP1
+    #   box  : bounding box   — (right, bottom) → (right+L_HORZ, bottom+l_vert)      CAP2
+    #   c2   : box NOT (c1_v, c1_h) → right of c1_v, below c1_h                      CAP2
+    #
+    # add_L_undercut_top  (undercut_style="top"):
+    #   Anchors at top-left corner of the body: (left=cx-hx, top=cy+hy)
+    #   l_vert = hx*2 - WIRE_WIDTH   ← full square width minus wire width
+    #   c1_v : horizontal arm — (left, top) → (left+l_vert, top+CAP_H)               CAP1
+    #   c1_h : vertical arm   — (left+l_vert-CAP_H, top) → (left+l_vert, top+L_HORZ) CAP1
+    #   box  : bounding box   — (left, top) → (left+l_vert, top+L_HORZ)              CAP2
+    #   c2   : box NOT (c1_v, c1_h) → below c1_v, left of c1_h                       CAP2
+    #
+    # All coords below are centre-relative (cell frame), _rect adds origin.
+    # ─────────────────────────────────────────────────────────────────────────
+    l_reach = cw + cl   # L_HORZ = CAP_H + CAP2_H
 
     if undercut_style == "right":
-        # Horizontal arm: top edge of square, extending to the right
+        l_vert = hy * 2 - ww          # = square_y - WIRE_WIDTH
+        right  =  hx                  # right edge of body
+        bottom = -hy                  # bottom edge of body
+
+        # c1_v — vertical arm (left strip of L)
         components.append(_rect(
             origin,
-            hx, hy - uc_thick,
-            hx + cl, hy,
-            LAYER_UNDERCUT_RING,
+            right,       bottom,
+            right + cw,  bottom + l_vert,
+            LAYER_CAP1,
         ))
-        # Vertical arm: right side of square, extending down
+        # c1_h — horizontal arm (top strip of L)
         components.append(_rect(
             origin,
-            hx - uc_thick, -hy,
-            hx, hy - uc_thick,
-            LAYER_UNDERCUT_RING,
+            right,          bottom + l_vert - cw,
+            right + l_reach, bottom + l_vert,
+            LAYER_CAP1,
         ))
-    else:  # "top"
-        # Vertical arm: top edge of square, extending up
+        # c2_fill — interior: right of c1_v AND below c1_h
         components.append(_rect(
             origin,
-            hx - uc_thick, hy,
-            hx, hy + cl,
-            LAYER_UNDERCUT_RING,
-        ))
-        # Horizontal arm: top of square, extending left
-        components.append(_rect(
-            origin,
-            -hx, hy - uc_thick,
-            hx - uc_thick, hy,
-            LAYER_UNDERCUT_RING,
+            right + cw,     bottom,
+            right + l_reach, bottom + l_vert - cw,
+            LAYER_CAP2,
         ))
 
-    # ── 4. Ports — computed geometrically, no combinatorial branches ──────────
-    # ── 4. Ports — semantically correct, matching component_model._make_square_ports
+    else:  # "top"
+        l_vert = hx * 2 - ww          # = square_x - WIRE_WIDTH
+        left   = -hx                  # left edge of body
+        top    =  hy                  # top edge of body
+
+        # c1_v — horizontal arm (bottom strip of L, confusingly named c1_v in reference)
+        components.append(_rect(
+            origin,
+            left,          top,
+            left + l_vert, top + cw,
+            LAYER_CAP1,
+        ))
+        # c1_h — vertical arm (right strip of L)
+        components.append(_rect(
+            origin,
+            left + l_vert - cw, top,
+            left + l_vert,       top + l_reach,
+            LAYER_CAP1,
+        ))
+        # c2_fill — interior: above c1_v AND left of c1_h
+        components.append(_rect(
+            origin,
+            left,               top + cw,
+            left + l_vert - cw, top + l_reach,
+            LAYER_CAP2,
+        ))
+
+    # ── 4. Ports — match _make_square_ports() in component_model.py ───────────
     #
-    # Convention (from the reference layout in component_model.py):
-    #   A wire_width-wide lead placed flush with one corner of the square
-    #   has its centreline at ±(h − wire_width/2) on the transverse axis.
+    # All offsets are body-local, i.e. relative to body.origin = (cx−hx, cy−hy).
+    # Centre of body in body-local coords = (hx, hy).
+    # Wire lead flush with one corner → centreline at (h − w/2) on transverse axis.
     #
-    # All offsets are body-local (relative to body.origin = bbox min-corner).
-    # The square centre in body-local coords is (hx, hy).
+    # PortSide convention: Qt scene Y increases downward (origin = bbox min-corner),
+    # so y=0 is the TOP of the screen (NORTH) and y=2*hy is the BOTTOM (SOUTH).
+    # EAST/WEST are unchanged — X is rightward in both conventions.
     w = wire_width
-    def _p(name, lx_um, ly_um, side):
+
+    def _p(name: str, lx_um: float, ly_um: float, side: PortSide) -> Port:
         return Port(name, Point(um_to_dbu(lx_um), um_to_dbu(ly_um)), side)
 
     if cap_style == "top" and undercut_style == "right":
         ports = [
-            _p("right",  hx * 2,           hy * 2 - w / 2, PortSide.EAST),
-            _p("bottom", w / 2,             0,              PortSide.SOUTH),
-            _p("top",    hx,                hy * 2,         PortSide.NORTH),
-            _p("left",   0,                 hy,             PortSide.WEST),
+            _p("right",  2*hx,       2*hy - w/2, PortSide.EAST),
+            _p("bottom", w/2,        0,           PortSide.NORTH),   # y=0 → top of screen
+            _p("top",    hx,         2*hy,        PortSide.SOUTH),   # y=2hy → bottom of screen
+            _p("left",   0,          hy,          PortSide.WEST),
         ]
     elif cap_style == "side" and undercut_style == "top":
         ports = [
-            _p("top",    hx * 2 - w / 2,   hy * 2,         PortSide.NORTH),
-            _p("left",   0,                 w / 2,          PortSide.WEST),
-            _p("right",  hx * 2,            hy,             PortSide.EAST),
-            _p("bottom", hx,                0,              PortSide.SOUTH),
+            _p("top",    2*hx - w/2, 2*hy,       PortSide.SOUTH),   # y=2hy → bottom of screen
+            _p("left",   0,          w/2,         PortSide.WEST),
+            _p("right",  2*hx,       hy,          PortSide.EAST),
+            _p("bottom", hx,         0,           PortSide.NORTH),   # y=0 → top of screen
         ]
     elif cap_style == "top" and undercut_style == "top":
         ports = [
-            _p("top",    hx * 2 - w / 2,   hy * 2,         PortSide.NORTH),
-            _p("bottom", hx,                0,              PortSide.SOUTH),
-            _p("right",  hx * 2,            hy,             PortSide.EAST),
-            _p("left",   0,                 hy,             PortSide.WEST),
+            _p("top",    2*hx - w/2, 2*hy,       PortSide.SOUTH),
+            _p("bottom", hx,         0,           PortSide.NORTH),
+            _p("right",  2*hx,       hy,          PortSide.EAST),
+            _p("left",   0,          hy,          PortSide.WEST),
         ]
     else:  # cap_style="side", undercut_style="right"
         ports = [
-            _p("right",  hx * 2,           hy * 2 - w / 2, PortSide.EAST),
-            _p("left",   0,                 hy,             PortSide.WEST),
-            _p("top",    hx,                hy * 2,         PortSide.NORTH),
-            _p("bottom", hx,                0,              PortSide.SOUTH),
+            _p("right",  2*hx,       2*hy - w/2, PortSide.EAST),
+            _p("left",   0,          hy,          PortSide.WEST),
+            _p("top",    hx,         2*hy,        PortSide.SOUTH),
+            _p("bottom", hx,         0,           PortSide.NORTH),
         ]
+
     _assign_ports(body, ports)
 
-    # Mark sub-components (everything except the anchor body) as port-free.
-    # This prevents rebuild_ports() from auto-generating generic N/S/E/W ports
-    # on caps, undercut arms, etc.  Only the body (index 0) gets real ports.
+    # Sub-components carry no ports — only the anchor body (index 0) does.
     for comp in components[1:]:
         comp._no_auto_ports = True
 
     return CellResult(
         components=components,
-        group_name=f"SquareNode ({square_x:.1f}×{square_y:.1f}µm)",
+        group_name=f"ByiskJJ ({square_x:.1f}×{square_y:.1f}µm)",
         description=(
-            f"Biysk bonding square  {square_x}×{square_y} µm  "
+            f"Byisk JJ bonding square  {square_x}×{square_y} µm  "
             f"cap={cap_style}  undercut={undercut_style}"
         ),
     )
@@ -506,28 +567,11 @@ def build_manhattan_jj(
         LAYER_BIYSK_JUNCTION,
     ))
 
-    # ── 6. Ports on the horizontal lead — matching component_model._make_jj_ports
+    # ── 6. Ports on the horizontal lead ──────────────────────────────────────
     #
-    # Reference (component_model.py _make_jj_ports):
-    #   s = lead_width (JJ square side), L = lead_length
-    #   Port("lead_in",   0,            0,               "-x")   ← entry of horiz lead
-    #   Port("down_out",  L + s/2,     -(s/2 + L),      "-y")   ← bottom of down lead
-    #   Port("right_out", L + 2s + 0.9, 0,               "+x")  ← right end of CAP2
-    #   Port("top_out",   L + s/2,      s/2 + s + 0.9,  "+y")   ← top of CAP2
-    #
-    # Those are all in CELL-FRAME coords (relative to cell origin = entry of horiz lead).
     # horiz_lead.origin is at (origin.x, origin.y - w/2) in world DBU,
-    # so we must subtract horiz_lead.origin from each cell-frame position to get
-    # the port offset relative to horiz_lead.origin.
-    #
-    # horiz_lead.origin relative to cell origin: (0, -w/2)  [µm]
-    # → port_offset = cell_frame_pos - (0, -w/2) = (cf_x, cf_y + w/2)
-
-    # Cell-frame positions (µm, origin = left end of horiz lead at cell entry):
-    #   lead_in  : (0,               0)        → body offset (0,        w/2)
-    #   down_out : (x_sq + s/2,      y_down_bottom) → body offset (x_sq+s/2, y_down_bottom+w/2)
-    #   right_out: (x_sq+2s+e2+e3,   0)        → body offset (x_sq+2s+e2+e3, w/2)
-    #   top_out  : (x_sq + s/2,      y_top_base+s+e2+e3) → body offset (x_sq+s/2, y_top_base+s+e2+e3+w/2)
+    # so port offsets relative to horiz_lead.origin are:
+    #   port_offset = (cell_frame_x, cell_frame_y + w/2)
 
     oy = w / 2   # correction: cell_frame_y → body_offset_y = cf_y + w/2
 

@@ -82,14 +82,19 @@ class Colors:
     # ── Layer Colors ──────────────────────────────────────────────────────────
     # Layer 0 is sky blue (not amber) — avoids confusion with selection state.
     # All 8 are perceptually similar in brightness so no layer "pops" unfairly.
+    # GDS layer assignments (cell_library.LAYERS):
+    #   idx 2 — L2  Undercut ring  → violet  (must contrast with teal body)
+    #   idx 4 — L4  Cap1           → salmon  (must contrast with violet + teal)
+    #   idx 5 — L5  Biysk junc.    → teal    (dominant body layer)
+    # Tuned to component_model.LAYER_COLORS, desaturated ~15% for the dark canvas.
     LAYER_COLORS = [
-        "#5AC8E8",  # 0 — sky blue     (deliberately not amber)
-        "#E06060",  # 1 — warm red
-        "#78C878",  # 2 — sage green
+        "#5AC8E8",  # 0 — sky blue          (not amber — avoids selection confusion)
+        "#E06060",  # 1 — L1  Branch         warm red
+        "#C060FF",  # 2 — L2  Undercut ring  violet    ← was sage green (clashed with body)
         "#E8C040",  # 3 — golden yellow
-        "#A882D4",  # 4 — soft lavender
-        "#40B4C0",  # 5 — teal
-        "#E09038",  # 6 — warm ochre
+        "#F0997B",  # 4 — L4  Cap1           warm salmon ← was lavender
+        "#5DCAA5",  # 5 — L5  Biysk junc.    teal      ← tuned to ref #5DCAA5
+        "#E09038",  # 6 — L6  Cap2           warm ochre
         "#D4708A",  # 7 — dusty rose
     ]
 

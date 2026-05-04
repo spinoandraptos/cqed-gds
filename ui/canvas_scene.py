@@ -44,11 +44,11 @@ from core.commands import PlaceCellCommand
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
-GRID_MINOR_DBU  = um_to_dbu(1)
+GRID_MINOR_DBU  = um_to_dbu(0.1)
 GRID_MAJOR_DBU  = um_to_dbu(10)
 SCENE_EXTENT    = um_to_dbu(5_000)
-DEFAULT_W_DBU   = um_to_dbu(10)
-DEFAULT_H_DBU   = um_to_dbu(5)
+DEFAULT_W_DBU   = um_to_dbu(2)    # was um_to_dbu(10)
+DEFAULT_H_DBU   = um_to_dbu(0.2)  # was um_to_dbu(5)
 DEFAULT_PW_DBU  = um_to_dbu(1)
 MIN_POLY_PTS    = 3
 VERTEX_DOT_R    = um_to_dbu(0.4)
@@ -344,15 +344,18 @@ class GroupItem(QGraphicsItem):
         self.update()
 
     def _current_bbox(self) -> QRectF:
-        bb  = self._group.bbox_from(self._scene_ref._design.components)
-        pad = float(um_to_dbu(2))
+        bb = self._group.bbox_from(self._scene_ref._design.components)
+        # No scene-space padding — the box hugs the physical cell geometry.
+        # A tiny cosmetic pixel offset is added in boundingRect() for Qt's
+        # dirty-region tracking only; it never inflates the visual rect.
         return QRectF(
-            bb.x_min - pad, bb.y_min - pad,
-            bb.x_max - bb.x_min + pad * 2,
-            bb.y_max - bb.y_min + pad * 2,
+            bb.x_min, bb.y_min,
+            bb.x_max - bb.x_min,
+            bb.y_max - bb.y_min,
         )
 
     def boundingRect(self) -> QRectF:
+        # 4 extra scene-units (sub-pixel at any sensible zoom) for cosmetic pen
         return self._current_bbox().adjusted(-4, -4, 4, 4)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
@@ -364,23 +367,28 @@ class GroupItem(QGraphicsItem):
         else:
             border = _GROUP_BORDER_IDLE
 
-        pen = QPen(QColor(border), 1.2)
+        # Cosmetic pen — 1 px on screen regardless of zoom
+        pen = QPen(QColor(border), 1.0)
         pen.setCosmetic(True)
         pen.setStyle(Qt.PenStyle.DashLine)
-        pen.setDashPattern([8, 4])
+        pen.setDashPattern([6, 3])
         painter.setPen(pen)
         fill = QColor(border); fill.setAlpha(_GROUP_BG_ALPHA)
         painter.setBrush(QBrush(fill))
-        painter.drawRoundedRect(rect, um_to_dbu(1), um_to_dbu(1))
+        # drawRect instead of drawRoundedRect — corner radius was scene-space
+        # (um_to_dbu(1) = 1000 nm) which ballooned the visual box at any zoom.
+        painter.drawRect(rect)
 
+        # Label: cosmetic pixel-size font positioned just above the top edge
         name_pen = QPen(QColor(border)); name_pen.setCosmetic(True)
         painter.setPen(name_pen)
         font = painter.font()
-        font.setPixelSize(um_to_dbu(3))
+        font.setPixelSize(10)   # fixed 10 px — readable at any zoom
         painter.setFont(font)
+        # Offset in scene units must be tiny; use 1 DBU (1 nm) so the label
+        # sits right on the border line rather than floating 1 µm above it.
         painter.drawText(
-            QPointF(rect.left() + um_to_dbu(1),
-                    rect.top()  - um_to_dbu(0.5)),
+            QPointF(rect.left() + 4, rect.top() - 2),
             self._group.name,
         )
 
