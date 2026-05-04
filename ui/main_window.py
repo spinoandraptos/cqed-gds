@@ -38,6 +38,175 @@ from core.serialiser import save, load, SerialisationError
 from ui.sweep_dialog import SweepDialog
 from ui.cell_palette import CellLibraryPanel
 
+class CellSweepDialog(QDialog):
+    """
+    Sweep dialog for parametric cell groups.
+
+    Lets the user choose one cell parameter, define a start/stop/steps range,
+    and generates one re-placed copy of the cell for each step — laid out in a
+    row with a configurable spacing.
+
+    Re-uses the same _ReplaceCellCmd pattern that _on_cell_param_change_requested
+    uses for single edits, so every sweep is a single BatchCommand on the undo stack.
+
+    Layout
+    ------
+    ┌─────────────────────────────────┐
+    │  Cell: ManhattanJJ (…)          │
+    │  Parameter: [combo ▼]           │
+    │  Start:  [spinbox]  µm          │
+    │  Stop:   [spinbox]  µm          │
+    │  Steps:  [spinbox]  (int)       │
+    │  Spacing:[spinbox]  µm          │
+    │  [ Cancel ]        [ Sweep ]    │
+    └─────────────────────────────────┘
+    """
+
+    def __init__(self, group, design, scene, parent=None) -> None:
+        super().__init__(parent)
+        self._group  = group
+        self._design = design
+        self._scene  = scene
+
+        from core.cell_library import CELL_BY_ID
+        self._cdef = CELL_BY_ID[group.cell_id]
+
+        self.setWindowTitle(f"Sweep — {self._cdef.name}")
+        self.setMinimumWidth(340)
+        self._build_ui()
+
+    def _build_ui(self) -> None:
+        from PyQt6.QtWidgets import (
+            QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox,
+            QDialogButtonBox, QLabel,
+        )
+        root = QVBoxLayout(self)
+        root.setSpacing(10)
+
+        # Current params = defaults overridden by any stored overrides
+        self._current_params = dict(self._cdef.defaults)
+        stored = getattr(self._group, "_cell_params", {})
+        self._current_params.update(stored)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        # Cell name row
+        cell_lbl = QLabel(f"<b>{self._cdef.name}</b>  —  {self._group.name}")
+        cell_lbl.setWordWrap(True)
+        root.addWidget(cell_lbl)
+        root.addLayout(form)
+
+        # Parameter selector — only numeric (float) params can be swept
+        self._param_combo = QComboBox()
+        float_params = [k for k, v in self._cdef.defaults.items()
+                        if isinstance(v, float)]
+        self._param_combo.addItems(float_params)
+        form.addRow("Parameter:", self._param_combo)
+
+        # Start / stop / steps
+        self._start_sb = QDoubleSpinBox()
+        self._start_sb.setRange(0.001, 1000.0)
+        self._start_sb.setDecimals(3)
+        self._start_sb.setSuffix(" µm")
+        self._start_sb.setSingleStep(0.1)
+
+        self._stop_sb = QDoubleSpinBox()
+        self._stop_sb.setRange(0.001, 1000.0)
+        self._stop_sb.setDecimals(3)
+        self._stop_sb.setSuffix(" µm")
+        self._stop_sb.setSingleStep(0.1)
+
+        self._steps_sb = QSpinBox()
+        self._steps_sb.setRange(2, 100)
+        self._steps_sb.setValue(5)
+
+        self._spacing_sb = QDoubleSpinBox()
+        self._spacing_sb.setRange(0.0, 10_000.0)
+        self._spacing_sb.setDecimals(1)
+        self._spacing_sb.setSuffix(" µm")
+        self._spacing_sb.setSingleStep(1.0)
+        self._spacing_sb.setValue(10.0)
+
+        form.addRow("Start:", self._start_sb)
+        form.addRow("Stop:",  self._stop_sb)
+        form.addRow("Steps:", self._steps_sb)
+        form.addRow("Spacing:", self._spacing_sb)
+
+        # Pre-populate start/stop from current value of the first parameter
+        self._param_combo.currentTextChanged.connect(self._on_param_changed)
+        self._on_param_changed(self._param_combo.currentText())
+
+        # Buttons
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Cancel |
+            QDialogButtonBox.StandardButton.Ok
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Sweep")
+        btns.accepted.connect(self._do_sweep)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+    def _on_param_changed(self, key: str) -> None:
+        """Pre-fill start/stop around the current value of the chosen parameter."""
+        if not key:
+            return
+        cur = self._current_params.get(key, self._cdef.defaults.get(key, 1.0))
+        self._start_sb.setValue(max(0.001, cur * 0.5))
+        self._stop_sb.setValue(cur * 1.5)
+
+    def _do_sweep(self) -> None:
+        from core.cell_library import place_cell, CELL_BY_ID
+        from core.commands import PlaceCellCommand, BatchCommand
+        from core.model import Point
+        import math
+
+        key     = self._param_combo.currentText()
+        start   = self._start_sb.value()
+        stop    = self._stop_sb.value()
+        n_steps = self._steps_sb.value()
+        spacing_dbu = int(round(self._spacing_sb.value() * 1000))  # µm → DBU
+
+        if start >= stop:
+            QMessageBox.warning(self, "Sweep", "Start must be less than Stop.")
+            return
+
+        # Compute the group's current bbox to figure out its width for auto-spacing
+        bb     = self._group.bbox_from(self._design.components)
+        origin = Point(bb.x_min, bb.y_min)
+        cell_width_dbu = bb.x_max - bb.x_min
+
+        values = [start + (stop - start) * i / (n_steps - 1)
+                  for i in range(n_steps)]
+
+        cmds = []
+        for i, val in enumerate(values):
+            params = dict(self._current_params)
+            params[key] = val
+
+            # Place each copy offset to the right by (cell_width + spacing) × i
+            offset_x = i * (cell_width_dbu + spacing_dbu)
+            step_origin = Point(origin.x + offset_x, origin.y)
+
+            try:
+                result = place_cell(self._group.cell_id, step_origin, params=params)
+            except (KeyError, ValueError) as exc:
+                QMessageBox.warning(self, "Sweep", f"Step {i+1}: {exc}")
+                return
+
+            cmd = PlaceCellCommand(result, cell_id=self._group.cell_id,
+                                   cell_params=params)
+            cmds.append(cmd)
+
+        if cmds:
+            self._scene.cmd_stack.execute(
+                BatchCommand(cmds, f"Sweep {self._cdef.name}.{key} "
+                                   f"[{start:.3f}…{stop:.3f}] ×{n_steps}")
+            )
+
+        self.accept()
+
+
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -47,6 +216,7 @@ class MainWindow(QMainWindow):
 
         self._design = DesignScene(name="layout")
         self._current_file: Optional[Path] = None
+        self._selected_group_id: Optional[str] = None   # tracks last group-selected signal
         self._scene  = CanvasScene(self._design)
         self._view   = CanvasView(self._scene)
 
@@ -89,6 +259,9 @@ class MainWindow(QMainWindow):
         edit_menu = mb.addMenu("Edit")
         self._act_undo   = self._action("Undo",            "Ctrl+Z",         self._undo)
         self._act_redo   = self._action("Redo",            "Ctrl+Shift+Z",   self._redo)
+        self._act_copy      = self._action("Copy",           "Ctrl+C",         self._copy)
+        self._act_paste     = self._action("Paste",          "Ctrl+V",         self._paste)
+        self._act_duplicate = self._action("Duplicate",      "Ctrl+D",         self._duplicate)
         self._act_selall = self._action("Select All",      "Ctrl+A",         self._select_all)
         self._act_delete = self._action("Delete",          "Delete",         self._delete_selected)
         self._act_sweep = self._action("Sweep Parameter…", "Ctrl+W", self._sweep)
@@ -98,6 +271,7 @@ class MainWindow(QMainWindow):
         self._act_rot_ccw = self._action("Rotate 90° CCW", "Shift+R",       lambda: self._scene.rotate_selection(ccw=True))
         self._act_escape = self._action("Cancel / Select", "Escape",         self._escape)
         for a in [self._act_undo, self._act_redo, None,
+                self._act_copy, self._act_paste, self._act_duplicate, None,
                 self._act_selall, self._act_delete,
                 self._act_sweep, self._act_group, self._act_ungroup,
                 self._act_rot_cw, self._act_rot_ccw,
@@ -319,6 +493,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_item_selected(self, comp_id: str) -> None:
+        self._selected_group_id = None   # a component is now selected, not a group
         if comp_id:
             comp = self._design.get(comp_id)
             if comp:
@@ -486,6 +661,19 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot()
     def _sweep(self) -> None:
+        # ── Case 1: a cell group is selected → sweep its cell parameters ──────
+        if self._selected_group_id:
+            group = self._design.get_group(self._selected_group_id)
+            if group is not None and getattr(group, "cell_id", None):
+                dlg = CellSweepDialog(
+                    group, self._design, self._scene, self
+                )
+                dlg.exec()
+                return
+            # Group exists but has no cell_id (a user-drawn group) → fall through
+            # to the component path which will show the "select one component" message.
+
+        # ── Case 2: exactly one standalone component selected ─────────────────
         selected = [
             item.component
             for item in self._scene.selectedItems()
@@ -493,7 +681,8 @@ class MainWindow(QMainWindow):
         ]
         if len(selected) != 1:
             QMessageBox.information(
-                self, "Sweep", "Select exactly one component to sweep."
+                self, "Sweep",
+                "Select exactly one component or cell group to sweep."
             )
             return
         dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
@@ -614,6 +803,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_group_selected(self, group_id: str) -> None:
+        self._selected_group_id = group_id
         group = self._design.get_group(group_id)
         if group:
             self._props.show_group(group, self._design)
@@ -667,6 +857,18 @@ class MainWindow(QMainWindow):
     def _select_all(self) -> None:
         for item in self._scene.items():
             item.setSelected(True)
+
+    def _copy(self) -> None:
+        self._scene.copy_selection()
+        # Reset paste-offset counter: next paste starts at +1 offset
+        from core.clipboard import Clipboard
+        Clipboard.instance().reset_paste_count()
+
+    def _paste(self) -> None:
+        self._scene.paste()
+
+    def _duplicate(self) -> None:
+        self._scene.duplicate_selection()
 
     def _delete_selected(self) -> None:
         from core.commands import RemoveComponent
@@ -832,6 +1034,7 @@ class MainWindow(QMainWindow):
             "Middle-drag or Space+drag - Pan<br><br>"
             "<b>Edit</b><br>"
             "Ctrl+Z / Ctrl+Shift+Z - Undo / Redo<br>"
+            "Ctrl+C - Copy | Ctrl+V - Paste | Ctrl+D - Duplicate<br>"
             "Ctrl+A - Select all | Delete - Delete selected<br>"
             "R - Rotate 90° CW | Shift+R - Rotate 90° CCW<br>"
         )

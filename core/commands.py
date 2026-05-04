@@ -15,7 +15,7 @@ from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 
 from core.model import DesignScene, GDSComponent, Point, Connection, ComponentGroup
-from core.cell_library import CellResult
+from core.cell_library import CellResult, PortSide
 
 # Fields that EditComponent is allowed to mutate.
 # A typo in a key name silently creates a new attribute on the dataclass,
@@ -382,6 +382,19 @@ def _rotate_point(px: int, py: int,
     return cx + dx, cy + dy
 
 
+def _rotate_port_side(side: "PortSide", steps: int) -> "PortSide":
+    """
+    Rotate a PortSide by `steps` × 90° CCW.
+
+    Rotation order (CCW): NORTH → WEST → SOUTH → EAST → NORTH
+    One step CCW:  N→W, W→S, S→E, E→N
+    """
+    from core.model import PortSide
+    ccw_cycle = [PortSide.NORTH, PortSide.WEST, PortSide.SOUTH, PortSide.EAST]
+    idx = ccw_cycle.index(side)
+    return ccw_cycle[(idx + steps) % 4]
+
+
 def _rotate_component_in_place(comp: "GDSComponent",
                                 cx: int, cy: int,
                                 steps: int) -> None:
@@ -392,6 +405,11 @@ def _rotate_component_in_place(comp: "GDSComponent",
     because a rotated axis-aligned rectangle is no longer axis-aligned.
     Polygons and paths simply rotate every vertex.
     steps: +1 = 90° CCW, -1 = 90° CW.
+
+    Port fix: port offsets are vectors relative to comp.origin in local space.
+    When the component rotates, those offset vectors must rotate by the same
+    steps around (0, 0) in local space.  Port sides (NORTH/SOUTH/EAST/WEST)
+    rotate by the same steps.  Port IDs are preserved — no Connection breakage.
     """
     from core.model import ComponentKind, Point
 
@@ -415,6 +433,17 @@ def _rotate_component_in_place(comp: "GDSComponent",
         ]
         if comp.points:
             comp.origin = comp.points[0]
+
+    # ── Rotate port offsets and sides ─────────────────────────────────────────
+    # Port offsets are relative to comp.origin (local space).  After the
+    # geometry rotation above, comp.origin has moved in world space, but the
+    # local-space offsets still point in the old directions.  We rotate each
+    # offset vector around (0, 0) — i.e. the same steps, same formula, but
+    # with the rotation centre fixed at the local origin.
+    for port in comp.ports:
+        rx, ry = _rotate_point(port.offset.x, port.offset.y, 0, 0, steps)
+        port.offset = Point(rx, ry)
+        port.side   = _rotate_port_side(port.side, steps)
 
 
 class RotateComponent(Command):
@@ -445,6 +474,12 @@ class RotateComponent(Command):
         self._snap_width  = comp.width
         self._snap_height = comp.height
         self._snap_points = list(comp.points) if comp.points else None
+        # Snapshot port offsets+sides — _rotate_component_in_place mutates them
+        # in-place, so undo must restore them rather than rotate back.
+        self._snap_ports  = [
+            (p.id, Point(p.offset.x, p.offset.y), p.side)
+            for p in comp.ports
+        ]
 
     def _centre_of(self, comp: "GDSComponent") -> tuple[int, int]:
         bb = comp.bbox
@@ -468,6 +503,12 @@ class RotateComponent(Command):
         comp.width  = self._snap_width
         comp.height = self._snap_height
         comp.points = list(self._snap_points) if self._snap_points is not None else None
+        # Restore port offsets and sides from the pre-rotation snapshot
+        port_map = {p.id: p for p in comp.ports}
+        for port_id, offset, side in self._snap_ports:
+            if port_id in port_map:
+                port_map[port_id].offset = Point(offset.x, offset.y)
+                port_map[port_id].side   = side
         design.is_dirty = True
 
     @property
@@ -513,6 +554,9 @@ class RotateGroup(Command):
                 "width":  comp.width,
                 "height": comp.height,
                 "points": list(comp.points) if comp.points else None,
+                # Snapshot port offsets+sides — rotated in-place, must restore on undo
+                "ports":  [(p.id, Point(p.offset.x, p.offset.y), p.side)
+                           for p in comp.ports],
             })
 
     def execute(self, design: DesignScene) -> None:
@@ -536,6 +580,12 @@ class RotateGroup(Command):
                 comp.width  = snap["width"]
                 comp.height = snap["height"]
                 comp.points = list(snap["points"]) if snap["points"] is not None else None
+                # Restore port offsets and sides from pre-rotation snapshot
+                port_map = {p.id: p for p in comp.ports}
+                for port_id, offset, side in snap["ports"]:
+                    if port_id in port_map:
+                        port_map[port_id].offset = Point(offset.x, offset.y)
+                        port_map[port_id].side   = side
         design.is_dirty = True
 
     @property
@@ -590,6 +640,47 @@ class PlaceCellCommand(Command):
     @property
     def description(self) -> str:
         return f"Place {self._result.group_name}"
+
+# ── Paste command ─────────────────────────────────────────────────────────────
+
+class PasteComponents(Command):
+    """
+    Add a set of pasted components (and optionally a group) to the scene
+    as a single, fully undoable action.
+
+    Mirrors PlaceCellCommand in structure:
+      execute : add all components → add group (if any)
+      undo    : remove group → remove all components (reverse order)
+
+    Port auto-generation is skipped for components that already have ports
+    (they were deep-copied from real shapes that had ports built previously).
+    Components with no ports and _no_auto_ports=False get fresh default ports.
+    """
+
+    def __init__(self, components: list["GDSComponent"],
+                 group: Optional["ComponentGroup"] = None) -> None:
+        self._components = components
+        self._group      = group
+
+    def execute(self, design: DesignScene) -> None:
+        for comp in self._components:
+            if not comp.ports and not getattr(comp, "_no_auto_ports", False):
+                comp.build_default_ports()
+            design.add(comp)
+        if self._group is not None:
+            design.add_group(self._group)
+
+    def undo(self, design: DesignScene) -> None:
+        if self._group is not None:
+            design.remove_group(self._group.id)
+        for comp in reversed(self._components):
+            design.remove(comp.id)
+
+    @property
+    def description(self) -> str:
+        n = len(self._components)
+        return f"Paste {n} component{'s' if n != 1 else ''}"
+
 
 # ── Command Stack ─────────────────────────────────────────────────────────────
 
