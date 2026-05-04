@@ -413,6 +413,11 @@ class GroupItem(QGraphicsItem):
                 total_dy += snap_adjust[1]
 
             if total_dx != 0 or total_dy != 0:
+                # Sever any existing connections on group members before moving.
+                # This clears stale indicators whether or not a new snap is found.
+                for cid in self._group.member_ids:
+                    self._scene_ref.disconnect_component(cid)
+
                 # Reverse only the live-dragged portion — snap nudge was never
                 # applied to the model, so only undo _total_dx / _total_dy
                 for cid in self._group.member_ids:
@@ -652,18 +657,12 @@ class ComponentItem(QGraphicsItem):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if event.buttons() & Qt.MouseButton.LeftButton:
-            self._scene_ref._on_item_move(event)
-            event.accept()
-        else:
-            super().mouseMoveEvent(event)
+        # Drag is handled at the scene level so all selected items move together.
+        event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            self._scene_ref._on_item_release(event)
-            event.accept()
-        else:
-            super().mouseReleaseEvent(event)
+        # Release is handled at the scene level.
+        event.accept()
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
@@ -1046,11 +1045,14 @@ class CanvasScene(QGraphicsScene):
         if event.button() == Qt.MouseButton.LeftButton:
             comp_item = self._hit_component_item(event.scenePos())
             if comp_item is not None:
-                # Item hit — _on_item_press (called via item.mousePressEvent)
-                # owns all selection logic. Call super() only to deliver the
-                # event to the item; Qt will NOT apply its own selection logic
-                # when the item's mousePressEvent accepts and returns without
-                # calling its own super().
+                # _on_item_press owns all selection logic and snapshots origins.
+                # We must ALSO call super() so Qt delivers the press down to the
+                # item — without this, ComponentItem.mousePressEvent is never
+                # called, so Qt never arms the item's mouseMoveEvent, and only
+                # the directly-clicked item would move during a multi-select drag.
+                # Qt will not stomp our selection because the item's
+                # mousePressEvent accepts the event without calling its own
+                # super(), preventing Qt's built-in selection handling from running.
                 self._on_item_press(comp_item, event)
                 return
             else:
@@ -1076,7 +1078,19 @@ class CanvasScene(QGraphicsScene):
         elif self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             self._update_ghost_edge(snapped)
 
+        # Drive multi-select drag from the scene so ALL selected items move,
+        # regardless of which single item Qt delivered the press to.
+        if self._drag_start is not None and self._orig_positions:
+            self._on_item_move(event)
+
         super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._drag_start is not None and self._orig_positions):
+            self._on_item_release(event)
+            return
+        super().mouseReleaseEvent(event)
 
     def _on_item_press(self, item: "ComponentItem", event) -> None:
         """Called by ComponentItem.mousePressEvent — handles select + drag arm."""
@@ -1193,15 +1207,6 @@ class CanvasScene(QGraphicsScene):
                 self.cmd_stack.execute(
                     BatchCommand(move_cmds, f"Move {len(move_cmds)} components")
                 )
-
-        if self._snap_offset is not None and len(self._orig_positions) == 1:
-            item = next(iter(self._orig_positions))
-            self._try_connect_snapped(item._comp, self._snap_offset)
-
-        self._drag_start     = None
-        self._orig_positions = {}
-        self._drag_committed = False
-        self._snap_offset    = None
 
         if self._snap_offset is not None and len(self._orig_positions) == 1:
             item = next(iter(self._orig_positions))
