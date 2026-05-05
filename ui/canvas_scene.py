@@ -813,6 +813,10 @@ class CanvasScene(QGraphicsScene):
         self._pl = PlacementState()
         self._pl.mode = PlacementMode.SELECT
 
+        # Last known cursor position in scene coordinates (updated on mouseMoveEvent).
+        # Used by paste() to place content under the cursor.
+        self._cursor_scene_pos: QPointF = QPointF(0, 0)
+
         # ── Drag state (managed at scene level) ───────────────────────────────
         self._drag_start:     Optional[QPointF] = None
         self._orig_positions: dict              = {}   # ComponentItem → Point
@@ -1181,6 +1185,7 @@ class CanvasScene(QGraphicsScene):
     def mouseMoveEvent(self, event) -> None:
         raw     = event.scenePos()
         snapped = self.snap_f(raw.x(), raw.y())
+        self._cursor_scene_pos = raw          # track for paste-at-cursor
         self.cursor_moved.emit(dbu_to_um(int(raw.x())), dbu_to_um(int(raw.y())))
 
         if self._pl.mode == PlacementMode.PLACE_RECT:
@@ -1564,33 +1569,68 @@ class CanvasScene(QGraphicsScene):
 
     def copy_selection(self) -> None:
         """
-        Copy all selected ComponentItems to the in-process Clipboard.
+        Copy all selected ComponentItems (and GroupItems) to the in-process Clipboard.
 
-        Group detection: if every selected component belongs to the same single
-        group, that group template is also copied so paste preserves grouping.
-        Mixed selections (multiple groups, or group + loose items) drop grouping —
-        components are pasted as independent shapes, matching standard EDA behaviour.
+        Group detection:
+          • If a GroupItem is selected, all of its member components are collected
+            and the group object is preserved so paste re-creates the group.
+          • If only loose ComponentItems are selected and they all share one group,
+            that group is also copied (original behaviour).
+          • Mixed selections (multiple groups, or group + loose items) drop grouping —
+            components are pasted as independent shapes, matching standard EDA behaviour.
         """
-        comp_items = [i for i in self.selectedItems() if isinstance(i, ComponentItem)]
-        if not comp_items:
-            return
+        sel = self.selectedItems()
+        group_items = [i for i in sel if isinstance(i, GroupItem)]
+        comp_items  = [i for i in sel if isinstance(i, ComponentItem)]
 
-        components = [i.component for i in comp_items]
-
-        # Detect if all selected components share exactly one group
+        components: list[GDSComponent] = []
         group: Optional[ComponentGroup] = None
-        if len(comp_items) > 1:
-            groups = {self._design.group_of(c.id) for c in components}
-            groups.discard(None)
-            if len(groups) == 1:
-                group = next(iter(groups))
+
+        if group_items:
+            # Single group selected (the common case for cells / parametric groups).
+            # Collect all member components from the first group; ignore extras for
+            # mixed selections — drop grouping as stated in the docstring.
+            if len(group_items) == 1:
+                gi = group_items[0]
+                group = gi.group
+                components = [
+                    c for c in self._design.components
+                    if c.id in group.member_ids
+                ]
+            else:
+                # Multiple groups selected — merge members, drop all group metadata.
+                seen_ids: set[str] = set()
+                for gi in group_items:
+                    for cid in gi.group.member_ids:
+                        if cid not in seen_ids:
+                            comp = self._design.get(cid)
+                            if comp:
+                                components.append(comp)
+                                seen_ids.add(cid)
+        else:
+            # No GroupItem selected — fall back to the original loose-component path.
+            if not comp_items:
+                return
+            components = [i.component for i in comp_items]
+            # Detect if all selected components share exactly one group
+            if len(comp_items) > 1:
+                groups = {self._design.group_of(c.id) for c in components}
+                groups.discard(None)
+                if len(groups) == 1:
+                    group = next(iter(groups))
+
+        if not components:
+            return
 
         Clipboard.instance().copy(components, group)
         Clipboard.instance().reset_paste_count()
 
     def paste(self) -> None:
         """
-        Paste from the Clipboard, offset by PASTE_OFFSET_DBU × paste_count.
+        Paste from the Clipboard centred on the current cursor position so the
+        result lands exactly where the user is pointing.  Falls back to viewport
+        centre if the cursor hasn't moved over the canvas yet.
+        Nudged by PASTE_OFFSET_DBU × paste_count so consecutive pastes stagger.
         The newly pasted items are selected immediately so the user can drag
         them to their final position without an extra click.
         """
@@ -1598,7 +1638,19 @@ class CanvasScene(QGraphicsScene):
         if cb.is_empty:
             return
 
-        components, group = cb.paste(base_offset_dbu=PASTE_OFFSET_DBU)
+        # Prefer cursor position; fall back to viewport centre.
+        sp = self._cursor_scene_pos
+        if sp.isNull():
+            views = self.views()
+            if views:
+                vr = views[0].viewport().rect()
+                sp = views[0].mapToScene(vr.center())
+        target_center = (int(sp.x()), int(sp.y()))
+
+        components, group = cb.paste(
+            base_offset_dbu=PASTE_OFFSET_DBU,
+            target_center=target_center,
+        )
         cmd = PasteComponents(components, group)
         self.cmd_stack.execute(cmd)
 

@@ -67,15 +67,22 @@ class Clipboard:
 
     # ── Read ──────────────────────────────────────────────────────────────────
 
-    def paste(self, base_offset_dbu: int = 10_000) -> tuple[list[GDSComponent],
-                                                             Optional[ComponentGroup]]:
+    def paste(self, base_offset_dbu: int = 10_000,
+              target_center: Optional[tuple[int, int]] = None,
+              ) -> tuple[list[GDSComponent], Optional[ComponentGroup]]:
         """
         Return fresh deep-copies of clipboard contents with:
           - New unique IDs for every component (and the group, if any)
           - Group member_ids remapped to the new component IDs
           - Cell metadata (cell_id, _cell_params) preserved
-          - Position offset by base_offset_dbu * paste_count so consecutive
-            pastes stagger rather than stacking invisibly on top of each other
+          - Positioning:
+              • If target_center (x_dbu, y_dbu) is given, the pasted selection
+                is centred on that point (viewport centre) and then nudged by
+                base_offset_dbu × paste_count so consecutive pastes stagger.
+                This ensures paste always lands on-screen regardless of where
+                the source objects live in scene space.
+              • If target_center is None (legacy path), behaviour is unchanged:
+                position = source_position + base_offset_dbu × paste_count.
 
         Increments internal paste_count — call reset_paste_count() whenever
         the user does something other than paste (move, new copy, etc.).
@@ -86,17 +93,30 @@ class Clipboard:
             return [], None
 
         self._paste_count += 1
-        offset = base_offset_dbu * self._paste_count
 
         id_map: dict[str, str] = {}   # old_id → new_id
         pasted: list[GDSComponent] = []
+
+        if target_center is not None:
+            # Centre the pasted selection exactly on the cursor — no stagger.
+            xs = [t.origin.x for t in self._entries]
+            ys = [t.origin.y for t in self._entries]
+            src_cx = (min(xs) + max(xs)) // 2
+            src_cy = (min(ys) + max(ys)) // 2
+            base_dx = target_center[0] - src_cx
+            base_dy = target_center[1] - src_cy
+        else:
+            # Legacy fallback: offset from source position.
+            offset  = base_offset_dbu * self._paste_count
+            base_dx = offset
+            base_dy = offset
 
         for template in self._entries:
             comp    = copy.deepcopy(template)
             old_id  = comp.id
             comp.id = uuid.uuid4().hex[:8]
             id_map[old_id] = comp.id
-            comp.move_by(offset, offset)
+            comp.move_by(base_dx, base_dy)
             # Regenerate port IDs so pasted ports never alias originals
             for port in comp.ports:
                 port.id = uuid.uuid4().hex[:6]
