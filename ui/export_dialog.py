@@ -278,11 +278,19 @@ class ExportResultDialog(QDialog):
     def _open_klayout(self) -> None:
         try:
             import os
+            env = os.environ.copy()
+            # Strip X11/ICE session-manager vars that Qt sets on itself.
+            # KLayout inherits them, tries to attach to the same ICE socket,
+            # fails (errno=0), and the ICE error handler calls exit().
+            # Unsetting them makes KLayout start its own clean ICE session.
+            for var in ("SESSION_MANAGER", "QT_SESSION_KEY",
+                        "QT_SESSION_ID", "XSESSION_IS_UP"):
+                env.pop(var, None)
             subprocess.Popen(
                 ["klayout", self._path],
-                close_fds=True,          # don't leak Qt's X11/ICE sockets
+                close_fds=True,          # don't leak Qt's X11 fds
                 start_new_session=True,  # setsid() — detach from our process group
-                env=os.environ.copy(),   # pass DISPLAY, XAUTHORITY, etc. through
+                env=env,
             )
         except Exception as exc:
             QMessageBox.warning(self, "KLayout", f"Could not launch KLayout:\n{exc}")
