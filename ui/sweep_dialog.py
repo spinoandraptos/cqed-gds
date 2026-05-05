@@ -429,9 +429,11 @@ class GroupSweepDialog(QDialog):
             if design.get(cid) is not None
         ]
 
-        # Detect cell mode: the group was merged from parametric cells
+        # Detect cell mode: the group was merged from parametric cells.
+        # _cell_subgroups now includes non-cell (plain) entries too, so check
+        # that at least one entry has a real cell_id before entering cell mode.
         self._cell_subgroups: list = getattr(group, "_cell_subgroups", [])
-        self._is_cell_mode: bool   = bool(self._cell_subgroups)
+        self._is_cell_mode: bool   = any(sg.get("cell_id") for sg in self._cell_subgroups)
 
         self.setWindowTitle("Group Array / Parameter Sweep")
         self.setMinimumWidth(480)
@@ -497,8 +499,10 @@ class GroupSweepDialog(QDialog):
         self._target_combo.setStyleSheet(_combo_style())
 
         if self._is_cell_mode:
-            # One entry per cell sub-group descriptor
+            # One entry per cell sub-group descriptor (skip plain/passthrough entries)
             for i, sg in enumerate(self._cell_subgroups):
+                if not sg.get("cell_id"):
+                    continue   # passthrough non-cell entry — not a sweep target
                 cdef = CELL_BY_ID.get(sg["cell_id"])
                 label = sg["name"] if sg["name"] else (cdef.name if cdef else sg["cell_id"])
                 self._target_combo.addItem(label, i)   # data = subgroup index

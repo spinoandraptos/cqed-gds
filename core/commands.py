@@ -325,22 +325,39 @@ class MergeGroups(Command):
         # component fields (width/height/layer) when the merged group contains
         # parametric cells.
         #
-        # _cell_subgroups is a list of dicts, one per source group that was a
-        # parametric cell (has cell_id).  Each entry has:
+        # _cell_subgroups is a list of dicts, one per source group (cell OR
+        # plain regular group) plus one extra "loose" entry for any
+        # extra_comp_ids that weren't in any source group.  Each entry has:
         #   "name"        — display name (e.g. "ByiskJJ (2.0×2.0µm)")
-        #   "cell_id"     — catalogue key (e.g. "square_node")
-        #   "cell_params" — dict of µm-space parameter values at merge time
-        #   "member_ids"  — list of component IDs that belong to this sub-cell
-        self._merged._cell_subgroups = [
-            {
-                "name":       snap.name,
-                "cell_id":    getattr(snap, "cell_id", None),
+        #   "cell_id"     — catalogue key, or None for plain/regular groups
+        #   "cell_params" — dict of µm-space parameter values (empty for plain)
+        #   "member_ids"  — list of component IDs that belong to this sub-group
+        #
+        # Non-cell entries (cell_id=None) are treated as passthrough in the
+        # sweep loop — they are deep-copied and translated but never rebuilt
+        # via place_cell().  This ensures regular items in a mixed merge group
+        # are not silently dropped during a sweep.
+        subgroups: list = []
+        for snap in self._source_snapshots:
+            subgroups.append({
+                "name":        snap.name,
+                "cell_id":     getattr(snap, "cell_id", None),
                 "cell_params": dict(getattr(snap, "_cell_params", {})),
-                "member_ids": list(snap.member_ids),
-            }
-            for snap in self._source_snapshots
-            if getattr(snap, "cell_id", None)
-        ]
+                "member_ids":  list(snap.member_ids),
+            })
+        # Loose components that were not part of any source group
+        if extra_comp_ids:
+            already_covered = {cid for snap in self._source_snapshots
+                               for cid in snap.member_ids}
+            loose = [cid for cid in extra_comp_ids if cid not in already_covered]
+            if loose:
+                subgroups.append({
+                    "name":        "(loose)",
+                    "cell_id":     None,
+                    "cell_params": {},
+                    "member_ids":  loose,
+                })
+        self._merged._cell_subgroups = subgroups
 
     def execute(self, design: DesignScene) -> None:
         # Dissolve every source group
