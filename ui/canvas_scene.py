@@ -411,111 +411,48 @@ class GroupItem(QGraphicsItem):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._editing:
             self._scene_ref.group_selected.emit(self._group.id)
-            # Select the group if not already selected
-            if not self.isSelected():
+            modifiers = event.modifiers()
+            multi_mod = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
+                                          Qt.KeyboardModifier.ShiftModifier))
+            if multi_mod:
+                self.setSelected(not self.isSelected())
+            elif not self.isSelected():
+                self._scene_ref.clearSelection()
                 self.setSelected(True)
-            # Always arm drag on the first press — don't require a second click
-            self._drag_start    = event.scenePos()
-            self._last_drag_pos = event.scenePos()
-            self._total_dx      = 0
-            self._total_dy      = 0
-            self._snap_adjust   = None
+            # else: already selected — keep existing multi-selection for drag
+
+            # Always delegate drag to the scene-level unified drag system.
+            # This handles: single group, multiple groups, and mixed
+            # component+group selections in one consistent code path.
+            self._scene_ref._on_group_press(self, event)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        if self._drag_start is None or self._editing:
+        # All drag movement is driven at the scene level by _on_unified_move.
+        # Qt's mouse grabber is this GroupItem, so we forward to the scene
+        # explicitly — the scene's own mouseMoveEvent is bypassed during a
+        # GroupItem drag.
+        if self._scene_ref._unified_drag_active:
+            self._scene_ref._on_unified_move(event)
+            event.accept()
+            return
+        if self._editing:
             super().mouseMoveEvent(event)
             return
-
-        # Incremental delta since last frame — move members live
-        cur  = event.scenePos()
-        dx   = int(round(cur.x() - self._last_drag_pos.x()))
-        dy   = int(round(cur.y() - self._last_drag_pos.y()))
-
-        if dx != 0 or dy != 0:
-            for cid in self._group.member_ids:
-                comp = self._scene_ref._design.get(cid)
-                if comp:
-                    comp.move_by(dx, dy)
-            # Sync Qt items immediately — no full _on_model_changed needed
-            for cid in self._group.member_ids:
-                item = self._scene_ref._items.get(cid)
-                if item:
-                    item.sync_from_model()
-                    item.refresh_connection_state(self._scene_ref._design)
-
-            self._total_dx      += dx
-            self._total_dy      += dy
-            self._last_drag_pos  = cur
-
-            # Invalidate group border so it redraws at new position
-            self.prepareGeometryChange()
-
-        # ── Port snap probe (runs every move, zero-cost when no near port) ────
-        self._scene_ref.clear_all_port_highlights()
-        snap = self._scene_ref.find_group_port_snap(self._group)
-        if snap:
-            self._snap_adjust = (snap[0], snap[1])   # extra_dx, extra_dy
-            my_comp_id, my_port_id, their_comp_id, their_port_id = snap[2:]
-            my_item    = self._scene_ref._items.get(my_comp_id)
-            their_item = self._scene_ref._items.get(their_comp_id)
-            if my_item:
-                my_item.set_port_active(my_port_id, True)
-            if their_item:
-                their_item.set_port_active(their_port_id, True)
-        else:
-            self._snap_adjust = None
-
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._drag_start is not None
-                and not self._editing):
-
-            self._scene_ref.clear_all_port_highlights()
-
-            total_dx = self._total_dx
-            total_dy = self._total_dy
-
-            # Incorporate any snap nudge into the total displacement
-            snap_adjust = self._snap_adjust
-            if snap_adjust:
-                total_dx += snap_adjust[0]
-                total_dy += snap_adjust[1]
-
-            if total_dx != 0 or total_dy != 0:
-                # Sever any existing connections on group members before moving.
-                # This clears stale indicators whether or not a new snap is found.
-                for cid in self._group.member_ids:
-                    self._scene_ref.disconnect_component(cid)
-
-                # Reverse only the live-dragged portion — snap nudge was never
-                # applied to the model, so only undo _total_dx / _total_dy
-                for cid in self._group.member_ids:
-                    comp = self._scene_ref._design.get(cid)
-                    if comp:
-                        comp.move_by(-self._total_dx, -self._total_dy)
-
-                self._scene_ref.cmd_stack.execute(
-                    MoveGroup(self._group.id, total_dx, total_dy)
-                )
-
-            # Wire snapped ports via undo-aware commands
-            if snap_adjust:
-                self._scene_ref._try_connect_group_snap(self._group)
-
-            self._drag_start    = None
-            self._last_drag_pos = None
-            self._total_dx      = 0
-            self._total_dy      = 0
-            self._snap_adjust   = None
+        # All drag release is handled at the scene level by _on_unified_release.
+        if self._scene_ref._unified_drag_active:
+            self._scene_ref._on_unified_release(event)
             event.accept()
             return
-
-        super().mouseReleaseEvent(event)
+        if self._editing:
+            super().mouseReleaseEvent(event)
+            return
+        event.accept()
 
     def mouseDoubleClickEvent(self, event) -> None:
         self.enter_edit_mode()
@@ -817,11 +754,16 @@ class CanvasScene(QGraphicsScene):
         # Used by paste() to place content under the cursor.
         self._cursor_scene_pos: QPointF = QPointF(0, 0)
 
-        # ── Drag state (managed at scene level) ───────────────────────────────
-        self._drag_start:     Optional[QPointF] = None
-        self._orig_positions: dict              = {}   # ComponentItem → Point
-        self._drag_committed: bool              = False
-        self._snap_offset:    Optional[Point]   = None
+        # ── Unified drag state ────────────────────────────────────────────────
+        # One system handles everything: single components, multi-component,
+        # single groups, multi-group, and mixed component+group selections.
+        self._drag_start:       Optional[QPointF] = None
+        self._drag_last:        Optional[QPointF] = None
+        self._drag_committed:   bool              = False
+        self._snap_offset:      Optional[Point]   = None
+        # Snapshots: keyed by item, value is the Point origin at drag start
+        self._orig_comp_positions:  dict = {}   # ComponentItem → Point
+        self._orig_group_positions: dict = {}   # group_id      → {comp_id: Point}
 
         # Wire Qt's built-in selection signal so the properties panel clears
         # when the user clicks empty canvas (previously this was never connected).
@@ -1170,7 +1112,34 @@ class CanvasScene(QGraphicsScene):
                 super().mousePressEvent(event)
                 return
             else:
-                # Empty canvas — clear selection unless modifier held,
+                # Check whether a GroupItem sits under the cursor.
+                # If so, let super() deliver the event directly to it —
+                # GroupItem.mousePressEvent owns selection management for
+                # groups and will call _arm_unified_drag preserving whatever
+                # ComponentItems are already selected.
+                # DO NOT call clearSelection() here: that would wipe the
+                # ComponentItems out of the selection before GroupItem sees
+                # the event, breaking mixed-selection drag when the user
+                # initiates the drag by clicking the group border/label.
+                transform = self.views()[0].transform() if self.views() else QTransform()
+                hit = self.itemAt(event.scenePos(), transform)
+                hit_group = None
+                candidate = hit
+                while candidate is not None:
+                    if isinstance(candidate, GroupItem):
+                        hit_group = candidate
+                        break
+                    candidate = candidate.parentItem()
+
+                if hit_group is not None and not hit_group.is_editing:
+                    # A GroupItem was clicked — let it handle selection and drag.
+                    # Do NOT clear selection here; GroupItem.mousePressEvent
+                    # preserves the multi-selection when the group is already
+                    # selected (the else-already-selected branch).
+                    super().mousePressEvent(event)
+                    return
+
+                # Truly empty canvas — clear selection unless modifier held,
                 # then let super() start a rubber-band drag.
                 modifiers = event.modifiers()
                 multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
@@ -1193,19 +1162,25 @@ class CanvasScene(QGraphicsScene):
         elif self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             self._update_ghost_edge(snapped)
 
-        # Drive multi-select drag from the scene so ALL selected items move,
-        # regardless of which single item Qt delivered the press to.
-        if self._drag_start is not None and self._orig_positions:
-            self._on_item_move(event)
+        # Drive the unified drag for component-initiated drags.
+        # (Group-initiated drags are forwarded here from GroupItem.mouseMoveEvent
+        #  because Qt delivers move events to the mouse grabber, not the scene.)
+        if self._unified_drag_active and (self._orig_comp_positions or self._orig_group_positions):
+            self._on_unified_move(event)
 
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if (event.button() == Qt.MouseButton.LeftButton
-                and self._drag_start is not None and self._orig_positions):
-            self._on_item_release(event)
-            return
+        if event.button() == Qt.MouseButton.LeftButton:
+            if self._unified_drag_active and (self._orig_comp_positions or self._orig_group_positions):
+                self._on_unified_release(event)
+                return
         super().mouseReleaseEvent(event)
+
+    # ── Legacy alias (kept so any external call sites still compile) ─────────
+    def _selected_group_count(self) -> int:
+        return sum(1 for i in self.selectedItems()
+                   if isinstance(i, GroupItem) and not i.is_editing)
 
     def _on_item_press(self, item: "ComponentItem", event) -> None:
         """Called by ComponentItem.mousePressEvent — handles select + drag arm."""
@@ -1227,15 +1202,7 @@ class CanvasScene(QGraphicsScene):
         finally:
             self.blockSignals(False)
 
-        # Snapshot origins of everything currently selected
-        self._drag_start     = event.scenePos()
-        self._drag_committed = False
-        self._snap_offset    = None
-        self._orig_positions = {
-            i: Point(i._comp.origin.x, i._comp.origin.y)
-            for i in self.selectedItems()
-            if isinstance(i, ComponentItem)
-        }
+        self._arm_unified_drag(event)
 
         # Fire selection signal once, cleanly, after we're done
         comp_items = [i for i in self.selectedItems() if isinstance(i, ComponentItem)]
@@ -1246,9 +1213,57 @@ class CanvasScene(QGraphicsScene):
         else:
             self.multi_selection_changed.emit([i.component.id for i in comp_items])
 
+    def _on_group_press(self, gi: "GroupItem", event) -> None:
+        """Called by GroupItem.mousePressEvent — arms unified drag from a group press."""
+        self._arm_unified_drag(event)
+
+    def _arm_unified_drag(self, event) -> None:
+        """
+        Snapshot origins for ALL currently selected items — both ComponentItems
+        and GroupItems — so the unified move handler can drive them together.
+        """
+        self._drag_start     = event.scenePos()
+        self._drag_last      = event.scenePos()
+        self._drag_committed = False
+        self._snap_offset    = None
+
+        self._orig_comp_positions = {
+            i: Point(i._comp.origin.x, i._comp.origin.y)
+            for i in self.selectedItems()
+            if isinstance(i, ComponentItem)
+        }
+        self._orig_group_positions = {}
+        for gi in self.selectedItems():
+            if not isinstance(gi, GroupItem) or gi.is_editing:
+                continue
+            origins = {}
+            for cid in gi.group.member_ids:
+                comp = self._design.get(cid)
+                if comp:
+                    origins[cid] = Point(comp.origin.x, comp.origin.y)
+            self._orig_group_positions[gi.group.id] = origins
+
     def _on_item_move(self, event) -> None:
-        """Called by ComponentItem.mouseMoveEvent during drag."""
-        if self._drag_start is None or not self._orig_positions:
+        """Legacy entry point — routes to unified handler."""
+        self._on_unified_move(event)
+
+    def _on_item_release(self, event) -> None:
+        """Legacy entry point — routes to unified handler."""
+        self._on_unified_release(event)
+
+    @property
+    def _unified_drag_active(self) -> bool:
+        """True while a unified drag gesture (any item type) is in progress."""
+        return self._drag_start is not None
+
+    def _on_unified_move(self, event) -> None:
+        """
+        Move ALL selected items — ComponentItems and GroupItems — together.
+        Called from scene.mouseMoveEvent (component drag) and
+        GroupItem.mouseMoveEvent (which forwards here because Qt delivers
+        move events to the mouse-grabbing item, not the scene).
+        """
+        if self._drag_start is None:
             return
         delta = event.scenePos() - self._drag_start
         if not self._drag_committed:
@@ -1256,7 +1271,8 @@ class CanvasScene(QGraphicsScene):
                 return
             self._drag_committed = True
 
-        for item, orig in self._orig_positions.items():
+        # ── Move standalone ComponentItems ────────────────────────────────────
+        for item, orig in self._orig_comp_positions.items():
             new_x = orig.x + int(round(delta.x()))
             new_y = orig.y + int(round(delta.y()))
             dx = new_x - item._comp.origin.x
@@ -1265,11 +1281,35 @@ class CanvasScene(QGraphicsScene):
                 item._comp.move_by(dx, dy)
                 item.sync_from_model()
 
+        # ── Move GroupItem members ─────────────────────────────────────────────
+        for group_id, origins in self._orig_group_positions.items():
+            group = self._design.get_group(group_id)
+            if not group:
+                continue
+            for cid, orig in origins.items():
+                comp = self._design.get(cid)
+                if comp:
+                    new_x = orig.x + int(round(delta.x()))
+                    new_y = orig.y + int(round(delta.y()))
+                    dx = new_x - comp.origin.x
+                    dy = new_y - comp.origin.y
+                    if dx != 0 or dy != 0:
+                        comp.move_by(dx, dy)
+                        item = self._items.get(cid)
+                        if item:
+                            item.sync_from_model()
+                            item.refresh_connection_state(self._design)
+            gi = self._group_items.get(group_id)
+            if gi:
+                gi.prepareGeometryChange()
+
         self.clear_all_port_highlights()
         self._snap_offset = None
-        if len(self._orig_positions) == 1:
-            item = next(iter(self._orig_positions))
-            orig = self._orig_positions[item]
+
+        # Port snap — only for single-component-only drags
+        if len(self._orig_comp_positions) == 1 and not self._orig_group_positions:
+            item = next(iter(self._orig_comp_positions))
+            orig = self._orig_comp_positions[item]
             tentative = Point(
                 orig.x + int(round(delta.x())),
                 orig.y + int(round(delta.y())),
@@ -1283,30 +1323,41 @@ class CanvasScene(QGraphicsScene):
                 if other:
                     other.set_port_active(their_port_id, True)
 
-    def _on_item_release(self, event) -> None:
+    def _on_unified_release(self, event) -> None:
+        """
+        Commit the unified drag as one BatchCommand covering both component
+        moves and group moves so a single Undo reverses everything together.
+        """
         self.clear_all_port_highlights()
-        if not self._drag_committed or not self._orig_positions:
-            self._drag_start     = None
-            self._orig_positions = {}
-            self._drag_committed = False
-            self._snap_offset    = None
+        has_comp_drag  = bool(self._orig_comp_positions)
+        has_group_drag = bool(self._orig_group_positions)
+
+        if not self._drag_committed or (not has_comp_drag and not has_group_drag):
+            self._drag_start              = None
+            self._drag_last               = None
+            self._orig_comp_positions     = {}
+            self._orig_group_positions    = {}
+            self._drag_committed          = False
+            self._snap_offset             = None
             return
 
         delta = event.scenePos() - self._drag_start
-
-        # ── Build move commands ───────────────────────────────────────────────
         move_cmds = []
-        for item, orig in self._orig_positions.items():
-            if self._snap_offset is not None and len(self._orig_positions) == 1:
+
+        # ── Component move commands ────────────────────────────────────────────
+        snap_item = None
+        for item, orig in self._orig_comp_positions.items():
+            if self._snap_offset is not None and len(self._orig_comp_positions) == 1 and not has_group_drag:
                 final = self._snap_offset
+                snap_item = item
             else:
                 raw   = Point(orig.x + int(round(delta.x())),
-                            orig.y + int(round(delta.y())))
+                              orig.y + int(round(delta.y())))
                 final = self.snap(raw)
 
             # Revert live move so MoveComponent records correct before/after
             item._comp.move_by(orig.x - item._comp.origin.x,
-                            orig.y - item._comp.origin.y)
+                               orig.y - item._comp.origin.y)
 
             if final != orig:
                 self.disconnect_component(item._comp.id)
@@ -1314,34 +1365,57 @@ class CanvasScene(QGraphicsScene):
 
             item.sync_from_model()
 
+        # ── Group move commands ────────────────────────────────────────────────
+        for group_id, origins in self._orig_group_positions.items():
+            group = self._design.get_group(group_id)
+            if not group:
+                continue
+
+            # Compute how far the group actually moved from original origins
+            sample_cid = group.member_ids[0] if group.member_ids else None
+            if sample_cid:
+                comp = self._design.get(sample_cid)
+                orig = origins.get(sample_cid)
+                if comp and orig:
+                    total_dx = int(round(delta.x()))
+                    total_dy = int(round(delta.y()))
+                else:
+                    total_dx = total_dy = 0
+            else:
+                total_dx = total_dy = 0
+
+            # Revert live move so MoveGroup records correct before/after
+            for cid, orig in origins.items():
+                comp = self._design.get(cid)
+                if comp:
+                    comp.move_by(orig.x - comp.origin.x,
+                                 orig.y - comp.origin.y)
+
+            if total_dx != 0 or total_dy != 0:
+                for cid in group.member_ids:
+                    self.disconnect_component(cid)
+                move_cmds.append(MoveGroup(group_id, total_dx, total_dy))
+
         # ── Push as one undo unit ─────────────────────────────────────────────
         if move_cmds:
             if len(move_cmds) == 1:
                 self.cmd_stack.execute(move_cmds[0])
             else:
-                # Wrap in BatchCommand so one Undo reverses all items together
-                from core.commands import BatchCommand
                 self.cmd_stack.execute(
-                    BatchCommand(move_cmds, f"Move {len(move_cmds)} components")
+                    BatchCommand(move_cmds,
+                                 f"Move {len(move_cmds)} items")
                 )
 
-        if self._snap_offset is not None and len(self._orig_positions) == 1:
-            item = next(iter(self._orig_positions))
-            self._try_connect_snapped(item._comp, self._snap_offset)
+        # Port snap connect — only for single-component drags
+        if snap_item is not None and self._snap_offset is not None:
+            self._try_connect_snapped(snap_item._comp, self._snap_offset)
 
-        self._drag_start     = None
-        self._orig_positions = {}
-        self._drag_committed = False
-        self._snap_offset    = None
-
-        if self._snap_offset is not None and len(self._orig_positions) == 1:
-            item = next(iter(self._orig_positions))
-            self._try_connect_snapped(item._comp, self._snap_offset)
-
-        self._drag_start     = None
-        self._orig_positions = {}
-        self._drag_committed = False
-        self._snap_offset    = None
+        self._drag_start              = None
+        self._drag_last               = None
+        self._orig_comp_positions     = {}
+        self._orig_group_positions    = {}
+        self._drag_committed          = False
+        self._snap_offset             = None
 
     def keyPressEvent(self, event) -> None:
         key  = event.key()
