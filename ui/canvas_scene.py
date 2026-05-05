@@ -1306,7 +1306,7 @@ class CanvasScene(QGraphicsScene):
         self.clear_all_port_highlights()
         self._snap_offset = None
 
-        # Port snap — only for single-component-only drags
+        # Port snap — single component-only drag
         if len(self._orig_comp_positions) == 1 and not self._orig_group_positions:
             item = next(iter(self._orig_comp_positions))
             orig = self._orig_comp_positions[item]
@@ -1322,6 +1322,23 @@ class CanvasScene(QGraphicsScene):
                 other = self.item_for(their_comp_id)
                 if other:
                     other.set_port_active(their_port_id, True)
+
+        # Port snap — single group drag (cells/parametric groups)
+        elif len(self._orig_group_positions) == 1 and not self._orig_comp_positions:
+            group_id = next(iter(self._orig_group_positions))
+            group = self._design.get_group(group_id)
+            if group:
+                snap_result = self.find_group_port_snap(group)
+                if snap_result:
+                    extra_dx, extra_dy, my_comp_id, my_port_id, their_comp_id, their_port_id = snap_result
+                    # Store snap offset as a sentinel tuple for the release handler
+                    self._snap_offset = ("group", group_id, extra_dx, extra_dy)
+                    my_item = self.item_for(my_comp_id)
+                    if my_item:
+                        my_item.set_port_active(my_port_id, True)
+                    other = self.item_for(their_comp_id)
+                    if other:
+                        other.set_port_active(their_port_id, True)
 
     def _on_unified_release(self, event) -> None:
         """
@@ -1347,7 +1364,9 @@ class CanvasScene(QGraphicsScene):
         # ── Component move commands ────────────────────────────────────────────
         snap_item = None
         for item, orig in self._orig_comp_positions.items():
-            if self._snap_offset is not None and len(self._orig_comp_positions) == 1 and not has_group_drag:
+            if (isinstance(self._snap_offset, Point)
+                    and len(self._orig_comp_positions) == 1
+                    and not has_group_drag):
                 final = self._snap_offset
                 snap_item = item
             else:
@@ -1366,6 +1385,7 @@ class CanvasScene(QGraphicsScene):
             item.sync_from_model()
 
         # ── Group move commands ────────────────────────────────────────────────
+        snapped_group_id = None
         for group_id, origins in self._orig_group_positions.items():
             group = self._design.get_group(group_id)
             if not group:
@@ -1383,6 +1403,15 @@ class CanvasScene(QGraphicsScene):
                     total_dx = total_dy = 0
             else:
                 total_dx = total_dy = 0
+
+            # If a group snap was active, add the extra nudge to land flush
+            if (isinstance(self._snap_offset, tuple)
+                    and self._snap_offset[0] == "group"
+                    and self._snap_offset[1] == group_id):
+                _, _, extra_dx, extra_dy = self._snap_offset
+                total_dx += extra_dx
+                total_dy += extra_dy
+                snapped_group_id = group_id
 
             # Revert live move so MoveGroup records correct before/after
             for cid, orig in origins.items():
@@ -1406,9 +1435,15 @@ class CanvasScene(QGraphicsScene):
                                  f"Move {len(move_cmds)} items")
                 )
 
-        # Port snap connect — only for single-component drags
-        if snap_item is not None and self._snap_offset is not None:
+        # Port snap connect — single component drag
+        if snap_item is not None and isinstance(self._snap_offset, Point):
             self._try_connect_snapped(snap_item._comp, self._snap_offset)
+
+        # Port snap connect — single group drag
+        if snapped_group_id is not None:
+            group = self._design.get_group(snapped_group_id)
+            if group:
+                self._try_connect_group_snap(group)
 
         self._drag_start              = None
         self._drag_last               = None

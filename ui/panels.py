@@ -623,6 +623,7 @@ class PropertiesPanel(QWidget):
         self._current_comp_id  = None
         self._current_group_id = None
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
+            self._cell_params_widget.hide()
             self._cell_params_widget.setParent(None)
             self._cell_params_widget.deleteLater()
             self._cell_params_widget = None
@@ -740,8 +741,12 @@ class PropertiesPanel(QWidget):
         render an editable parameter section above the member cards.
         Otherwise hides the section cleanly.
         """
-        # Clear any existing params widget
+        # Clear any existing params widget.
+        # IMPORTANT: hide() before setParent(None) — otherwise Qt briefly
+        # promotes the widget to a top-level window between reparenting and
+        # deleteLater(), which causes a visible flash/popup on every selection.
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
+            self._cell_params_widget.hide()
             self._cell_params_widget.setParent(None)
             self._cell_params_widget.deleteLater()
             self._cell_params_widget = None
@@ -841,6 +846,10 @@ class PropertiesPanel(QWidget):
                     combo.setCurrentText(str(current_val))
                     combo.setFixedWidth(110)
                     combo.setStyleSheet(spin_style)
+                    # NoFocus prevents the combo from grabbing focus when the
+                    # panel is rebuilt on selection change, which was causing
+                    # the dropdown to pop open immediately on every cell click.
+                    combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                     combo.currentTextChanged.connect(
                         lambda val, _k=key, _gid=group_id, _cid=cell_id:
                             self.cell_param_change_requested.emit(_gid, _cid, _k, val)

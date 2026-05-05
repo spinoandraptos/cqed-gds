@@ -207,6 +207,36 @@ class CellSweepDialog(QDialog):
         self.accept()
 
 
+class _RemoveGroup:
+    """
+    Minimal undo-able command to remove a group record from the design.
+    Used by _delete_selected so group deletion is undoable as part of
+    a BatchCommand alongside RemoveComponent.
+    """
+    def __init__(self, group) -> None:
+        # Reconstruct explicitly — shallow copy would share the member_ids list
+        self._group = ComponentGroup(
+            name=group.name,
+            member_ids=list(group.member_ids),
+            id=group.id,
+        )
+        # Preserve any dynamic attrs (cell_id, _cell_params) so undo restores
+        # parametric cell metadata correctly
+        for attr in ("cell_id", "_cell_params"):
+            if hasattr(group, attr):
+                setattr(self._group, attr, getattr(group, attr))
+
+    def execute(self, design) -> None:
+        design.remove_group(self._group.id)
+
+    def undo(self, design) -> None:
+        design.add_group(self._group)
+
+    @property
+    def description(self) -> str:
+        return f"Remove group '{self._group.name}'"
+
+
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
@@ -460,7 +490,7 @@ class MainWindow(QMainWindow):
         self._scene.connections_changed.connect(self._refresh_props_for_selection)
         self._scene.group_edit_entered.connect(
             lambda gid: self._flash_status(
-                f"Editing group — click outside to exit", ms=0
+                "Editing group — click outside to exit", ms=2500
             )
         )
         self._scene.group_edit_exited.connect(
@@ -871,18 +901,47 @@ class MainWindow(QMainWindow):
         self._scene.duplicate_selection()
 
     def _delete_selected(self) -> None:
-        from core.commands import RemoveComponent
-        selected = [
-            item.component
-            for item in self._scene.selectedItems()
-            if hasattr(item, "component")
-        ]
-        for comp in selected:
-            self._scene.cmd_stack.execute(RemoveComponent(comp))
-        if selected:
-            self._flash_status(
-                f"Deleted {len(selected)} component{'s' if len(selected) > 1 else ''}"
+        from core.commands import RemoveComponent, BatchCommand
+        from ui.canvas_scene import GroupItem
+
+        sel = self._scene.selectedItems()
+        cmds = []
+        deleted_comp_ids: set = set()   # guard against double-delete of group members
+
+        # ── Delete selected groups (group record + all member components) ──────
+        for item in sel:
+            if not isinstance(item, GroupItem):
+                continue
+            group = item.group
+            cmds.append(_RemoveGroup(group))
+            for cid in group.member_ids:
+                if cid not in deleted_comp_ids:
+                    comp = self._design.get(cid)
+                    if comp:
+                        cmds.append(RemoveComponent(comp))
+                        deleted_comp_ids.add(cid)
+
+        # ── Delete loose selected ComponentItems not already covered above ─────
+        for item in sel:
+            if not hasattr(item, "component"):
+                continue
+            comp = item.component
+            if comp.id not in deleted_comp_ids:
+                cmds.append(RemoveComponent(comp))
+                deleted_comp_ids.add(comp.id)
+
+        if not cmds:
+            return
+
+        if len(cmds) == 1:
+            self._scene.cmd_stack.execute(cmds[0])
+        else:
+            self._scene.cmd_stack.execute(
+                BatchCommand(cmds, f"Delete {len(deleted_comp_ids)} item(s)")
             )
+        self._flash_status(
+            f"Deleted {len(deleted_comp_ids)} item{'s' if len(deleted_comp_ids) != 1 else ''}"
+        )
 
     # ── File actions ──────────────────────────────────────────────────────────
     def _new_design(self) -> None:
