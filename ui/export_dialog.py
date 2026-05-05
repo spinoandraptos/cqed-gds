@@ -277,6 +277,12 @@ class ExportResultDialog(QDialog):
 
     def _open_klayout(self) -> None:
         try:
-            subprocess.Popen(["klayout", self._path])
+            import os
+            subprocess.Popen(
+                ["klayout", self._path],
+                close_fds=True,          # don't leak Qt's X11/ICE sockets
+                start_new_session=True,  # setsid() — detach from our process group
+                env=os.environ.copy(),   # pass DISPLAY, XAUTHORITY, etc. through
+            )
         except Exception as exc:
             QMessageBox.warning(self, "KLayout", f"Could not launch KLayout:\n{exc}")
