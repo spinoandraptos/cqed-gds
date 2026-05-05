@@ -60,9 +60,39 @@ class CanvasView(QGraphicsView):
         self._space_held       = False
         self._current_zoom     = 1.0       # px per DBU unit
         self._rubber_banding   = False     # True while an empty-canvas drag is live
+        self._had_items        = False     # flips True after the first item lands
 
         self._setup_view()
         self._fit_all()
+
+        # Auto-fit when the very first component is placed so it's immediately
+        # visible at a comfortable zoom. scene_changed fires after every model
+        # mutation; we disconnect after the first non-empty canvas so we never
+        # fight the user's subsequent zoom choices.
+        if hasattr(scene, "scene_changed"):
+            scene.scene_changed.connect(self._on_scene_changed_first_item)
+
+    # ── First-item auto-fit ───────────────────────────────────────────────────
+
+    def _on_scene_changed_first_item(self) -> None:
+        """
+        Called on every scene_changed until the canvas has items.
+        On the first change that produces a non-empty bounding rect, zoom-to-fit
+        so the newly placed component is centred and clearly visible, then
+        disconnect — we must never override the user's zoom after that.
+        """
+        if self._had_items:
+            return
+        items_rect = self.scene().itemsBoundingRect()
+        if items_rect.isNull() or items_rect.isEmpty():
+            return
+        self._had_items = True
+        self._fit_all()
+        # Disconnect: user is now in control of zoom
+        try:
+            self.scene().scene_changed.disconnect(self._on_scene_changed_first_item)
+        except (RuntimeError, TypeError):
+            pass  # already disconnected or scene gone — safe to ignore
 
     # ── Setup ─────────────────────────────────────────────────────────────────
 
@@ -93,10 +123,16 @@ class CanvasView(QGraphicsView):
         self.setAcceptDrops(True)
 
     def _fit_all(self) -> None:
-        """Zoom-to-fit all items on the canvas, or a default rect if empty."""
+        """Zoom-to-fit all items on the canvas, or a default rect if empty.
+
+        Empty canvas uses a tight 50×50 µm working area centred on the origin
+        so the first dropped component is immediately visible at a comfortable
+        zoom rather than the full scene extent (which makes a 2 µm shape a
+        single pixel).
+        """
         items_rect = self.scene().itemsBoundingRect()
         if items_rect.isNull() or items_rect.isEmpty():
-            ext = um_to_dbu(200)
+            ext = um_to_dbu(25)   # ±25 µm → 50×50 µm window
             fit_rect = QRectF(-ext, -ext, ext * 2, ext * 2)
         else:
             # Add 10% padding on each side so shapes aren't flush to the edge
