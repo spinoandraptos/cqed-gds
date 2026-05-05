@@ -294,11 +294,17 @@ class MergeGroups(Command):
         extra_comp_ids: List[str],
         name: str,
     ) -> None:
-        # Snapshot source groups so undo can recreate them exactly
-        self._source_snapshots: List[ComponentGroup] = [
-            ComponentGroup(name=g.name, member_ids=list(g.member_ids), id=g.id)
-            for g in source_groups
-        ]
+        # Snapshot source groups so undo can recreate them exactly, preserving
+        # all dynamic attrs (cell_id, _cell_params) so undo restores parametric
+        # cell metadata and the sweep dialog can recover it after undo.
+        self._source_snapshots: List[ComponentGroup] = []
+        for g in source_groups:
+            snap = ComponentGroup(name=g.name, member_ids=list(g.member_ids), id=g.id)
+            for attr in ("cell_id", "_cell_params"):
+                if hasattr(g, attr):
+                    setattr(snap, attr, getattr(g, attr))
+            self._source_snapshots.append(snap)
+
         # Flat union of all member IDs (preserves order, deduplicates)
         seen: set = set()
         flat_ids: List[str] = []
@@ -314,11 +320,33 @@ class MergeGroups(Command):
 
         self._merged = ComponentGroup(name=name, member_ids=flat_ids)
 
+        # Store cell sub-group descriptors so GroupSweepDialog can expose
+        # cell-level parameters (square_x, lead_width, …) rather than raw
+        # component fields (width/height/layer) when the merged group contains
+        # parametric cells.
+        #
+        # _cell_subgroups is a list of dicts, one per source group that was a
+        # parametric cell (has cell_id).  Each entry has:
+        #   "name"        — display name (e.g. "ByiskJJ (2.0×2.0µm)")
+        #   "cell_id"     — catalogue key (e.g. "square_node")
+        #   "cell_params" — dict of µm-space parameter values at merge time
+        #   "member_ids"  — list of component IDs that belong to this sub-cell
+        self._merged._cell_subgroups = [
+            {
+                "name":       snap.name,
+                "cell_id":    getattr(snap, "cell_id", None),
+                "cell_params": dict(getattr(snap, "_cell_params", {})),
+                "member_ids": list(snap.member_ids),
+            }
+            for snap in self._source_snapshots
+            if getattr(snap, "cell_id", None)
+        ]
+
     def execute(self, design: DesignScene) -> None:
         # Dissolve every source group
         for snap in self._source_snapshots:
             design.remove_group(snap.id)
-        # Add the flat merged group
+        # Add the flat merged group (carries _cell_subgroups set in __init__)
         design.add_group(self._merged)
 
     def undo(self, design: DesignScene) -> None:
@@ -752,3 +780,75 @@ class CommandStack:
     @property
     def redo_description(self) -> str:
         return self._redo_stack[-1].description if self._redo_stack else ""
+    
+class RemoveGroup:
+    """
+    Minimal undo-able command to remove a group record from the design.
+    Used by _delete_selected so group deletion is undoable as part of
+    a BatchCommand alongside RemoveComponent.
+    """
+    def __init__(self, group) -> None:
+        # Reconstruct explicitly — shallow copy would share the member_ids list
+        self._group = ComponentGroup(
+            name=group.name,
+            member_ids=list(group.member_ids),
+            id=group.id,
+        )
+        # Preserve any dynamic attrs (cell_id, _cell_params) so undo restores
+        # parametric cell metadata correctly
+        for attr in ("cell_id", "_cell_params"):
+            if hasattr(group, attr):
+                setattr(self._group, attr, getattr(group, attr))
+
+    def execute(self, design) -> None:
+        design.remove_group(self._group.id)
+
+    def undo(self, design) -> None:
+        design.add_group(self._group)
+
+    @property
+    def description(self) -> str:
+        return f"Remove group '{self._group.name}'"
+    
+class ReplaceCellCmd:
+    """Atomic remove-old + place-new, fully undo-able."""
+    def __init__(self, design_ref, scene_ref, new_result, cdef, param_key, cell_id, params,
+                 old_group_id, old_group_name, old_comp_ids, old_comps):
+        self._design = design_ref
+        self._scene  = scene_ref
+        self.cdef = cdef
+        self.param_key = param_key
+        self.params = params
+        self._old_group_id = old_group_id
+        self._old_group_name = old_group_name
+        self._old_comp_ids = old_comp_ids
+        self._old_comps = old_comps
+        self._new_cmd = PlaceCellCommand(new_result, cell_id=cell_id, cell_params=params)
+
+    @property
+    def description(self):
+        return f"Edit {self.cdef.name} parameter '{self.param_key}'"
+
+    def execute(self, design):
+        # Remove old group + members
+        design.remove_group(self._old_group_id)
+        for cid in self._old_comp_ids:
+            design.remove(cid)
+        # Place rebuilt cell
+        self._new_cmd.execute(design)
+        # Tag new group with param overrides
+        if self._new_cmd._group is not None:
+            self._new_cmd._group._cell_params = self.params
+
+    def undo(self, design):
+        # Undo new placement
+        self._new_cmd.undo(design)
+        # Restore old components
+        for comp in self._old_comps:
+            design.add(comp)
+        old_g = ComponentGroup(
+            name=self._old_group_name,
+            member_ids=self._old_comp_ids,
+            id=self._old_group_id,
+        )
+        design.add_group(old_g)

@@ -1,91 +1,88 @@
 """
 ui/canvas_scene.py — QGraphicsScene subclass.
 
-Phase 2 additions over Phase 1:
-  - PlacementMode enum: SELECT | PLACE_RECT | PLACE_POLYGON | PLACE_PATH
-  - ComponentItem factory: dispatches rect/polygon/path Qt item per kind
-  - Ghost preview items during placement (rubber-band rect, live polygon outline)
-  - Click-to-place for rect (single click stamps it, stay in mode for rapid place)
-  - Click-per-vertex for polygon (double-click or Enter closes, ESC cancels)
-  - Click-per-vertex for path (Enter commits open polyline, ESC cancels)
-  - mode_changed signal drives status bar text and cursor in the view
+Coordinate convention: 1 scene unit = 1 DBU (nm). Y-axis is NOT flipped here;
+the GDS flip happens at export only.
 
-Coordinate convention (unchanged from Phase 1):
-  1 scene unit = 1 DBU (nm). Y-axis NOT flipped — GDS flip at export only.
+Placement modes
+---------------
+SELECT        — default; clicks select / drag items.
+PLACE_RECT    — single click stamps a rectangle; mode persists for rapid placement.
+PLACE_POLYGON — click per vertex; double-click or Enter closes; ESC cancels.
+PLACE_PATH    — click per vertex; Enter commits open polyline; ESC cancels.
+
+Drag system
+-----------
+A single unified drag handler (_arm_unified_drag / _on_unified_move /
+_on_unified_release) covers standalone components, multi-component, single
+groups, multi-group, and mixed component+group selections.
 """
 
 from __future__ import annotations
 
 import math
+from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Dict, List, Optional
 
-from PyQt6.QtCore import Qt, QRectF, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal
 from PyQt6.QtGui import (
-    QPen, QBrush, QColor, QPainter, QPolygonF, QPainterPath, QTransform
+    QBrush, QColor, QPainter, QPainterPath, QPen, QPolygonF, QTransform,
 )
 from PyQt6.QtWidgets import (
-    QGraphicsScene, QGraphicsItem,
-    QGraphicsRectItem, QGraphicsPolygonItem, QGraphicsPathItem,
-    QGraphicsEllipseItem, QGraphicsLineItem,
+    QGraphicsEllipseItem, QGraphicsItem, QGraphicsLineItem,
+    QGraphicsPathItem, QGraphicsPolygonItem, QGraphicsRectItem, QGraphicsScene,
 )
 
-from dataclasses import dataclass, field
-
-from core.model import (
-    DesignScene, GDSComponent, ComponentKind,
-    Point, Port, PortSide, dbu_to_um, um_to_dbu, ComponentGroup
-)
+from core.cell_library import place_cell
+from core.clipboard import Clipboard
 from core.commands import (
-    CommandStack, AddComponent, MoveComponent,
-    ConnectPorts, DisconnectPorts,
-    MoveGroup, BatchCommand,
+    AddComponent, BatchCommand, CommandStack, ConnectPorts, DisconnectPorts,
+    MoveComponent, MoveGroup, PasteComponents, PlaceCellCommand,
     RotateComponent, RotateGroup,
-    PasteComponents,
+)
+from core.model import (
+    ComponentGroup, ComponentKind, DesignScene, GDSComponent,
+    Point, Port, PortSide, dbu_to_um, um_to_dbu,
 )
 from ui.theme import Colors
-from core.cell_library import place_cell
-from core.commands import PlaceCellCommand
-from core.clipboard import Clipboard
 
 
-# ── Constants ─────────────────────────────────────────────────────────────────
+# ── Scene constants ────────────────────────────────────────────────────────────
 
-GRID_MINOR_DBU  = um_to_dbu(0.1)
-GRID_MAJOR_DBU  = um_to_dbu(10)
-SCENE_EXTENT    = um_to_dbu(5_000)
-DEFAULT_W_DBU   = um_to_dbu(2)    # was um_to_dbu(10)
-DEFAULT_H_DBU   = um_to_dbu(0.2)  # was um_to_dbu(5)
-DEFAULT_PW_DBU  = um_to_dbu(1)
-MIN_POLY_PTS    = 3
-VERTEX_DOT_R    = um_to_dbu(0.4)
-PORT_SNAP_RADIUS = um_to_dbu(1)   # snap kicks in within 1 µm
-PASTE_OFFSET_DBU = um_to_dbu(10)  # each paste nudges 10 µm further so pastes don't stack invisibly
+GRID_MINOR_DBU   = um_to_dbu(0.1)
+GRID_MAJOR_DBU   = um_to_dbu(10)
+SCENE_EXTENT     = um_to_dbu(5_000)
+DEFAULT_W_DBU    = um_to_dbu(2)
+DEFAULT_H_DBU    = um_to_dbu(0.2)
+DEFAULT_PW_DBU   = um_to_dbu(1)
+MIN_POLY_PTS     = 3
+VERTEX_DOT_R     = um_to_dbu(0.4)
+PORT_SNAP_RADIUS = um_to_dbu(1)
+PASTE_OFFSET_DBU = um_to_dbu(10)
 
-# Connection edge indicator colours
-_CONN_FILL   = "#4ade80"   # green fill
-_CONN_BORDER = "#166534"   # dark green border
+# Connection indicator colours
+_CONN_FILL   = "#4ade80"
+_CONN_BORDER = "#166534"
 
 
-# ── Placement FSM state ───────────────────────────────────────────────────────
+# ── Placement FSM ─────────────────────────────────────────────────────────────
 
 @dataclass
 class PlacementState:
     """
-    All mutable state belonging to one placement gesture.
+    All mutable state for one placement gesture.
     Replacing with a fresh instance atomically resets everything —
     no risk of a stray ghost or dangling vertex list after cancel.
     """
-    mode:        "PlacementMode" = None          # filled in after enum defined
+    mode:        "PlacementMode" = None
     layer:       int             = 0
-    pts:         list            = field(default_factory=list)   # List[QPointF]
-    ghost_rect:  object          = None          # Optional[QGraphicsRectItem]
-    ghost_poly:  object          = None          # Optional[QGraphicsPolygonItem]
-    ghost_edge:  object          = None          # Optional[QGraphicsLineItem]
-    vertex_dots: list            = field(default_factory=list)   # List[QGraphicsEllipseItem]
+    pts:         list            = field(default_factory=list)
+    ghost_rect:  object          = None
+    ghost_poly:  object          = None
+    ghost_edge:  object          = None
+    vertex_dots: list            = field(default_factory=list)
 
-
-# ── Placement mode ────────────────────────────────────────────────────────────
 
 class PlacementMode(Enum):
     SELECT        = auto()
@@ -103,7 +100,7 @@ class PlacementMode(Enum):
         }[self]
 
 
-# ── Pen / brush helpers ───────────────────────────────────────────────────────
+# ── Pen helper ────────────────────────────────────────────────────────────────
 
 def _cosmetic(color: str, width: float = 1.0,
               style: Qt.PenStyle = Qt.PenStyle.SolidLine) -> QPen:
@@ -112,18 +109,14 @@ def _cosmetic(color: str, width: float = 1.0,
     return pen
 
 
-# ── Port Graphics Item ────────────────────────────────────────────────────────
+# ── Port graphics item ────────────────────────────────────────────────────────
 
-_PORT_NORMAL  = "#38bdf8"   # teal — idle / visible
-_PORT_ACTIVE  = "#4ade80"   # green — snap candidate
-
-# Screen-space sizes (pixels).  Ports use ItemIgnoresTransformations so these
-# are always exactly this many pixels on screen regardless of zoom level.
+_PORT_NORMAL  = "#38bdf8"
+_PORT_ACTIVE  = "#4ade80"
 _PORT_R_PX    = 4.0    # dot radius in screen pixels
 _PORT_TICK_PX = 8.0    # outward tick length in screen pixels
 
-# Arrow tip offsets per side (unit vectors, pointing outward)
-_ARROW_DIR = {
+_ARROW_DIR: dict[PortSide, tuple[int, int]] = {
     PortSide.NORTH: (0, -1),
     PortSide.SOUTH: (0,  1),
     PortSide.EAST:  (1,  0),
@@ -133,20 +126,16 @@ _ARROW_DIR = {
 
 class PortItem(QGraphicsItem):
     """
-    Fixed screen-size port dot — always 4 px radius, never blocked by zoom.
+    Fixed screen-size port dot — always _PORT_R_PX radius, zoom-immune.
 
     Key design decisions
     --------------------
-    • ItemIgnoresTransformations: the item is positioned in scene space (so it
-      follows the component when it moves) but painted in screen space, so it
-      never grows when the user zooms in.  No more port blobs eating the cell.
-
-    • Visibility gated on parent state: hidden by default; shown only while the
-      parent ComponentItem is hovered or selected, or while the port is the
-      active snap target.  This keeps the canvas clean at a glance.
-
-    • Zero mouse interaction: NoButton + no hover so it never steals clicks from
-      the component beneath it.
+    • ItemIgnoresTransformations: positioned in scene space (moves with
+      the component) but painted in screen space (never grows on zoom-in).
+    • Hidden by default; shown only while the parent ComponentItem is hovered
+      or selected, or while the port is the active snap target.
+    • Zero mouse interaction: NoButton so it never steals clicks from the
+      component beneath it.
     """
 
     def __init__(self, port: Port, origin: Point, parent: QGraphicsItem) -> None:
@@ -156,16 +145,13 @@ class PortItem(QGraphicsItem):
 
         self.setZValue(8)
         self.setAcceptHoverEvents(False)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
-        # Render at a fixed screen size — immune to zoom transforms.
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
         abs_pos = port.abs_pos(origin)
         self.setPos(abs_pos.x, abs_pos.y)
-
-        # Hidden at rest; shown by ComponentItem on hover/select or snap-active.
         self.setVisible(False)
 
     @property
@@ -173,79 +159,61 @@ class PortItem(QGraphicsItem):
         return self._port
 
     def set_active(self, active: bool) -> None:
-        """Highlight this port as the current snap target (shows it regardless of parent state)."""
+        """Highlight as the current snap target; forces visibility while active."""
         if active != self._active:
             self._active = active
             if active:
                 self.setVisible(True)
-            # Visibility when deactivating is restored by set_visible_for_state()
             self.update()
 
     def set_visible_for_state(self, hovered_or_selected: bool) -> None:
-        """Show/hide based on parent component's hover/selection state."""
-        # Always keep visible if actively snapping
+        """Show/hide based on parent component hover/selection state."""
         self.setVisible(hovered_or_selected or self._active)
 
     def boundingRect(self) -> QRectF:
-        # In screen-space (ItemIgnoresTransformations), units ARE pixels.
-        r    = _PORT_R_PX
-        tick = _PORT_TICK_PX
-        dx, dy = _ARROW_DIR[self._port.side]
-        # Bounding rect must cover both the circle and the tick line.
-        min_x = min(-r, dx * tick - 1)
-        min_y = min(-r, dy * tick - 1)
-        max_x = max( r, dx * tick + 1)
-        max_y = max( r, dy * tick + 1)
-        return QRectF(min_x, min_y, max_x - min_x, max_y - min_y)
+        r, tick = _PORT_R_PX, _PORT_TICK_PX
+        dx, dy  = _ARROW_DIR[self._port.side]
+        return QRectF(
+            min(-r, dx * tick - 1),
+            min(-r, dy * tick - 1),
+            max(r, dx * tick + 1) - min(-r, dx * tick - 1),
+            max(r, dy * tick + 1) - min(-r, dy * tick - 1),
+        )
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         color = QColor(_PORT_ACTIVE if self._active else _PORT_NORMAL)
         r     = _PORT_R_PX
 
-        # Filled circle with a crisp 1 px border
+        fill = QColor(color)
+        fill.setAlpha(210)
         pen = QPen(color, 1.0)
         pen.setCosmetic(True)
         painter.setPen(pen)
-        fill = QColor(color)
-        fill.setAlpha(210)
         painter.setBrush(QBrush(fill))
         painter.drawEllipse(QPointF(0.0, 0.0), r, r)
 
-        # Short outward tick — shows directionality without eating real estate
-        dx, dy = _ARROW_DIR[self._port.side]
+        dx, dy   = _ARROW_DIR[self._port.side]
         tick_pen = QPen(color, 1.5)
         tick_pen.setCosmetic(True)
         painter.setPen(tick_pen)
         painter.setBrush(QBrush(Qt.BrushStyle.NoBrush))
         painter.drawLine(
-            QPointF(dx * r, dy * r),                          # circle edge
-            QPointF(dx * _PORT_TICK_PX, dy * _PORT_TICK_PX), # tick tip
+            QPointF(dx * r,         dy * r),
+            QPointF(dx * _PORT_TICK_PX, dy * _PORT_TICK_PX),
         )
 
 
-# ── Connection Edge Indicator ─────────────────────────────────────────────────
+# ── Connection edge indicator ─────────────────────────────────────────────────
 
-# Screen-space pip size — fixed pixels, zoom-immune, unobtrusive.
-_INDICATOR_R_PX   = 3.0   # dot radius in screen pixels
-_INDICATOR_GAP_PX = 6.0   # outward offset from edge so it sits just outside
-
-_ARROW_DIR_INDICATOR = {
-    PortSide.NORTH: (0, -1),
-    PortSide.SOUTH: (0,  1),
-    PortSide.EAST:  (1,  0),
-    PortSide.WEST:  (-1, 0),
-}
+_INDICATOR_R_PX   = 3.0
+_INDICATOR_GAP_PX = 6.0
 
 
 class EdgeIndicatorItem(QGraphicsItem):
     """
-    Tiny fixed-pixel dot sitting just outside the component edge to signal
-    a live connection on that side.
-
-    Uses ItemIgnoresTransformations so it's always _INDICATOR_R_PX regardless
-    of zoom — informational at a glance, never obstructing the view.
-    The item is positioned at the scene-space edge midpoint so it moves with
-    the parent component automatically.
+    Tiny fixed-pixel dot just outside the component edge, signalling a live
+    connection on that side.  Uses ItemIgnoresTransformations — always the same
+    screen size regardless of zoom.
     """
 
     def __init__(self, side: PortSide, bbox_local: QRectF,
@@ -253,86 +221,69 @@ class EdgeIndicatorItem(QGraphicsItem):
         super().__init__(parent)
         self._side = side
         self.setZValue(9)
+        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations, True)
-        self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
-        # Anchor at the scene-space midpoint of the relevant edge.
-        # Paint is then done in screen-space (pixels) around (0, 0).
-        cx = (bbox_local.left() + bbox_local.right())  / 2.0
-        cy = (bbox_local.top()  + bbox_local.bottom()) / 2.0
-        dx, dy = _ARROW_DIR_INDICATOR[side]
-        if side == PortSide.NORTH:
-            self.setPos(cx, bbox_local.top())
-        elif side == PortSide.SOUTH:
-            self.setPos(cx, bbox_local.bottom())
-        elif side == PortSide.WEST:
-            self.setPos(bbox_local.left(), cy)
-        else:  # EAST
-            self.setPos(bbox_local.right(), cy)
+        cx = (bbox_local.left()  + bbox_local.right())  / 2.0
+        cy = (bbox_local.top()   + bbox_local.bottom()) / 2.0
+        pos = {
+            PortSide.NORTH: QPointF(cx,              bbox_local.top()),
+            PortSide.SOUTH: QPointF(cx,              bbox_local.bottom()),
+            PortSide.WEST:  QPointF(bbox_local.left(), cy),
+            PortSide.EAST:  QPointF(bbox_local.right(), cy),
+        }[side]
+        self.setPos(pos)
 
     def boundingRect(self) -> QRectF:
         r = _INDICATOR_R_PX + _INDICATOR_GAP_PX + 2.0
         return QRectF(-r, -r, r * 2, r * 2)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        dx, dy = _ARROW_DIR_INDICATOR[self._side]
-        # Centre the pip just outside the edge
-        cx = dx * _INDICATOR_GAP_PX
-        cy = dy * _INDICATOR_GAP_PX
-        r  = _INDICATOR_R_PX
+        dx, dy = _ARROW_DIR[self._side]
+        cx, cy = dx * _INDICATOR_GAP_PX, dy * _INDICATOR_GAP_PX
+        r      = _INDICATOR_R_PX
 
         fill = QColor(_CONN_FILL)
         fill.setAlpha(180)
-        border = QColor(_CONN_BORDER)
-
-        pen = QPen(border, 1.0)
+        pen = QPen(QColor(_CONN_BORDER), 1.0)
         pen.setCosmetic(True)
         painter.setPen(pen)
         painter.setBrush(QBrush(fill))
         painter.drawEllipse(QPointF(cx, cy), r, r)
 
-# ── Group Graphics Item ───────────────────────────────────────────────────────
 
-_GROUP_BORDER_IDLE     = "#475569"
-_GROUP_BORDER_HOVER    = "#38bdf8"
-_GROUP_BORDER_EDITING  = "#f59e0b"   # amber — editing mode
-_GROUP_BG_ALPHA        = 18          # very faint fill so members show through
+# ── Group graphics item ───────────────────────────────────────────────────────
+
+_GROUP_BORDER_IDLE    = "#475569"
+_GROUP_BORDER_HOVER   = "#38bdf8"
+_GROUP_BORDER_EDITING = "#f59e0b"
+_GROUP_BG_ALPHA       = 18
 
 
 class GroupItem(QGraphicsItem):
     """
     Visual container for a ComponentGroup.
 
-    Drag is handled MANUALLY — ItemIsMovable is never set.
-    During drag we call move_by() on each member directly so they
-    follow in real-time. On release we undo those live moves and
-    re-apply via MoveGroup so the command stack gets one clean entry.
+    Drag is driven manually — ItemIsMovable is never set.  During drag we call
+    move_by() on each member directly so they follow in real-time.  On release
+    we revert those live moves and re-apply via MoveGroup so the command stack
+    gets one clean, undo-able entry.
     """
 
-    def __init__(self, group: "ComponentGroup", scene_ref: "CanvasScene") -> None:
+    def __init__(self, group: ComponentGroup, scene_ref: "CanvasScene") -> None:
         super().__init__()
-        self._group      = group
-        self._scene_ref  = scene_ref
-        self._editing    = False
-
-        # Drag state
-        self._drag_start:    Optional[QPointF] = None
-        self._last_drag_pos: Optional[QPointF] = None   # previous frame position
-        self._total_dx = 0   # accumulated DBU delta this drag gesture
-        self._total_dy = 0
-        self._snap_adjust: Optional[tuple] = None   # (extra_dx, extra_dy) snap nudge
+        self._group     = group
+        self._scene_ref = scene_ref
+        self._editing   = False
 
         self.setZValue(1)
-        self.setFlags(
-            QGraphicsItem.GraphicsItemFlag.ItemIsSelectable
-            # NO ItemIsMovable — we drive movement ourselves
-        )
+        self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setAcceptHoverEvents(True)
 
     @property
-    def group(self) -> "ComponentGroup":
+    def group(self) -> ComponentGroup:
         return self._group
 
     @property
@@ -353,21 +304,14 @@ class GroupItem(QGraphicsItem):
 
     def _current_bbox(self) -> QRectF:
         bb = self._group.bbox_from(self._scene_ref._design.components)
-        # No scene-space padding — the box hugs the physical cell geometry.
-        # A tiny cosmetic pixel offset is added in boundingRect() for Qt's
-        # dirty-region tracking only; it never inflates the visual rect.
-        return QRectF(
-            bb.x_min, bb.y_min,
-            bb.x_max - bb.x_min,
-            bb.y_max - bb.y_min,
-        )
+        return QRectF(bb.x_min, bb.y_min, bb.x_max - bb.x_min, bb.y_max - bb.y_min)
 
     def boundingRect(self) -> QRectF:
-        # 4 extra scene-units (sub-pixel at any sensible zoom) for cosmetic pen
         return self._current_bbox().adjusted(-4, -4, 4, 4)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
         rect = self._current_bbox()
+
         if self._editing:
             border = _GROUP_BORDER_EDITING
         elif self.isSelected():
@@ -375,65 +319,52 @@ class GroupItem(QGraphicsItem):
         else:
             border = _GROUP_BORDER_IDLE
 
-        # Cosmetic pen — 1 px on screen regardless of zoom
         pen = QPen(QColor(border), 1.0)
         pen.setCosmetic(True)
         pen.setStyle(Qt.PenStyle.DashLine)
         pen.setDashPattern([6, 3])
         painter.setPen(pen)
-        fill = QColor(border); fill.setAlpha(_GROUP_BG_ALPHA)
+        fill = QColor(border)
+        fill.setAlpha(_GROUP_BG_ALPHA)
         painter.setBrush(QBrush(fill))
-        # drawRect instead of drawRoundedRect — corner radius was scene-space
-        # (um_to_dbu(1) = 1000 nm) which ballooned the visual box at any zoom.
         painter.drawRect(rect)
 
-        # Label: cosmetic pixel-size font positioned just above the top edge
-        name_pen = QPen(QColor(border)); name_pen.setCosmetic(True)
+        name_pen = QPen(QColor(border))
+        name_pen.setCosmetic(True)
         painter.setPen(name_pen)
         font = painter.font()
-        font.setPixelSize(10)   # fixed 10 px — readable at any zoom
+        font.setPixelSize(10)
         painter.setFont(font)
-        # Offset in scene units must be tiny; use 1 DBU (1 nm) so the label
-        # sits right on the border line rather than floating 1 µm above it.
-        painter.drawText(
-            QPointF(rect.left() + 4, rect.top() - 2),
-            self._group.name,
-        )
+        painter.drawText(QPointF(rect.left() + 4, rect.top() - 2), self._group.name)
 
     def hoverEnterEvent(self, event) -> None:
         self.setCursor(Qt.CursorShape.SizeAllCursor)
-        self.update(); super().hoverEnterEvent(event)
+        self.update()
+        super().hoverEnterEvent(event)
 
     def hoverLeaveEvent(self, event) -> None:
         self.unsetCursor()
-        self.update(); super().hoverLeaveEvent(event)
+        self.update()
+        super().hoverLeaveEvent(event)
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton and not self._editing:
             self._scene_ref.group_selected.emit(self._group.id)
-            modifiers = event.modifiers()
-            multi_mod = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
-                                          Qt.KeyboardModifier.ShiftModifier))
-            if multi_mod:
+            multi = bool(event.modifiers() & (
+                Qt.KeyboardModifier.ControlModifier |
+                Qt.KeyboardModifier.ShiftModifier
+            ))
+            if multi:
                 self.setSelected(not self.isSelected())
             elif not self.isSelected():
                 self._scene_ref.clearSelection()
                 self.setSelected(True)
-            # else: already selected — keep existing multi-selection for drag
-
-            # Always delegate drag to the scene-level unified drag system.
-            # This handles: single group, multiple groups, and mixed
-            # component+group selections in one consistent code path.
             self._scene_ref._on_group_press(self, event)
             event.accept()
             return
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        # All drag movement is driven at the scene level by _on_unified_move.
-        # Qt's mouse grabber is this GroupItem, so we forward to the scene
-        # explicitly — the scene's own mouseMoveEvent is bypassed during a
-        # GroupItem drag.
         if self._scene_ref._unified_drag_active:
             self._scene_ref._on_unified_move(event)
             event.accept()
@@ -444,7 +375,6 @@ class GroupItem(QGraphicsItem):
         event.accept()
 
     def mouseReleaseEvent(self, event) -> None:
-        # All drag release is handled at the scene level by _on_unified_release.
         if self._scene_ref._unified_drag_active:
             self._scene_ref._on_unified_release(event)
             event.accept()
@@ -460,24 +390,21 @@ class GroupItem(QGraphicsItem):
         event.accept()
 
 
-# ── Component Graphics Item ───────────────────────────────────────────────────
+# ── Component graphics item ───────────────────────────────────────────────────
 
 class ComponentItem(QGraphicsItem):
     """
     Visual proxy for one GDSComponent.
 
     A thin shell that owns a child delegate item (Rect/Polygon/Path) and
-    centralises all event handling here. The delegate only provides shape +
-    paint. This keeps interaction logic in one place regardless of geometry type.
+    centralises all event handling.  The delegate provides shape + paint only;
+    interaction logic lives here regardless of geometry type.
     """
 
     def __init__(self, component: GDSComponent, scene_ref: "CanvasScene") -> None:
         super().__init__()
         self._comp      = component
         self._scene_ref = scene_ref
-        self._drag_start:  Optional[QPointF] = None
-        self._orig_pos:    Optional[Point]   = None
-        self._snap_offset: Optional[Point]   = None
 
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
@@ -487,8 +414,8 @@ class ComponentItem(QGraphicsItem):
         self.setAcceptHoverEvents(True)
         self.setCursor(Qt.CursorShape.SizeAllCursor)
 
-        self._delegate: QGraphicsItem = self._make_delegate()
-        self._port_items: List[PortItem] = self._build_port_items()
+        self._delegate:        QGraphicsItem          = self._make_delegate()
+        self._port_items:      List[PortItem]         = self._build_port_items()
         self._edge_indicators: List[EdgeIndicatorItem] = []
         self._apply_style(selected=False, hovered=False)
 
@@ -498,13 +425,12 @@ class ComponentItem(QGraphicsItem):
         c = self._comp
         if c.kind == ComponentKind.RECTANGLE:
             return QGraphicsRectItem(c.origin.x, c.origin.y, c.width, c.height, self)
-        elif c.kind == ComponentKind.POLYGON:
+        if c.kind == ComponentKind.POLYGON:
             return QGraphicsPolygonItem(self._build_polygon(), self)
-        else:   # PATH
-            return QGraphicsPathItem(self._build_path(), self)
+        return QGraphicsPathItem(self._build_path(), self)   # PATH
 
     def _build_polygon(self) -> QPolygonF:
-        pts = self._comp.points or []
+        pts  = self._comp.points or []
         poly = QPolygonF([QPointF(p.x, p.y) for p in pts])
         if pts and pts[0] != pts[-1]:
             poly.append(QPointF(pts[0].x, pts[0].y))
@@ -514,12 +440,12 @@ class ComponentItem(QGraphicsItem):
         pts = self._comp.points or []
         if not pts:
             return QPainterPath()
-        p = QPainterPath(QPointF(pts[0].x, pts[0].y))
+        path = QPainterPath(QPointF(pts[0].x, pts[0].y))
         for pt in pts[1:]:
-            p.lineTo(pt.x, pt.y)
-        return p
+            path.lineTo(pt.x, pt.y)
+        return path
 
-    # ── Required overrides ────────────────────────────────────────────────────
+    # ── Required QGraphicsItem overrides ──────────────────────────────────────
 
     def boundingRect(self) -> QRectF:
         return self._delegate.boundingRect() if self._delegate else QRectF()
@@ -534,7 +460,7 @@ class ComponentItem(QGraphicsItem):
 
     def _apply_style(self, selected: bool, hovered: bool) -> None:
         layer_color = Colors.LAYER_COLORS[self._comp.layer % len(Colors.LAYER_COLORS)]
-        base = QColor(layer_color)
+        base        = QColor(layer_color)
 
         if selected:
             fill_a, pen_color, pen_w = 90, Colors.ACCENT, 1.5
@@ -543,11 +469,11 @@ class ComponentItem(QGraphicsItem):
         else:
             fill_a, pen_color, pen_w = 45, layer_color, 0.8
 
-        fill = QColor(base); fill.setAlpha(fill_a)
+        fill = QColor(base)
+        fill.setAlpha(fill_a)
         pen  = _cosmetic(pen_color, pen_w)
 
         if isinstance(self._delegate, QGraphicsPathItem):
-            # Paths render as a thick stroked polyline with no fill
             pw     = self._comp.path_width or DEFAULT_PW_DBU
             stroke = QPen(fill, pw)
             stroke.setCapStyle(Qt.PenCapStyle.RoundCap)
@@ -558,7 +484,6 @@ class ComponentItem(QGraphicsItem):
             self._delegate.setPen(pen)
             self._delegate.setBrush(QBrush(fill))
 
-        # Ports only visible while hovered or selected — clean canvas at rest.
         show_ports = selected or hovered
         for pi in self._port_items:
             pi.set_visible_for_state(show_ports)
@@ -583,67 +508,48 @@ class ComponentItem(QGraphicsItem):
     def _build_port_items(self) -> List[PortItem]:
         return [PortItem(p, self._comp.origin, self) for p in self._comp.ports]
 
-    # In ComponentItem — replace rebuild_ports() entirely:
-
     def rebuild_ports(self) -> None:
         """
         Sync PortItem positions to match the current model state after any
         geometry change (move, resize, rotation).
 
         Two cases:
+          1. Standalone shape — ports have canonical names N/S/E/W (auto-generated
+             by build_default_ports()).  Recompute offsets from current bbox so they
+             stay edge-centred after rotation.
+          2. Cell anchor — ports have semantic names with explicit offsets set by
+             the cell builder.  Do NOT overwrite those offsets; only reposition
+             the PortItems to where the model already says.
 
-        1. Standalone shape — ports have canonical names "N"/"S"/"E"/"W" and
-           were auto-generated by build_default_ports().  Recompute their offsets
-           from the current bbox so they stay edge-centred after rotation.
-
-        2. Cell anchor — ports have semantic names ("lead_in", "right", etc.)
-           and explicit offsets set by the cell builder, already rotated by
-           _rotate_component_in_place().  We must NOT overwrite those offsets;
-           we only reposition the PortItems to match what the model already says.
-
-        Port IDs are never changed — Connection records store IDs and must
-        never be invalidated by a geometry update.
+        Port IDs are never changed — Connection records store IDs and must never
+        be invalidated by a geometry update.
         """
         if not self._comp.ports:
-            # Sub-components of a parametric cell have _no_auto_ports=True —
-            # they carry no connection points intentionally.  Only generate
-            # default ports for standalone shapes that were placed directly.
             if getattr(self._comp, "_no_auto_ports", False):
                 self._port_items = []
                 return
-            # First time only: generate ports and build items
             self._comp.build_default_ports()
             self._port_items = self._build_port_items()
             return
 
-        # Determine whether all ports are the auto-generated N/S/E/W set.
-        # Cell ports have semantic names — don't clobber their offsets.
         auto_names = {"N", "S", "E", "W"}
-        port_names = {p.name for p in self._comp.ports}
-        is_auto_ports = port_names <= auto_names  # subset — pure auto set
+        is_auto    = {p.name for p in self._comp.ports} <= auto_names
 
-        if is_auto_ports:
-            # Recompute bbox-centre offsets in-place so auto ports stay
-            # edge-centred after rotation / resize.
+        if is_auto:
             bb = self._comp.bbox
             cx = (bb.x_min + bb.x_max) // 2
             cy = (bb.y_min + bb.y_max) // 2
             ox, oy = self._comp.origin.x, self._comp.origin.y
-
             new_offsets = {
                 "N": Point(cx - ox, bb.y_min - oy),
                 "S": Point(cx - ox, bb.y_max - oy),
                 "W": Point(bb.x_min - ox, cy - oy),
                 "E": Point(bb.x_max - ox, cy - oy),
             }
-
             for port in self._comp.ports:
                 if port.name in new_offsets:
                     port.offset = new_offsets[port.name]
 
-        # In both cases, move the PortItems to wherever the model now says.
-        # For auto ports the offsets were just updated above.
-        # For cell ports the offsets were rotated by _rotate_component_in_place.
         for pi in self._port_items:
             abs_pos = pi.port.abs_pos(self._comp.origin)
             pi.setPos(abs_pos.x, abs_pos.y)
@@ -655,13 +561,13 @@ class ComponentItem(QGraphicsItem):
                 return
 
     def clear_port_highlights(self) -> None:
-        is_visible = self.isSelected()
+        visible = self.isSelected()
         for pi in self._port_items:
             pi.set_active(False)
-            pi.set_visible_for_state(is_visible)
+            pi.set_visible_for_state(visible)
 
     @property
-    def port_items(self) -> "List[PortItem]":
+    def port_items(self) -> List[PortItem]:
         return self._port_items
 
     def refresh_connection_state(self, design: DesignScene) -> None:
@@ -677,13 +583,11 @@ class ComponentItem(QGraphicsItem):
             return
 
         bbox = self._delegate.boundingRect()
-        seen: set = set()
+        seen: set[PortSide] = set()
         for side in occupied_sides:
-            if side in seen:
-                continue
-            seen.add(side)
-            ind = EdgeIndicatorItem(side, bbox, self)
-            self._edge_indicators.append(ind)
+            if side not in seen:
+                seen.add(side)
+                self._edge_indicators.append(EdgeIndicatorItem(side, bbox, self))
 
     # ── Events ────────────────────────────────────────────────────────────────
 
@@ -704,12 +608,10 @@ class ComponentItem(QGraphicsItem):
             super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        # Drag is handled at the scene level so all selected items move together.
-        event.accept()
+        event.accept()   # drag handled at scene level
 
     def mouseReleaseEvent(self, event) -> None:
-        # Release is handled at the scene level.
-        event.accept()
+        event.accept()   # release handled at scene level
 
     def itemChange(self, change, value):
         if change == QGraphicsItem.GraphicsItemChange.ItemSelectedHasChanged:
@@ -717,28 +619,29 @@ class ComponentItem(QGraphicsItem):
         return super().itemChange(change, value)
 
 
-# ── Canvas Scene ──────────────────────────────────────────────────────────────
+# ── Canvas scene ──────────────────────────────────────────────────────────────
 
 class CanvasScene(QGraphicsScene):
     """Master scene. Owns all ComponentItems, the CommandStack, and placement FSM."""
 
-    item_selected      = pyqtSignal(str)
-    item_hovered       = pyqtSignal(str)
-    cursor_moved       = pyqtSignal(float, float)
-    scene_changed      = pyqtSignal()
-    mode_changed       = pyqtSignal(str)
-    connections_changed = pyqtSignal()   # fired after any wiring change
-    multi_selection_changed = pyqtSignal(list)  # comp_ids when >1 selected
-    group_edit_entered = pyqtSignal(str)   # group_id
-    group_edit_exited  = pyqtSignal()
-    group_selected = pyqtSignal(str)
+    item_selected           = pyqtSignal(str)
+    item_hovered            = pyqtSignal(str)
+    cursor_moved            = pyqtSignal(float, float)
+    scene_changed           = pyqtSignal()
+    mode_changed            = pyqtSignal(str)
+    connections_changed     = pyqtSignal()
+    multi_selection_changed = pyqtSignal(list)
+    group_edit_entered      = pyqtSignal(str)
+    group_edit_exited       = pyqtSignal()
+    group_selected          = pyqtSignal(str)
 
     def __init__(self, design: DesignScene, parent=None) -> None:
         super().__init__(parent)
-        self._design = design
-        self._items: Dict[str, ComponentItem] = {}
-        self._group_items: Dict[str, GroupItem] = {}
-        self._editing_group_id: Optional[str]  = None
+        self._design      = design
+        self._items:       Dict[str, ComponentItem] = {}
+        self._group_items: Dict[str, GroupItem]     = {}
+        self._editing_group_id: Optional[str]       = None
+
         self.cmd_stack = CommandStack(design)
         self.cmd_stack.connect_change(self._on_model_changed)
 
@@ -746,30 +649,22 @@ class CanvasScene(QGraphicsScene):
         self.setSceneRect(-ext, -ext, ext * 2, ext * 2)
         self.setBackgroundBrush(QBrush(QColor(Colors.CANVAS_BG)))
 
-        # Placement FSM — all state lives in one object; reset atomically.
-        self._pl = PlacementState()
+        self._pl      = PlacementState()
         self._pl.mode = PlacementMode.SELECT
 
-        # Last known cursor position in scene coordinates (updated on mouseMoveEvent).
-        # Used by paste() to place content under the cursor.
+        # Last known cursor scene position — used by paste() to place at cursor.
         self._cursor_scene_pos: QPointF = QPointF(0, 0)
 
-        # ── Unified drag state ────────────────────────────────────────────────
-        # One system handles everything: single components, multi-component,
-        # single groups, multi-group, and mixed component+group selections.
-        self._drag_start:       Optional[QPointF] = None
-        self._drag_last:        Optional[QPointF] = None
-        self._drag_committed:   bool              = False
-        self._snap_offset:      Optional[Point]   = None
-        # Snapshots: keyed by item, value is the Point origin at drag start
-        self._orig_comp_positions:  dict = {}   # ComponentItem → Point
-        self._orig_group_positions: dict = {}   # group_id      → {comp_id: Point}
+        # Unified drag state (components + groups move together).
+        self._drag_start:            Optional[QPointF] = None
+        self._drag_last:             Optional[QPointF] = None
+        self._drag_committed:        bool              = False
+        self._snap_offset:           Optional[object]  = None
+        self._orig_comp_positions:   dict              = {}   # ComponentItem → Point
+        self._orig_group_positions:  dict              = {}   # group_id → {comp_id: Point}
 
-        # Wire Qt's built-in selection signal so the properties panel clears
-        # when the user clicks empty canvas (previously this was never connected).
         self.selectionChanged.connect(self._on_selection_changed)
         self.group_edit_entered.connect(self._on_group_edit_entered)
-
 
     # ── Public placement API ──────────────────────────────────────────────────
 
@@ -788,7 +683,7 @@ class CanvasScene(QGraphicsScene):
         self._pl.mode = PlacementMode.SELECT
         self.mode_changed.emit(PlacementMode.SELECT.status_label)
 
-    # ── Public scene API (replaces direct private-member access from outside) ──
+    # ── Public scene API ──────────────────────────────────────────────────────
 
     def refresh_item_style(self, comp_id: str) -> None:
         """Re-apply layer colour after an undo-able layer edit."""
@@ -797,17 +692,19 @@ class CanvasScene(QGraphicsScene):
             item._apply_style(item.isSelected(), hovered=False)
 
     def reset(self) -> None:
-        """Clear all items and ghosts; called by MainWindow._new_design()."""
+        """Clear all items and ghosts — called by MainWindow on new design."""
         self._clear_ghosts()
         self._on_model_changed()
 
     def place_rectangle(self, origin_x_um: float, origin_y_um: float,
                         width_um: float, height_um: float, layer: int = 0) -> GDSComponent:
-        """Programmatic rect placement (toolbar quick-place, tests)."""
+        """Programmatic rectangle placement (tests, toolbar quick-place)."""
         comp = GDSComponent(
-            kind   = ComponentKind.RECTANGLE, layer = layer,
+            kind   = ComponentKind.RECTANGLE,
+            layer  = layer,
             origin = Point.from_um(origin_x_um, origin_y_um),
-            width  = um_to_dbu(width_um), height = um_to_dbu(height_um),
+            width  = um_to_dbu(width_um),
+            height = um_to_dbu(height_um),
         )
         self.cmd_stack.execute(AddComponent(comp))
         return comp
@@ -815,58 +712,33 @@ class CanvasScene(QGraphicsScene):
     def drop_shape(self, kind_val: int, layer: int, scene_pos: QPointF) -> None:
         """
         Called by CanvasView.dropEvent after a drag from the shape palette.
-
-        kind_val  — the raw ComponentKind enum value (int) carried in the MIME data
-        layer     — the target layer number
-        scene_pos — drop position in scene (DBU) coordinates, snapped to grid below
+        kind_val — raw ComponentKind int value from MIME data.
         """
         try:
             kind = ComponentKind(kind_val)
         except ValueError:
-            return  # unknown kind; ignore silently rather than crash
+            return
 
         snapped = self.snap_f(scene_pos.x(), scene_pos.y())
         cx, cy  = int(snapped.x()), int(snapped.y())
+        hw, hh  = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
 
         if kind == ComponentKind.RECTANGLE:
-            hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
             comp = GDSComponent(
-                kind   = ComponentKind.RECTANGLE,
-                layer  = layer,
-                origin = Point(cx - hw, cy - hh),
-                width  = DEFAULT_W_DBU,
-                height = DEFAULT_H_DBU,
+                kind=ComponentKind.RECTANGLE, layer=layer,
+                origin=Point(cx - hw, cy - hh),
+                width=DEFAULT_W_DBU, height=DEFAULT_H_DBU,
             )
-
         elif kind == ComponentKind.POLYGON:
-            # Default: equilateral-ish triangle centred on the drop point
-            hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
-            pts = [
-                Point(cx,      cy - hh),   # top
-                Point(cx + hw, cy + hh),   # bottom-right
-                Point(cx - hw, cy + hh),   # bottom-left
-            ]
-            comp = GDSComponent(
-                kind   = ComponentKind.POLYGON,
-                layer  = layer,
-                origin = pts[0],
-                points = pts,
-            )
-
+            pts  = [Point(cx, cy - hh), Point(cx + hw, cy + hh), Point(cx - hw, cy + hh)]
+            comp = GDSComponent(kind=ComponentKind.POLYGON, layer=layer,
+                                origin=pts[0], points=pts)
         elif kind == ComponentKind.PATH:
-            # Default: short horizontal segment
-            hw = DEFAULT_W_DBU // 2
-            pts = [Point(cx - hw, cy), Point(cx + hw, cy)]
-            comp = GDSComponent(
-                kind       = ComponentKind.PATH,
-                layer      = layer,
-                origin     = pts[0],
-                points     = pts,
-                path_width = DEFAULT_PW_DBU,
-            )
-
+            pts  = [Point(cx - hw, cy), Point(cx + hw, cy)]
+            comp = GDSComponent(kind=ComponentKind.PATH, layer=layer,
+                                origin=pts[0], points=pts, path_width=DEFAULT_PW_DBU)
         else:
-            return  # future kinds; ignore
+            return
 
         self.cmd_stack.execute(AddComponent(comp))
 
@@ -878,32 +750,123 @@ class CanvasScene(QGraphicsScene):
         g = float(GRID_MINOR_DBU)
         return QPointF(round(x / g) * g, round(y / g) * g)
 
-    def item_for(self, comp_id: str) -> Optional["ComponentItem"]:
+    def item_for(self, comp_id: str) -> Optional[ComponentItem]:
         return self._items.get(comp_id)
 
     def clear_all_port_highlights(self) -> None:
         for item in self._items.values():
             item.clear_port_highlights()
 
+    # ── Port snap ─────────────────────────────────────────────────────────────
+
+    def find_port_snap(self, moving_comp: GDSComponent,
+                       tentative_origin: Point) -> Optional[tuple]:
+        """
+        Check whether any port on *moving_comp* (placed at *tentative_origin*)
+        is within PORT_SNAP_RADIUS of a compatible port on another component.
+        Compatibility: ports must face each other (side == other.side.opposite).
+
+        Returns (snapped_origin, my_port_id, their_port_id, their_comp_id)
+        or None.  snapped_origin is the exact origin placing my_port flush
+        against their_port.
+        """
+        best_dist = PORT_SNAP_RADIUS
+        best      = None
+
+        for port in moving_comp.ports:
+            my_abs = Point(
+                tentative_origin.x + port.offset.x,
+                tentative_origin.y + port.offset.y,
+            )
+            for other_comp in self._design.components:
+                if other_comp.id == moving_comp.id:
+                    continue
+                for other_port in other_comp.ports:
+                    if other_port.side != port.side.opposite:
+                        continue
+                    their_abs = other_port.abs_pos(other_comp.origin)
+                    dx   = my_abs.x - their_abs.x
+                    dy   = my_abs.y - their_abs.y
+                    dist = math.sqrt(dx * dx + dy * dy)
+                    if dist < best_dist:
+                        best_dist = dist
+                        snapped   = Point(tentative_origin.x - dx, tentative_origin.y - dy)
+                        best      = (snapped, port.id, other_port.id, other_comp.id)
+
+        return best
+
+    def find_group_port_snap(self, moving_group: ComponentGroup) -> Optional[tuple]:
+        """
+        Check whether any port on any member of *moving_group* is within
+        PORT_SNAP_RADIUS of a compatible port outside the group.
+
+        Returns (extra_dx, extra_dy, my_comp_id, my_port_id,
+                 their_comp_id, their_port_id) or None.
+        """
+        member_ids = set(moving_group.member_ids)
+        best_dist  = PORT_SNAP_RADIUS
+        best       = None
+
+        for my_comp in self._design.components:
+            if my_comp.id not in member_ids:
+                continue
+            for my_port in my_comp.ports:
+                my_abs = my_port.abs_pos(my_comp.origin)
+                for other_comp in self._design.components:
+                    if other_comp.id in member_ids:
+                        continue
+                    for other_port in other_comp.ports:
+                        if other_port.side != my_port.side.opposite:
+                            continue
+                        their_abs = other_port.abs_pos(other_comp.origin)
+                        dx   = my_abs.x - their_abs.x
+                        dy   = my_abs.y - their_abs.y
+                        dist = math.sqrt(dx * dx + dy * dy)
+                        if dist < best_dist:
+                            best_dist = dist
+                            best      = (-dx, -dy,
+                                         my_comp.id, my_port.id,
+                                         other_comp.id, other_port.id)
+        return best
+
     def _try_connect_snapped(self, moving_comp: GDSComponent,
                               final_origin: Point) -> None:
-        """Called after snap-move committed. Find the flush port pair and wire it."""
+        """Wire the snapped port pair after a component move commits."""
         result = self.find_port_snap(moving_comp, final_origin)
         if result is None:
             return
         _, my_port_id, their_port_id, their_comp_id = result
-
-        if self._design.are_connected(
+        if not self._design.are_connected(
             moving_comp.id, my_port_id, their_comp_id, their_port_id
         ):
-            return  # already wired — idempotent
-
-        self.cmd_stack.execute(
-            ConnectPorts(moving_comp.id, my_port_id, their_comp_id, their_port_id)
-        )
+            self.cmd_stack.execute(
+                ConnectPorts(moving_comp.id, my_port_id, their_comp_id, their_port_id)
+            )
         self._refresh_indicators(moving_comp.id)
         self._refresh_indicators(their_comp_id)
         self.connections_changed.emit()
+
+    def _try_connect_group_snap(self, group: ComponentGroup) -> None:
+        """Wire the snapped port pair after a group move commits."""
+        snap = self.find_group_port_snap(group)
+        if snap is None:
+            return
+        _, _, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
+        self.disconnect_component(my_comp_id)
+        if not self._design.are_connected(
+            my_comp_id, my_port_id, their_comp_id, their_port_id
+        ):
+            self.cmd_stack.execute(
+                ConnectPorts(my_comp_id, my_port_id, their_comp_id, their_port_id)
+            )
+        self._refresh_indicators(my_comp_id)
+        self._refresh_indicators(their_comp_id)
+        self.connections_changed.emit()
+
+    def disconnect_component(self, comp_id: str) -> None:
+        """Sever every connection on comp_id via undo-aware commands."""
+        for conn in self._design.connections_for(comp_id):
+            self.cmd_stack.execute(DisconnectPorts(conn))
 
     def _refresh_indicators(self, comp_id: str) -> None:
         item = self._items.get(comp_id)
@@ -912,180 +875,39 @@ class CanvasScene(QGraphicsScene):
 
     def refresh_all_indicators(self) -> None:
         """Rebuild all edge indicators — call after undo/redo."""
-        for comp_id, item in self._items.items():
+        for item in self._items.values():
             item.refresh_connection_state(self._design)
-
-    def find_port_snap(
-        self,
-        moving_comp: GDSComponent,
-        tentative_origin: Point,
-    ) -> Optional[tuple]:
-        """
-        Check whether any port on *moving_comp* (placed at *tentative_origin*)
-        is within PORT_SNAP_RADIUS of a compatible port on another component.
-
-        Compatibility rule: ports must face each other
-        (moving.side == stationary.side.opposite).
-
-        Returns (snapped_origin, my_port_id, their_port_id, their_comp_id)
-        or None if no snap candidate found.
-
-        The returned snapped_origin is the exact origin that places my_port
-        flush against their_port — guaranteeing perfect edge alignment.
-        """
-        best_dist  = PORT_SNAP_RADIUS
-        best       = None
-
-        for port in moving_comp.ports:
-            # Absolute position of this port at the tentative location
-            my_abs = Point(
-                tentative_origin.x + port.offset.x,
-                tentative_origin.y + port.offset.y,
-            )
-
-            for other_comp in self._design.components:
-                if other_comp.id == moving_comp.id:
-                    continue
-                for other_port in other_comp.ports:
-                    # Compatibility: must face each other
-                    if other_port.side != port.side.opposite:
-                        continue
-
-                    their_abs = other_port.abs_pos(other_comp.origin)
-                    dx = my_abs.x - their_abs.x
-                    dy = my_abs.y - their_abs.y
-                    dist = math.sqrt(dx * dx + dy * dy)
-
-                    if dist < best_dist:
-                        best_dist = dist
-                        # Exact origin that places my port ON their port
-                        snapped_origin = Point(
-                            tentative_origin.x - dx,
-                            tentative_origin.y - dy,
-                        )
-                        best = (snapped_origin, port.id,
-                                other_port.id, other_comp.id)
-
-        return best
-    
-    def find_group_port_snap(
-        self,
-        moving_group: "ComponentGroup",
-    ) -> Optional[tuple]:
-        """
-        Check whether any port on any member of *moving_group* is within
-        PORT_SNAP_RADIUS of a compatible port on a component outside the group.
-
-        'Outside the group' means: not in moving_group.member_ids.  This
-        includes both standalone components and members of other groups —
-        cross-group snapping is fully supported.
-
-        Compatibility rule: ports must face each other
-        (moving.side == stationary.side.opposite).
-
-        Returns:
-            (extra_dx, extra_dy, my_comp_id, my_port_id,
-             their_comp_id, their_port_id)
-
-            extra_dx / extra_dy  — the additional DBU translation needed to
-                                   place the snapping port exactly flush.
-            my_comp_id           — the member of moving_group whose port snapped.
-
-        Returns None if no snap candidate found.
-        """
-        member_id_set = set(moving_group.member_ids)
-        best_dist = PORT_SNAP_RADIUS
-        best      = None
-
-        for my_comp in self._design.components:
-            if my_comp.id not in member_id_set:
-                continue
-            for my_port in my_comp.ports:
-                my_abs = my_port.abs_pos(my_comp.origin)
-
-                for other_comp in self._design.components:
-                    if other_comp.id in member_id_set:
-                        continue   # skip own group members
-                    for other_port in other_comp.ports:
-                        if other_port.side != my_port.side.opposite:
-                            continue
-
-                        their_abs = other_port.abs_pos(other_comp.origin)
-                        dx = my_abs.x - their_abs.x
-                        dy = my_abs.y - their_abs.y
-                        dist = math.sqrt(dx * dx + dy * dy)
-
-                        if dist < best_dist:
-                            best_dist = dist
-                            # Nudge that would place my_port exactly on their_port
-                            best = (
-                                -dx, -dy,
-                                my_comp.id, my_port.id,
-                                other_comp.id, other_port.id,
-                            )
-
-        return best
-
-    def _try_connect_group_snap(self, group: "ComponentGroup") -> None:
-        """
-        After a snapped group drop: find the flush port pair and wire it.
-        Disconnects any stale wiring on the snapping member first.
-        """
-        snap = self.find_group_port_snap(group)
-        if snap is None:
-            return
-        _, _, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
-
-        # Sever existing connections on the snapping member before rewiring
-        self.disconnect_component(my_comp_id)
-
-        if self._design.are_connected(
-            my_comp_id, my_port_id, their_comp_id, their_port_id
-        ):
-            return  # already wired — idempotent
-
-        self.cmd_stack.execute(
-            ConnectPorts(my_comp_id, my_port_id, their_comp_id, their_port_id)
-        )
-        self._refresh_indicators(my_comp_id)
-        self._refresh_indicators(their_comp_id)
-        self.connections_changed.emit()
-
-    def disconnect_component(self, comp_id: str) -> None:
-        """
-        Sever every connection on comp_id via undo-aware commands.
-        Called before a move commits so stale wiring is never left behind.
-        """
-        for conn in self._design.connections_for(comp_id):
-            self.cmd_stack.execute(DisconnectPorts(conn))
 
     # ── Mouse events ──────────────────────────────────────────────────────────
 
-    def _hit_component_item(self, scene_pos) -> Optional["ComponentItem"]:
-        """Walk the item at scene_pos up to the nearest ComponentItem, or None."""
+    def _hit_item(self, scene_pos, item_type: type) -> Optional[object]:
+        """Walk the item hierarchy at scene_pos and return the nearest item of item_type, or None."""
         transform = self.views()[0].transform() if self.views() else QTransform()
-        hit = self.itemAt(scene_pos, transform)
-        candidate = hit
+        candidate = self.itemAt(scene_pos, transform)
         while candidate is not None:
-            if isinstance(candidate, ComponentItem):
+            if isinstance(candidate, item_type):
                 return candidate
             candidate = candidate.parentItem()
         return None
 
+    def _hit_component_item(self, scene_pos) -> Optional[ComponentItem]:
+        return self._hit_item(scene_pos, ComponentItem)
+
+    def _hit_group_item(self, scene_pos) -> Optional[GroupItem]:
+        return self._hit_item(scene_pos, GroupItem)
+
     def mousePressEvent(self, event) -> None:
-        # ── Exit group edit on outside click ─────────────────────────────────
+        # Exit group edit when clicking outside the group.
         if self._editing_group_id:
-            group = self._design.get_group(self._editing_group_id)
-            if group:
-                hit_comp = getattr(self._hit_component_item(event.scenePos()), "component", None)
-                is_member = hit_comp is not None and hit_comp.id in group.member_ids
-                if not is_member:
-                    self.exit_group_edit()
-                    self.clearSelection()
+            group    = self._design.get_group(self._editing_group_id)
+            hit_comp = getattr(self._hit_component_item(event.scenePos()), "component", None)
+            if group and not (hit_comp and hit_comp.id in group.member_ids):
+                self.exit_group_edit()
+                self.clearSelection()
 
         snapped = self.snap_f(event.scenePos().x(), event.scenePos().y())
 
-        # ── Placement modes ───────────────────────────────────────────────────
+        # Placement modes intercept all clicks.
         if self._pl.mode == PlacementMode.PLACE_RECT:
             if event.button() == Qt.MouseButton.LeftButton:
                 self._stamp_rect(snapped)
@@ -1098,113 +920,98 @@ class CanvasScene(QGraphicsScene):
                 self._commit_poly_or_path()
             return
 
-        # ── Select mode ───────────────────────────────────────────────────────
-        if event.button() == Qt.MouseButton.LeftButton:
-            comp_item = self._hit_component_item(event.scenePos())
-            if comp_item is not None:
-                self._on_item_press(comp_item, event)
-                # Call super() so Qt delivers the press to the item and
-                # establishes a mouse grabber. Without a grabber,
-                # QGraphicsView will not forward mouseMoveEvents to the scene,
-                # so _on_item_move never fires. ComponentItem.mousePressEvent
-                # accepts without calling its own super(), so Qt's built-in
-                # selection logic does not run and our selection is preserved.
-                super().mousePressEvent(event)
-                return
-            else:
-                # Check whether a GroupItem sits under the cursor.
-                # If so, let super() deliver the event directly to it —
-                # GroupItem.mousePressEvent owns selection management for
-                # groups and will call _arm_unified_drag preserving whatever
-                # ComponentItems are already selected.
-                # DO NOT call clearSelection() here: that would wipe the
-                # ComponentItems out of the selection before GroupItem sees
-                # the event, breaking mixed-selection drag when the user
-                # initiates the drag by clicking the group border/label.
-                transform = self.views()[0].transform() if self.views() else QTransform()
-                hit = self.itemAt(event.scenePos(), transform)
-                hit_group = None
-                candidate = hit
-                while candidate is not None:
-                    if isinstance(candidate, GroupItem):
-                        hit_group = candidate
-                        break
-                    candidate = candidate.parentItem()
+        # Select mode.
+        if event.button() != Qt.MouseButton.LeftButton:
+            super().mousePressEvent(event)
+            return
 
-                if hit_group is not None and not hit_group.is_editing:
-                    # A GroupItem was clicked — let it handle selection and drag.
-                    # Do NOT clear selection here; GroupItem.mousePressEvent
-                    # preserves the multi-selection when the group is already
-                    # selected (the else-already-selected branch).
-                    super().mousePressEvent(event)
-                    return
+        comp_item = self._hit_component_item(event.scenePos())
+        if comp_item is not None:
+            self._on_item_press(comp_item, event)
+            super().mousePressEvent(event)
+            return
 
-                # Truly empty canvas — clear selection unless modifier held,
-                # then let super() start a rubber-band drag.
-                modifiers = event.modifiers()
-                multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
-                                          Qt.KeyboardModifier.ShiftModifier))
-                if not multi:
-                    self.clearSelection()
-                super().mousePressEvent(event)
-                return
+        group_item = self._hit_group_item(event.scenePos())
+        if group_item is not None and not group_item.is_editing:
+            # Let GroupItem.mousePressEvent own selection + drag.
+            super().mousePressEvent(event)
+            return
 
+        # Empty canvas — clear selection unless a modifier is held.
+        if not bool(event.modifiers() & (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        )):
+            self.clearSelection()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
-        raw     = event.scenePos()
-        snapped = self.snap_f(raw.x(), raw.y())
-        self._cursor_scene_pos = raw          # track for paste-at-cursor
+        raw = event.scenePos()
+        self._cursor_scene_pos = raw
         self.cursor_moved.emit(dbu_to_um(int(raw.x())), dbu_to_um(int(raw.y())))
 
+        snapped = self.snap_f(raw.x(), raw.y())
         if self._pl.mode == PlacementMode.PLACE_RECT:
             self._update_ghost_rect(snapped)
         elif self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             self._update_ghost_edge(snapped)
 
-        # Drive the unified drag for component-initiated drags.
-        # (Group-initiated drags are forwarded here from GroupItem.mouseMoveEvent
-        #  because Qt delivers move events to the mouse grabber, not the scene.)
         if self._unified_drag_active and (self._orig_comp_positions or self._orig_group_positions):
             self._on_unified_move(event)
 
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
-        if event.button() == Qt.MouseButton.LeftButton:
-            if self._unified_drag_active and (self._orig_comp_positions or self._orig_group_positions):
-                self._on_unified_release(event)
-                return
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._unified_drag_active
+                and (self._orig_comp_positions or self._orig_group_positions)):
+            self._on_unified_release(event)
+            return
         super().mouseReleaseEvent(event)
 
-    # ── Legacy alias (kept so any external call sites still compile) ─────────
-    def _selected_group_count(self) -> int:
-        return sum(1 for i in self.selectedItems()
-                   if isinstance(i, GroupItem) and not i.is_editing)
+    def keyPressEvent(self, event) -> None:
+        key  = event.key()
+        mods = event.modifiers()
+        ctrl = bool(mods & Qt.KeyboardModifier.ControlModifier)
 
-    def _on_item_press(self, item: "ComponentItem", event) -> None:
-        """Called by ComponentItem.mousePressEvent — handles select + drag arm."""
-        modifiers = event.modifiers()
-        multi = bool(modifiers & (Qt.KeyboardModifier.ControlModifier |
-                                  Qt.KeyboardModifier.ShiftModifier))
+        if key == Qt.Key.Key_Escape:
+            self.cancel_placement()
+        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            if self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
+                self._commit_poly_or_path()
+        elif key == Qt.Key.Key_C and ctrl:
+            self.copy_selection()
+        elif key == Qt.Key.Key_V and ctrl:
+            self.paste()
+        elif key == Qt.Key.Key_D and ctrl:
+            self.duplicate_selection()
+        elif key == Qt.Key.Key_R and self._pl.mode == PlacementMode.SELECT:
+            self.rotate_selection(ccw=bool(mods & Qt.KeyboardModifier.ShiftModifier))
+        else:
+            super().keyPressEvent(event)
 
-        # Block Qt's selectionChanged signal while we manipulate selection
-        # so _on_selection_changed doesn't fire mid-operation.
+    # ── Unified drag ──────────────────────────────────────────────────────────
+
+    @property
+    def _unified_drag_active(self) -> bool:
+        return self._drag_start is not None
+
+    def _on_item_press(self, item: ComponentItem, event) -> None:
+        """Called from mousePressEvent — handles select + drag arm."""
+        multi = bool(event.modifiers() & (
+            Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
+        ))
         self.blockSignals(True)
         try:
             if multi:
                 item.setSelected(not item.isSelected())
-            else:
-                if not item.isSelected():
-                    self.clearSelection()
-                    item.setSelected(True)
-                # already selected: keep existing multi-selection for drag
+            elif not item.isSelected():
+                self.clearSelection()
+                item.setSelected(True)
         finally:
             self.blockSignals(False)
 
         self._arm_unified_drag(event)
 
-        # Fire selection signal once, cleanly, after we're done
         comp_items = [i for i in self.selectedItems() if isinstance(i, ComponentItem)]
         if not comp_items:
             self.item_selected.emit("")
@@ -1213,15 +1020,12 @@ class CanvasScene(QGraphicsScene):
         else:
             self.multi_selection_changed.emit([i.component.id for i in comp_items])
 
-    def _on_group_press(self, gi: "GroupItem", event) -> None:
+    def _on_group_press(self, gi: GroupItem, event) -> None:
         """Called by GroupItem.mousePressEvent — arms unified drag from a group press."""
         self._arm_unified_drag(event)
 
     def _arm_unified_drag(self, event) -> None:
-        """
-        Snapshot origins for ALL currently selected items — both ComponentItems
-        and GroupItems — so the unified move handler can drive them together.
-        """
+        """Snapshot origins for ALL currently selected items."""
         self._drag_start     = event.scenePos()
         self._drag_last      = event.scenePos()
         self._drag_committed = False
@@ -1236,32 +1040,24 @@ class CanvasScene(QGraphicsScene):
         for gi in self.selectedItems():
             if not isinstance(gi, GroupItem) or gi.is_editing:
                 continue
-            origins = {}
-            for cid in gi.group.member_ids:
-                comp = self._design.get(cid)
-                if comp:
-                    origins[cid] = Point(comp.origin.x, comp.origin.y)
-            self._orig_group_positions[gi.group.id] = origins
+            self._orig_group_positions[gi.group.id] = {
+                cid: Point(comp.origin.x, comp.origin.y)
+                for cid in gi.group.member_ids
+                if (comp := self._design.get(cid)) is not None
+            }
 
+    # Legacy aliases kept for any external call sites.
     def _on_item_move(self, event) -> None:
-        """Legacy entry point — routes to unified handler."""
         self._on_unified_move(event)
 
     def _on_item_release(self, event) -> None:
-        """Legacy entry point — routes to unified handler."""
         self._on_unified_release(event)
-
-    @property
-    def _unified_drag_active(self) -> bool:
-        """True while a unified drag gesture (any item type) is in progress."""
-        return self._drag_start is not None
 
     def _on_unified_move(self, event) -> None:
         """
-        Move ALL selected items — ComponentItems and GroupItems — together.
-        Called from scene.mouseMoveEvent (component drag) and
-        GroupItem.mouseMoveEvent (which forwards here because Qt delivers
-        move events to the mouse-grabbing item, not the scene).
+        Move ALL selected items (ComponentItems and GroupItems) together.
+        Called from scene.mouseMoveEvent and forwarded here from
+        GroupItem.mouseMoveEvent.
         """
         if self._drag_start is None:
             return
@@ -1271,17 +1067,17 @@ class CanvasScene(QGraphicsScene):
                 return
             self._drag_committed = True
 
-        # ── Move standalone ComponentItems ────────────────────────────────────
+        # Move standalone ComponentItems.
         for item, orig in self._orig_comp_positions.items():
             new_x = orig.x + int(round(delta.x()))
             new_y = orig.y + int(round(delta.y()))
-            dx = new_x - item._comp.origin.x
-            dy = new_y - item._comp.origin.y
-            if dx != 0 or dy != 0:
+            dx    = new_x - item._comp.origin.x
+            dy    = new_y - item._comp.origin.y
+            if dx or dy:
                 item._comp.move_by(dx, dy)
                 item.sync_from_model()
 
-        # ── Move GroupItem members ─────────────────────────────────────────────
+        # Move GroupItem members.
         for group_id, origins in self._orig_group_positions.items():
             group = self._design.get_group(group_id)
             if not group:
@@ -1289,11 +1085,9 @@ class CanvasScene(QGraphicsScene):
             for cid, orig in origins.items():
                 comp = self._design.get(cid)
                 if comp:
-                    new_x = orig.x + int(round(delta.x()))
-                    new_y = orig.y + int(round(delta.y()))
-                    dx = new_x - comp.origin.x
-                    dy = new_y - comp.origin.y
-                    if dx != 0 or dy != 0:
+                    dx = orig.x + int(round(delta.x())) - comp.origin.x
+                    dy = orig.y + int(round(delta.y())) - comp.origin.y
+                    if dx or dy:
                         comp.move_by(dx, dy)
                         item = self._items.get(cid)
                         if item:
@@ -1306,32 +1100,29 @@ class CanvasScene(QGraphicsScene):
         self.clear_all_port_highlights()
         self._snap_offset = None
 
-        # Port snap — single component-only drag
+        # Port snap: single component drag.
         if len(self._orig_comp_positions) == 1 and not self._orig_group_positions:
-            item = next(iter(self._orig_comp_positions))
-            orig = self._orig_comp_positions[item]
-            tentative = Point(
-                orig.x + int(round(delta.x())),
-                orig.y + int(round(delta.y())),
-            )
-            snap_result = self.find_port_snap(item._comp, tentative)
-            if snap_result:
-                snap_origin, my_port_id, their_port_id, their_comp_id = snap_result
+            item   = next(iter(self._orig_comp_positions))
+            orig   = self._orig_comp_positions[item]
+            tentative = Point(orig.x + int(round(delta.x())),
+                              orig.y + int(round(delta.y())))
+            snap = self.find_port_snap(item._comp, tentative)
+            if snap:
+                snap_origin, my_port_id, their_port_id, their_comp_id = snap
                 self._snap_offset = snap_origin
                 item.set_port_active(my_port_id, True)
                 other = self.item_for(their_comp_id)
                 if other:
                     other.set_port_active(their_port_id, True)
 
-        # Port snap — single group drag (cells/parametric groups)
+        # Port snap: single group drag.
         elif len(self._orig_group_positions) == 1 and not self._orig_comp_positions:
             group_id = next(iter(self._orig_group_positions))
-            group = self._design.get_group(group_id)
+            group    = self._design.get_group(group_id)
             if group:
-                snap_result = self.find_group_port_snap(group)
-                if snap_result:
-                    extra_dx, extra_dy, my_comp_id, my_port_id, their_comp_id, their_port_id = snap_result
-                    # Store snap offset as a sentinel tuple for the release handler
+                snap = self.find_group_port_snap(group)
+                if snap:
+                    extra_dx, extra_dy, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
                     self._snap_offset = ("group", group_id, extra_dx, extra_dy)
                     my_item = self.item_for(my_comp_id)
                     if my_item:
@@ -1342,69 +1133,50 @@ class CanvasScene(QGraphicsScene):
 
     def _on_unified_release(self, event) -> None:
         """
-        Commit the unified drag as one BatchCommand covering both component
-        moves and group moves so a single Undo reverses everything together.
+        Commit the drag as one BatchCommand so a single Undo reverses everything.
         """
         self.clear_all_port_highlights()
-        has_comp_drag  = bool(self._orig_comp_positions)
-        has_group_drag = bool(self._orig_group_positions)
+        has_comps  = bool(self._orig_comp_positions)
+        has_groups = bool(self._orig_group_positions)
 
-        if not self._drag_committed or (not has_comp_drag and not has_group_drag):
-            self._drag_start              = None
-            self._drag_last               = None
-            self._orig_comp_positions     = {}
-            self._orig_group_positions    = {}
-            self._drag_committed          = False
-            self._snap_offset             = None
+        if not self._drag_committed or (not has_comps and not has_groups):
+            self._reset_drag_state()
             return
 
-        delta = event.scenePos() - self._drag_start
+        delta     = event.scenePos() - self._drag_start
         move_cmds = []
 
-        # ── Component move commands ────────────────────────────────────────────
+        # Component move commands.
         snap_item = None
         for item, orig in self._orig_comp_positions.items():
             if (isinstance(self._snap_offset, Point)
                     and len(self._orig_comp_positions) == 1
-                    and not has_group_drag):
-                final = self._snap_offset
+                    and not has_groups):
+                final     = self._snap_offset
                 snap_item = item
             else:
                 raw   = Point(orig.x + int(round(delta.x())),
                               orig.y + int(round(delta.y())))
                 final = self.snap(raw)
 
-            # Revert live move so MoveComponent records correct before/after
+            # Revert live move so MoveComponent records correct before/after.
             item._comp.move_by(orig.x - item._comp.origin.x,
                                orig.y - item._comp.origin.y)
-
             if final != orig:
                 self.disconnect_component(item._comp.id)
                 move_cmds.append(MoveComponent(item._comp.id, orig, final))
-
             item.sync_from_model()
 
-        # ── Group move commands ────────────────────────────────────────────────
+        # Group move commands.
         snapped_group_id = None
         for group_id, origins in self._orig_group_positions.items():
             group = self._design.get_group(group_id)
             if not group:
                 continue
 
-            # Compute how far the group actually moved from original origins
-            sample_cid = group.member_ids[0] if group.member_ids else None
-            if sample_cid:
-                comp = self._design.get(sample_cid)
-                orig = origins.get(sample_cid)
-                if comp and orig:
-                    total_dx = int(round(delta.x()))
-                    total_dy = int(round(delta.y()))
-                else:
-                    total_dx = total_dy = 0
-            else:
-                total_dx = total_dy = 0
+            total_dx = total_dy = int(round(delta.x())), int(round(delta.y()))
+            total_dx, total_dy  = int(round(delta.x())), int(round(delta.y()))
 
-            # If a group snap was active, add the extra nudge to land flush
             if (isinstance(self._snap_offset, tuple)
                     and self._snap_offset[0] == "group"
                     and self._snap_offset[1] == group_id):
@@ -1413,73 +1185,39 @@ class CanvasScene(QGraphicsScene):
                 total_dy += extra_dy
                 snapped_group_id = group_id
 
-            # Revert live move so MoveGroup records correct before/after
+            # Revert live move so MoveGroup records correct before/after.
             for cid, orig in origins.items():
                 comp = self._design.get(cid)
                 if comp:
-                    comp.move_by(orig.x - comp.origin.x,
-                                 orig.y - comp.origin.y)
+                    comp.move_by(orig.x - comp.origin.x, orig.y - comp.origin.y)
 
-            if total_dx != 0 or total_dy != 0:
+            if total_dx or total_dy:
                 for cid in group.member_ids:
                     self.disconnect_component(cid)
                 move_cmds.append(MoveGroup(group_id, total_dx, total_dy))
 
-        # ── Push as one undo unit ─────────────────────────────────────────────
         if move_cmds:
-            if len(move_cmds) == 1:
-                self.cmd_stack.execute(move_cmds[0])
-            else:
-                self.cmd_stack.execute(
-                    BatchCommand(move_cmds,
-                                 f"Move {len(move_cmds)} items")
-                )
+            cmd = (move_cmds[0] if len(move_cmds) == 1
+                   else BatchCommand(move_cmds, f"Move {len(move_cmds)} items"))
+            self.cmd_stack.execute(cmd)
 
-        # Port snap connect — single component drag
         if snap_item is not None and isinstance(self._snap_offset, Point):
             self._try_connect_snapped(snap_item._comp, self._snap_offset)
 
-        # Port snap connect — single group drag
         if snapped_group_id is not None:
             group = self._design.get_group(snapped_group_id)
             if group:
                 self._try_connect_group_snap(group)
 
-        self._drag_start              = None
-        self._drag_last               = None
-        self._orig_comp_positions     = {}
-        self._orig_group_positions    = {}
-        self._drag_committed          = False
-        self._snap_offset             = None
+        self._reset_drag_state()
 
-    def keyPressEvent(self, event) -> None:
-        key  = event.key()
-        mods = event.modifiers()
-
-        if key == Qt.Key.Key_Escape:
-            self.cancel_placement()
-
-        elif key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            if self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
-                self._commit_poly_or_path()
-
-        elif key == Qt.Key.Key_C and mods & Qt.KeyboardModifier.ControlModifier:
-            self.copy_selection()
-
-        elif key == Qt.Key.Key_V and mods & Qt.KeyboardModifier.ControlModifier:
-            self.paste()
-
-        elif key == Qt.Key.Key_D and mods & Qt.KeyboardModifier.ControlModifier:
-            self.duplicate_selection()
-
-        elif key == Qt.Key.Key_R and self._pl.mode == PlacementMode.SELECT:
-            # R      → 90° CW  (steps=-1, i.e. 270° CCW)
-            # Shift+R → 90° CCW (steps=+1)
-            ccw = bool(mods & Qt.KeyboardModifier.ShiftModifier)
-            self.rotate_selection(ccw=ccw)
-
-        else:
-            super().keyPressEvent(event)
+    def _reset_drag_state(self) -> None:
+        self._drag_start           = None
+        self._drag_last            = None
+        self._drag_committed       = False
+        self._snap_offset          = None
+        self._orig_comp_positions  = {}
+        self._orig_group_positions = {}
 
     # ── Rotation ──────────────────────────────────────────────────────────────
 
@@ -1487,51 +1225,34 @@ class CanvasScene(QGraphicsScene):
         """
         Rotate all selected items by 90°.
 
-        ccw=False  →  90° CW   (the natural default; matches most EDA tools)
-        ccw=True   →  90° CCW
+        ccw=False → 90° CW (default; matches most EDA tools).
+        ccw=True  → 90° CCW.
 
-        Design rules
-        ------------
-        • steps = +1  means 90° CCW in our convention (matching _rotate_point).
-          CW is steps = -1 ≡ 3 (mod 4).
-        • Groups rotate as a UNIT around their shared bbox centre, so members
-          don't spin individually — the whole cell pivots as one.
-        • Loose components (not in any group) rotate around their own bbox centre.
-        • A mixed selection (groups + loose items) each rotates around its own
-          centre independently — this matches how move works (each item moves
-          from its own origin) and avoids surprising galaxy-spin behaviour.
-        • The entire operation is pushed as ONE BatchCommand so Ctrl+Z undoes
-          all rotations in the selection atomically.
-        • After rotate we call _on_model_changed() (via cmd_stack notify) so the
-          scene re-syncs. ComponentItem.sync_from_model() already handles the
-          rect→polygon promotion because it rebuilds the delegate from scratch.
+        Groups rotate as a unit around their shared bbox centre.
+        Loose components rotate around their own bbox centre.
+        Mixed selections rotate each item around its own centre independently.
+        The entire operation is one BatchCommand so Ctrl+Z is atomic.
         """
         steps = 1 if ccw else 3   # 3 ≡ −1 (mod 4) → 90° CW
 
-        sel        = self.selectedItems()
-        comp_items = [i for i in sel if isinstance(i, ComponentItem)]
+        sel         = self.selectedItems()
+        comp_items  = [i for i in sel if isinstance(i, ComponentItem)]
         group_items = [i for i in sel if isinstance(i, GroupItem)]
 
         if not comp_items and not group_items:
             return
 
         cmds: List = []
+        grouped_ids: set[str] = set()
 
-        # ── 1. Groups ─────────────────────────────────────────────────────────
-        # Collect member components for each selected group.
-        # Skip members that are also individually selected — they belong to their
-        # group rotation, not a separate lone rotation.
-        grouped_ids: set = set()
         for gi in group_items:
             member_comps = [
-                c for c in self._design.components
-                if c.id in gi.group.member_ids
+                c for c in self._design.components if c.id in gi.group.member_ids
             ]
             grouped_ids.update(gi.group.member_ids)
             if member_comps:
                 cmds.append(RotateGroup(gi.group, member_comps, steps=steps))
 
-        # ── 2. Loose components (not covered by a selected group) ──────────────
         for ci in comp_items:
             if ci.component.id not in grouped_ids:
                 cmds.append(RotateComponent(ci.component, steps=steps))
@@ -1547,8 +1268,7 @@ class CanvasScene(QGraphicsScene):
                 BatchCommand(cmds, f"Rotate {len(cmds)} item(s) {deg}°")
             )
 
-        # Rebuild delegates for any item whose kind changed rect→polygon.
-        # sync_from_model() checks the delegate type and replaces it if needed.
+        # Rebuild delegates for any rect→polygon type promotion from rotation.
         for ci in comp_items:
             if ci.component.id not in grouped_ids:
                 self._rebuild_delegate_if_needed(ci)
@@ -1558,22 +1278,14 @@ class CanvasScene(QGraphicsScene):
                 if item:
                     self._rebuild_delegate_if_needed(item)
 
-    def _rebuild_delegate_if_needed(self, item: "ComponentItem") -> None:
+    def _rebuild_delegate_if_needed(self, item: ComponentItem) -> None:
         """
-        If a rectangle was promoted to a polygon by rotation, its Qt delegate
-        (QGraphicsRectItem) is now the wrong type. Replace it with a fresh one.
-        sync_from_model() handles in-place coordinate updates for unchanged types;
-        this method handles the rect→polygon type promotion that rotation causes.
+        Replace the Qt delegate if a rectangle was promoted to a polygon by
+        rotation (kind changed from RECTANGLE → POLYGON).
         """
-        comp       = item._comp
-        wrong_type = (
-            isinstance(item._delegate, QGraphicsRectItem)
-            and comp.kind != ComponentKind.RECTANGLE
-        )
-        if wrong_type:
-            # Detach the stale rect delegate (child of `item`, not a top-level item)
+        if (isinstance(item._delegate, QGraphicsRectItem)
+                and item._comp.kind != ComponentKind.RECTANGLE):
             item._delegate.setParentItem(None)
-            # Build the correct polygon delegate and attach it
             item._delegate = item._make_delegate()
             item._apply_style(item.isSelected(), hovered=False)
             item.prepareGeometryChange()
@@ -1585,16 +1297,15 @@ class CanvasScene(QGraphicsScene):
     def _stamp_rect(self, center: QPointF) -> None:
         hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
         comp = GDSComponent(
-            kind   = ComponentKind.RECTANGLE, layer = self._pl.layer,
-            origin = Point(int(center.x()) - hw, int(center.y()) - hh),
-            width  = DEFAULT_W_DBU, height = DEFAULT_H_DBU,
+            kind=ComponentKind.RECTANGLE, layer=self._pl.layer,
+            origin=Point(int(center.x()) - hw, int(center.y()) - hh),
+            width=DEFAULT_W_DBU, height=DEFAULT_H_DBU,
         )
         self.cmd_stack.execute(AddComponent(comp))
-        # ghost stays for the next placement (mode persists)
 
     def _add_vertex(self, pos: QPointF) -> None:
         self._pl.pts.append(pos)
-        r = float(VERTEX_DOT_R)
+        r   = float(VERTEX_DOT_R)
         dot = QGraphicsEllipseItem(pos.x() - r, pos.y() - r, r * 2, r * 2)
         dot.setPen(_cosmetic(Colors.ACCENT, 0.5))
         dot.setBrush(QBrush(QColor(Colors.ACCENT)))
@@ -1607,12 +1318,14 @@ class CanvasScene(QGraphicsScene):
         hw, hh = DEFAULT_W_DBU // 2, DEFAULT_H_DBU // 2
         rect   = QRectF(cursor.x() - hw, cursor.y() - hh, DEFAULT_W_DBU, DEFAULT_H_DBU)
         if self._pl.ghost_rect is None:
-            self._pl.ghost_rect = QGraphicsRectItem(rect)
-            c = QColor(Colors.ACCENT); c.setAlpha(25)
-            self._pl.ghost_rect.setPen(_cosmetic(Colors.ACCENT, 1.0, Qt.PenStyle.DashLine))
-            self._pl.ghost_rect.setBrush(QBrush(c))
-            self._pl.ghost_rect.setZValue(5)
-            self.addItem(self._pl.ghost_rect)
+            ghost = QGraphicsRectItem(rect)
+            c     = QColor(Colors.ACCENT)
+            c.setAlpha(25)
+            ghost.setPen(_cosmetic(Colors.ACCENT, 1.0, Qt.PenStyle.DashLine))
+            ghost.setBrush(QBrush(c))
+            ghost.setZValue(5)
+            self.addItem(ghost)
+            self._pl.ghost_rect = ghost
         else:
             self._pl.ghost_rect.setRect(rect)
 
@@ -1622,11 +1335,12 @@ class CanvasScene(QGraphicsScene):
             return
         poly = QPolygonF(pts)
         if self._pl.ghost_poly is None:
-            self._pl.ghost_poly = QGraphicsPolygonItem(poly)
-            self._pl.ghost_poly.setPen(_cosmetic(Colors.ACCENT, 1.0, Qt.PenStyle.DashLine))
-            self._pl.ghost_poly.setBrush(QBrush(Qt.BrushStyle.NoBrush))
-            self._pl.ghost_poly.setZValue(4)
-            self.addItem(self._pl.ghost_poly)
+            ghost = QGraphicsPolygonItem(poly)
+            ghost.setPen(_cosmetic(Colors.ACCENT, 1.0, Qt.PenStyle.DashLine))
+            ghost.setBrush(QBrush(Qt.BrushStyle.NoBrush))
+            ghost.setZValue(4)
+            self.addItem(ghost)
+            self._pl.ghost_poly = ghost
         else:
             self._pl.ghost_poly.setPolygon(poly)
 
@@ -1635,15 +1349,16 @@ class CanvasScene(QGraphicsScene):
             return
         last = self._pl.pts[-1]
         if self._pl.ghost_edge is None:
-            self._pl.ghost_edge = QGraphicsLineItem(last.x(), last.y(), cursor.x(), cursor.y())
-            self._pl.ghost_edge.setPen(_cosmetic(Colors.ACCENT_BRIGHT, 1.0, Qt.PenStyle.DotLine))
-            self._pl.ghost_edge.setZValue(6)
-            self.addItem(self._pl.ghost_edge)
+            ghost = QGraphicsLineItem(last.x(), last.y(), cursor.x(), cursor.y())
+            ghost.setPen(_cosmetic(Colors.ACCENT_BRIGHT, 1.0, Qt.PenStyle.DotLine))
+            ghost.setZValue(6)
+            self.addItem(ghost)
+            self._pl.ghost_edge = ghost
         else:
             self._pl.ghost_edge.setLine(last.x(), last.y(), cursor.x(), cursor.y())
 
     def _commit_poly_or_path(self) -> None:
-        pts = self._pl.pts
+        pts     = self._pl.pts
         min_pts = MIN_POLY_PTS if self._pl.mode == PlacementMode.PLACE_POLYGON else 2
         if len(pts) < min_pts:
             return
@@ -1661,7 +1376,7 @@ class CanvasScene(QGraphicsScene):
                 path_width=DEFAULT_PW_DBU,
             )
         self.cmd_stack.execute(AddComponent(comp))
-        self._clear_ghosts()   # reset vertices; stay in same mode
+        self._clear_ghosts()
 
     def _clear_ghosts(self) -> None:
         for item in (self._pl.ghost_rect, self._pl.ghost_poly, self._pl.ghost_edge):
@@ -1669,26 +1384,24 @@ class CanvasScene(QGraphicsScene):
                 self.removeItem(item)
         for dot in self._pl.vertex_dots:
             self.removeItem(dot)
-        # Atomically reset all placement state, preserving mode and layer
         mode  = self._pl.mode  if self._pl.mode  is not None else PlacementMode.SELECT
         layer = self._pl.layer
-        self._pl = PlacementState()
+        self._pl       = PlacementState()
         self._pl.mode  = mode
         self._pl.layer = layer
 
+    # ── Copy / paste / duplicate ──────────────────────────────────────────────
+
     def copy_selection(self) -> None:
         """
-        Copy all selected ComponentItems (and GroupItems) to the in-process Clipboard.
+        Copy selected items to the Clipboard.
 
-        Group detection:
-          • If a GroupItem is selected, all of its member components are collected
-            and the group object is preserved so paste re-creates the group.
-          • If only loose ComponentItems are selected and they all share one group,
-            that group is also copied (original behaviour).
-          • Mixed selections (multiple groups, or group + loose items) drop grouping —
-            components are pasted as independent shapes, matching standard EDA behaviour.
+        - Single GroupItem selected → copy all its members + group metadata.
+        - Multiple GroupItems selected → merge members, drop group metadata.
+        - Loose ComponentItems only → copy them; carry group metadata if they
+          all belong to exactly one shared group.
         """
-        sel = self.selectedItems()
+        sel         = self.selectedItems()
         group_items = [i for i in sel if isinstance(i, GroupItem)]
         comp_items  = [i for i in sel if isinstance(i, ComponentItem)]
 
@@ -1696,18 +1409,12 @@ class CanvasScene(QGraphicsScene):
         group: Optional[ComponentGroup] = None
 
         if group_items:
-            # Single group selected (the common case for cells / parametric groups).
-            # Collect all member components from the first group; ignore extras for
-            # mixed selections — drop grouping as stated in the docstring.
             if len(group_items) == 1:
-                gi = group_items[0]
-                group = gi.group
-                components = [
-                    c for c in self._design.components
-                    if c.id in group.member_ids
-                ]
+                gi         = group_items[0]
+                group      = gi.group
+                components = [c for c in self._design.components
+                              if c.id in group.member_ids]
             else:
-                # Multiple groups selected — merge members, drop all group metadata.
                 seen_ids: set[str] = set()
                 for gi in group_items:
                     for cid in gi.group.member_ids:
@@ -1717,11 +1424,9 @@ class CanvasScene(QGraphicsScene):
                                 components.append(comp)
                                 seen_ids.add(cid)
         else:
-            # No GroupItem selected — fall back to the original loose-component path.
             if not comp_items:
                 return
             components = [i.component for i in comp_items]
-            # Detect if all selected components share exactly one group
             if len(comp_items) > 1:
                 groups = {self._design.group_of(c.id) for c in components}
                 groups.discard(None)
@@ -1731,39 +1436,33 @@ class CanvasScene(QGraphicsScene):
         if not components:
             return
 
-        Clipboard.instance().copy(components, group)
-        Clipboard.instance().reset_paste_count()
+        cb = Clipboard.instance()
+        cb.copy(components, group)
+        cb.reset_paste_count()
 
     def paste(self) -> None:
         """
-        Paste from the Clipboard centred on the current cursor position so the
-        result lands exactly where the user is pointing.  Falls back to viewport
-        centre if the cursor hasn't moved over the canvas yet.
-        Nudged by PASTE_OFFSET_DBU × paste_count so consecutive pastes stagger.
-        The newly pasted items are selected immediately so the user can drag
-        them to their final position without an extra click.
+        Paste from the Clipboard centred on the current cursor position.
+        Falls back to viewport centre if the cursor hasn't moved over the canvas.
+        Consecutive pastes are staggered by PASTE_OFFSET_DBU × paste_count.
+        Newly pasted items are selected immediately.
         """
         cb = Clipboard.instance()
         if cb.is_empty:
             return
 
-        # Prefer cursor position; fall back to viewport centre.
         sp = self._cursor_scene_pos
-        if sp.isNull():
-            views = self.views()
-            if views:
-                vr = views[0].viewport().rect()
-                sp = views[0].mapToScene(vr.center())
+        if sp.isNull() and self.views():
+            vr = self.views()[0].viewport().rect()
+            sp = self.views()[0].mapToScene(vr.center())
         target_center = (int(sp.x()), int(sp.y()))
 
         components, group = cb.paste(
             base_offset_dbu=PASTE_OFFSET_DBU,
             target_center=target_center,
         )
-        cmd = PasteComponents(components, group)
-        self.cmd_stack.execute(cmd)
+        self.cmd_stack.execute(PasteComponents(components, group))
 
-        # Select only the newly pasted items
         self.clearSelection()
         for comp in components:
             item = self._items.get(comp.id)
@@ -1771,29 +1470,19 @@ class CanvasScene(QGraphicsScene):
                 item.setSelected(True)
 
     def duplicate_selection(self) -> None:
-        """
-        Duplicate = copy + paste in one gesture (Ctrl+D).
-        Resets paste count before the implicit paste so the duplicate lands
-        at exactly +1 × PASTE_OFFSET from the original, never further.
-        """
+        """Copy + paste in one gesture (Ctrl+D). Paste lands at +1 × PASTE_OFFSET."""
         self.copy_selection()
         self.paste()
 
-    def drop_cell(self, cell_id: str, scene_pos: QPointF | None = None,
-                  params: dict | None = None) -> None:
+    def drop_cell(self, cell_id: str, scene_pos: Optional[QPointF] = None,
+                  params: Optional[dict] = None) -> None:
         if scene_pos is None:
-            # Default: centre of the current viewport
-            view = self.views()[0] if self.views() else None
-            if view is not None:
-                vr = view.viewport().rect()
-                scene_pos = view.mapToScene(vr.center())
-            else:
-                scene_pos = QPointF(0, 0)
+            view      = self.views()[0] if self.views() else None
+            scene_pos = view.mapToScene(view.viewport().rect().center()) if view else QPointF(0, 0)
 
         origin = Point(int(scene_pos.x()), int(scene_pos.y()))
         result = place_cell(cell_id, origin, params=params)
         self.cmd_stack.execute(PlaceCellCommand(result, cell_id=cell_id, cell_params=params or {}))
-
 
     # ── Background ────────────────────────────────────────────────────────────
 
@@ -1803,30 +1492,32 @@ class CanvasScene(QGraphicsScene):
         self._draw_origin(painter)
 
     def _draw_grid(self, painter: QPainter, rect: QRectF) -> None:
-        left   = int(math.floor(rect.left()  / GRID_MINOR_DBU)) * GRID_MINOR_DBU
-        top    = int(math.floor(rect.top()   / GRID_MINOR_DBU)) * GRID_MINOR_DBU
-        right  = int(math.ceil(rect.right()  / GRID_MINOR_DBU)) * GRID_MINOR_DBU
-        bottom = int(math.ceil(rect.bottom() / GRID_MINOR_DBU)) * GRID_MINOR_DBU
+        left   = int(math.floor(rect.left()   / GRID_MINOR_DBU)) * GRID_MINOR_DBU
+        top    = int(math.floor(rect.top()    / GRID_MINOR_DBU)) * GRID_MINOR_DBU
+        right  = int(math.ceil(rect.right()   / GRID_MINOR_DBU)) * GRID_MINOR_DBU
+        bottom = int(math.ceil(rect.bottom()  / GRID_MINOR_DBU)) * GRID_MINOR_DBU
 
-        minor = QPen(QColor(Colors.GRID_MINOR)); minor.setCosmetic(True); minor.setWidthF(0.5)
-        major = QPen(QColor(Colors.GRID_MAJOR)); major.setCosmetic(True); major.setWidthF(0.8)
+        minor_pen = QPen(QColor(Colors.GRID_MINOR)); minor_pen.setCosmetic(True); minor_pen.setWidthF(0.5)
+        major_pen = QPen(QColor(Colors.GRID_MAJOR)); major_pen.setCosmetic(True); major_pen.setWidthF(0.8)
 
         painter.save()
         x = left
         while x <= right:
-            painter.setPen(major if x % GRID_MAJOR_DBU == 0 else minor)
+            painter.setPen(major_pen if x % GRID_MAJOR_DBU == 0 else minor_pen)
             painter.drawLine(QPointF(x, top), QPointF(x, bottom))
             x += GRID_MINOR_DBU
         y = top
         while y <= bottom:
-            painter.setPen(major if y % GRID_MAJOR_DBU == 0 else minor)
+            painter.setPen(major_pen if y % GRID_MAJOR_DBU == 0 else minor_pen)
             painter.drawLine(QPointF(left, y), QPointF(right, y))
             y += GRID_MINOR_DBU
         painter.restore()
 
     def _draw_origin(self, painter: QPainter) -> None:
         size = GRID_MAJOR_DBU * 3
-        pen  = QPen(QColor(Colors.GRID_ORIGIN)); pen.setCosmetic(True); pen.setWidthF(1.0)
+        pen  = QPen(QColor(Colors.GRID_ORIGIN))
+        pen.setCosmetic(True)
+        pen.setWidthF(1.0)
         painter.setPen(pen)
         painter.drawLine(QPointF(-size, 0), QPointF(size, 0))
         painter.drawLine(QPointF(0, -size), QPointF(0, size))
@@ -1835,18 +1526,18 @@ class CanvasScene(QGraphicsScene):
 
     def _on_selection_changed(self) -> None:
         """
-        Fired by Qt on every selection change (rubber-band, programmatic).
-        - GroupItem selected → do nothing; group_selected signal from GroupItem handles it.
-        - 0 ComponentItems  → clear panel via item_selected("")
-        - 1 ComponentItem   → show single component via item_selected(id)
-        - 2+ ComponentItems → show multi-select panel via multi_selection_changed
+        Fired by Qt on every selection change.
+        - GroupItem(s) selected  → group_selected signal already handled by GroupItem.
+        - 0 ComponentItems       → clear panel via item_selected("").
+        - 1 ComponentItem        → show single component.
+        - 2+ ComponentItems      → show multi-select panel.
         """
-        sel = self.selectedItems()
+        sel         = self.selectedItems()
         comp_items  = [i for i in sel if isinstance(i, ComponentItem)]
         group_items = [i for i in sel if isinstance(i, GroupItem)]
 
         if group_items:
-            return  # GroupItem.mousePressEvent already emitted group_selected
+            return
 
         if not comp_items:
             self.item_selected.emit("")
@@ -1876,29 +1567,24 @@ class CanvasScene(QGraphicsScene):
         for comp in self._design.components:
             self._items[comp.id].sync_from_model()
 
-        # ── Group sync ────────────────────────────────────────────────────────
-        model_gids  = {g.id for g in self._design.groups}
-        scene_gids  = set(self._group_items.keys())
+        # Group sync.
+        model_gids = {g.id for g in self._design.groups}
+        scene_gids = set(self._group_items.keys())
 
         for group in self._design.groups:
             if group.id not in self._group_items:
                 gi = GroupItem(group, self)
                 self.addItem(gi)
                 self._group_items[group.id] = gi
-                # Lock members immediately — they must not be individually
-                # selectable/draggable until the group enters edit mode.
-                # Without this, sweep-generated groups leave members selectable,
-                # causing Qt to hold simultaneous selected-item references to both
-                # the GroupItem and its ComponentItems during a merge, which
-                # produces a segfault when the GroupItem is removed mid-selection.
+                # Lock members immediately — must not be individually selectable
+                # until the group enters edit mode.
                 self._set_group_members_movable(group.id, False)
 
         for dead_id in scene_gids - model_gids:
             dead_item = self._group_items.pop(dead_id)
             dead_item.setSelected(False)
             self.removeItem(dead_item)
-            # Re-enable former members so they're individually selectable
-            # again now that the group is dissolved (ungroup / merge).
+            # Re-enable former members so they're individually selectable again.
             for cid in dead_item.group.member_ids:
                 item = self._items.get(cid)
                 if item:
@@ -1906,7 +1592,6 @@ class CanvasScene(QGraphicsScene):
                     item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, True)
                     item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
-        # Invalidate group geometry after any model change
         for gi in self._group_items.values():
             gi.prepareGeometryChange()
 
@@ -1921,12 +1606,8 @@ class CanvasScene(QGraphicsScene):
         for cid in group.member_ids:
             item = self._items.get(cid)
             if item:
-                item.setFlag(
-                    QGraphicsItem.GraphicsItemFlag.ItemIsMovable, movable
-                )
-                item.setFlag(
-                    QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, movable
-                )
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,    movable)
+                item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, movable)
 
     def exit_group_edit(self) -> None:
         if self._editing_group_id:
@@ -1935,3 +1616,10 @@ class CanvasScene(QGraphicsScene):
                 gi.exit_edit_mode()
             self._editing_group_id = None
             self.group_edit_exited.emit()
+
+    # ── Legacy ────────────────────────────────────────────────────────────────
+
+    def _selected_group_count(self) -> int:
+        """Return the number of non-editing GroupItems currently selected."""
+        return sum(1 for i in self.selectedItems()
+                   if isinstance(i, GroupItem) and not i.is_editing)

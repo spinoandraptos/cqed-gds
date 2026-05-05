@@ -1,254 +1,65 @@
 """
-ui/main_window.py — Top-level QMainWindow.
+ui/main_window.py — Top-level QMainWindow for GDS Canvas Designer.
 
-Phase 2 changes over Phase 1:
-  - Toolbar: three mutually-exclusive tool buttons (Select / Rect / Polygon / Path)
-    using QToolButton.setCheckable + an action group so only one is active at a time.
-  - Status bar left segment shows current placement mode label from scene.
-  - ESC shortcut in menu + always available globally (scene handles it too).
-  - _on_place_mode_requested() — receives signal from palette, calls scene.set_mode().
-  - _on_layer_change_requested() — wraps EditComponent in undo stack.
-  - Palette signal renamed: place_mode_requested (not place_requested).
+Responsibilities:
+  - Menu bar, toolbar, status bar, and central widget layout.
+  - Wiring scene/view/panel signals to application-level slots.
+  - File I/O (new, open, save, save-as, export).
+  - Edit actions (undo/redo, copy/paste/duplicate, group/ungroup, delete, sweep).
 """
 
 from __future__ import annotations
+
+from pathlib import Path
 from typing import Optional
 
-from PyQt6.QtWidgets import (
-    QHBoxLayout, QMainWindow, QToolBar, QLabel, QVBoxLayout,
-    QWidget, QSizePolicy, QMessageBox, QApplication, QToolButton,
-    QDialog, QDialogButtonBox, QFileDialog, QTabWidget,
-)
-from PyQt6.QtGui import (
-    QAction, QActionGroup, QKeySequence, QFont, QColor,
-    QIcon, QPixmap, QPainter,
-)
-from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
 import qtawesome as qta
-from pathlib import Path
-from ui.theme import Colors, Fonts, Geometry, apply_theme
-from ui.canvas_scene import CanvasScene, PlacementMode, GroupItem
+from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
+from PyQt6.QtGui import QAction, QKeySequence
+from PyQt6.QtWidgets import (
+    QApplication, QDialog, QDialogButtonBox, QFileDialog,
+    QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox,
+    QSizePolicy, QTabWidget, QToolBar, QVBoxLayout, QWidget,
+)
+
+from core.cell_library import CELL_BY_ID, Point, place_cell
+from core.clipboard import Clipboard
+from core.commands import (
+    BatchCommand, EditComponent, GroupComponents, MergeGroups,
+    RemoveComponent, RemoveGroup, ReplaceCellCmd, UngroupComponents,
+)
+from core.exporter import ExportError, export_gds
+from core.model import ComponentKind, DesignScene
+from core.serialiser import SerialisationError, load, save
+from ui.canvas_scene import CanvasScene, GroupItem, PlacementMode
 from ui.canvas_view import CanvasView
-from ui.panels import ComponentPalette, PropertiesPanel
-from core.model import DesignScene, GDSComponent, ComponentKind, ComponentGroup
-from core.commands import CommandStack, EditComponent, GroupComponents, UngroupComponents, MergeGroups
-from ui.export_dialog import ExportResultDialog
-from core.exporter import export_gds, ExportError
-from core.serialiser import save, load, SerialisationError
-from ui.sweep_dialog import SweepDialog
 from ui.cell_palette import CellLibraryPanel
-
-class CellSweepDialog(QDialog):
-    """
-    Sweep dialog for parametric cell groups.
-
-    Lets the user choose one cell parameter, define a start/stop/steps range,
-    and generates one re-placed copy of the cell for each step — laid out in a
-    row with a configurable spacing.
-
-    Re-uses the same _ReplaceCellCmd pattern that _on_cell_param_change_requested
-    uses for single edits, so every sweep is a single BatchCommand on the undo stack.
-
-    Layout
-    ------
-    ┌─────────────────────────────────┐
-    │  Cell: ManhattanJJ (…)          │
-    │  Parameter: [combo ▼]           │
-    │  Start:  [spinbox]  µm          │
-    │  Stop:   [spinbox]  µm          │
-    │  Steps:  [spinbox]  (int)       │
-    │  Spacing:[spinbox]  µm          │
-    │  [ Cancel ]        [ Sweep ]    │
-    └─────────────────────────────────┘
-    """
-
-    def __init__(self, group, design, scene, parent=None) -> None:
-        super().__init__(parent)
-        self._group  = group
-        self._design = design
-        self._scene  = scene
-
-        from core.cell_library import CELL_BY_ID
-        self._cdef = CELL_BY_ID[group.cell_id]
-
-        self.setWindowTitle(f"Sweep — {self._cdef.name}")
-        self.setMinimumWidth(340)
-        self._build_ui()
-
-    def _build_ui(self) -> None:
-        from PyQt6.QtWidgets import (
-            QFormLayout, QComboBox, QDoubleSpinBox, QSpinBox,
-            QDialogButtonBox, QLabel,
-        )
-        root = QVBoxLayout(self)
-        root.setSpacing(10)
-
-        # Current params = defaults overridden by any stored overrides
-        self._current_params = dict(self._cdef.defaults)
-        stored = getattr(self._group, "_cell_params", {})
-        self._current_params.update(stored)
-
-        form = QFormLayout()
-        form.setSpacing(8)
-
-        # Cell name row
-        cell_lbl = QLabel(f"<b>{self._cdef.name}</b>  —  {self._group.name}")
-        cell_lbl.setWordWrap(True)
-        root.addWidget(cell_lbl)
-        root.addLayout(form)
-
-        # Parameter selector — only numeric (float) params can be swept
-        self._param_combo = QComboBox()
-        float_params = [k for k, v in self._cdef.defaults.items()
-                        if isinstance(v, float)]
-        self._param_combo.addItems(float_params)
-        form.addRow("Parameter:", self._param_combo)
-
-        # Start / stop / steps
-        self._start_sb = QDoubleSpinBox()
-        self._start_sb.setRange(0.001, 1000.0)
-        self._start_sb.setDecimals(3)
-        self._start_sb.setSuffix(" µm")
-        self._start_sb.setSingleStep(0.1)
-
-        self._stop_sb = QDoubleSpinBox()
-        self._stop_sb.setRange(0.001, 1000.0)
-        self._stop_sb.setDecimals(3)
-        self._stop_sb.setSuffix(" µm")
-        self._stop_sb.setSingleStep(0.1)
-
-        self._steps_sb = QSpinBox()
-        self._steps_sb.setRange(2, 100)
-        self._steps_sb.setValue(5)
-
-        self._spacing_sb = QDoubleSpinBox()
-        self._spacing_sb.setRange(0.0, 10_000.0)
-        self._spacing_sb.setDecimals(1)
-        self._spacing_sb.setSuffix(" µm")
-        self._spacing_sb.setSingleStep(1.0)
-        self._spacing_sb.setValue(10.0)
-
-        form.addRow("Start:", self._start_sb)
-        form.addRow("Stop:",  self._stop_sb)
-        form.addRow("Steps:", self._steps_sb)
-        form.addRow("Spacing:", self._spacing_sb)
-
-        # Pre-populate start/stop from current value of the first parameter
-        self._param_combo.currentTextChanged.connect(self._on_param_changed)
-        self._on_param_changed(self._param_combo.currentText())
-
-        # Buttons
-        btns = QDialogButtonBox(
-            QDialogButtonBox.StandardButton.Cancel |
-            QDialogButtonBox.StandardButton.Ok
-        )
-        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Sweep")
-        btns.accepted.connect(self._do_sweep)
-        btns.rejected.connect(self.reject)
-        root.addWidget(btns)
-
-    def _on_param_changed(self, key: str) -> None:
-        """Pre-fill start/stop around the current value of the chosen parameter."""
-        if not key:
-            return
-        cur = self._current_params.get(key, self._cdef.defaults.get(key, 1.0))
-        self._start_sb.setValue(max(0.001, cur * 0.5))
-        self._stop_sb.setValue(cur * 1.5)
-
-    def _do_sweep(self) -> None:
-        from core.cell_library import place_cell, CELL_BY_ID
-        from core.commands import PlaceCellCommand, BatchCommand
-        from core.model import Point
-        import math
-
-        key     = self._param_combo.currentText()
-        start   = self._start_sb.value()
-        stop    = self._stop_sb.value()
-        n_steps = self._steps_sb.value()
-        spacing_dbu = int(round(self._spacing_sb.value() * 1000))  # µm → DBU
-
-        if start >= stop:
-            QMessageBox.warning(self, "Sweep", "Start must be less than Stop.")
-            return
-
-        # Compute the group's current bbox to figure out its width for auto-spacing
-        bb     = self._group.bbox_from(self._design.components)
-        origin = Point(bb.x_min, bb.y_min)
-        cell_width_dbu = bb.x_max - bb.x_min
-
-        values = [start + (stop - start) * i / (n_steps - 1)
-                  for i in range(n_steps)]
-
-        cmds = []
-        for i, val in enumerate(values):
-            params = dict(self._current_params)
-            params[key] = val
-
-            # Place each copy offset to the right by (cell_width + spacing) × i
-            offset_x = i * (cell_width_dbu + spacing_dbu)
-            step_origin = Point(origin.x + offset_x, origin.y)
-
-            try:
-                result = place_cell(self._group.cell_id, step_origin, params=params)
-            except (KeyError, ValueError) as exc:
-                QMessageBox.warning(self, "Sweep", f"Step {i+1}: {exc}")
-                return
-
-            cmd = PlaceCellCommand(result, cell_id=self._group.cell_id,
-                                   cell_params=params)
-            cmds.append(cmd)
-
-        if cmds:
-            self._scene.cmd_stack.execute(
-                BatchCommand(cmds, f"Sweep {self._cdef.name}.{key} "
-                                   f"[{start:.3f}…{stop:.3f}] ×{n_steps}")
-            )
-
-        self.accept()
-
-
-class _RemoveGroup:
-    """
-    Minimal undo-able command to remove a group record from the design.
-    Used by _delete_selected so group deletion is undoable as part of
-    a BatchCommand alongside RemoveComponent.
-    """
-    def __init__(self, group) -> None:
-        # Reconstruct explicitly — shallow copy would share the member_ids list
-        self._group = ComponentGroup(
-            name=group.name,
-            member_ids=list(group.member_ids),
-            id=group.id,
-        )
-        # Preserve any dynamic attrs (cell_id, _cell_params) so undo restores
-        # parametric cell metadata correctly
-        for attr in ("cell_id", "_cell_params"):
-            if hasattr(group, attr):
-                setattr(self._group, attr, getattr(group, attr))
-
-    def execute(self, design) -> None:
-        design.remove_group(self._group.id)
-
-    def undo(self, design) -> None:
-        design.add_group(self._group)
-
-    @property
-    def description(self) -> str:
-        return f"Remove group '{self._group.name}'"
+from ui.export_dialog import ExportResultDialog
+from ui.panels import ComponentPalette, PropertiesPanel
+from ui.sweep_dialog import CellSweepDialog, GroupSweepDialog, SweepDialog
+from ui.theme import Colors, Fonts, Geometry, apply_theme
 
 
 class MainWindow(QMainWindow):
 
     TITLE_BASE = "GDS Canvas Designer"
 
+    # Maps ComponentKind → the PlacementMode the palette requests.
+    _KIND_TO_MODE: dict[ComponentKind, PlacementMode] = {
+        ComponentKind.RECTANGLE: PlacementMode.PLACE_RECT,
+        ComponentKind.POLYGON:   PlacementMode.PLACE_POLYGON,
+        ComponentKind.PATH:      PlacementMode.PLACE_PATH,
+    }
+
     def __init__(self) -> None:
         super().__init__()
 
-        self._design = DesignScene(name="layout")
-        self._current_file: Optional[Path] = None
-        self._selected_group_id: Optional[str] = None   # tracks last group-selected signal
-        self._scene  = CanvasScene(self._design)
-        self._view   = CanvasView(self._scene)
+        self._design            = DesignScene(name="layout")
+        self._current_file:     Optional[Path] = None
+        self._selected_group_id: Optional[str] = None
+
+        self._scene = CanvasScene(self._design)
+        self._view  = CanvasView(self._scene)
 
         apply_theme(QApplication.instance())
 
@@ -271,58 +82,63 @@ class MainWindow(QMainWindow):
 
     def _build_menu_bar(self) -> None:
         mb = self.menuBar()
+        self._build_file_menu(mb)
+        self._build_edit_menu(mb)
+        self._build_view_menu(mb)
+        self._build_help_menu(mb)
 
-        # File
-        file_menu = mb.addMenu("File")
-        self._act_new    = self._action("New Design",      "Ctrl+N",         self._new_design)
-        self._act_open = self._action("Open…", "Ctrl+O", self._open)
-        self._act_save   = self._action("Save",            "Ctrl+S",         self._save)
-        self._act_saveas = self._action("Save As…",        "Ctrl+Shift+S",   self._save_as)
-        self._act_export = self._action("Export GDS…",     "Ctrl+E",         self._export_gds)
-        self._act_quit   = self._action("Quit",            "Ctrl+Q",         self.close)
-        for a in [self._act_new, self._act_open, None,
-                self._act_save, self._act_saveas, None,
-                self._act_export, None, self._act_quit]:
-            file_menu.addSeparator() if a is None else file_menu.addAction(a)
+    def _build_file_menu(self, mb) -> None:
+        menu = mb.addMenu("File")
+        self._act_new    = self._action("New Design",    "Ctrl+N",       self._new_design)
+        self._act_open   = self._action("Open…",         "Ctrl+O",       self._open)
+        self._act_save   = self._action("Save",          "Ctrl+S",       self._save)
+        self._act_saveas = self._action("Save As…",      "Ctrl+Shift+S", self._save_as)
+        self._act_export = self._action("Export GDS…",   "Ctrl+E",       self._export_gds)
+        self._act_quit   = self._action("Quit",          "Ctrl+Q",       self.close)
+        self._populate_menu(menu, [
+            self._act_new, self._act_open, None,
+            self._act_save, self._act_saveas, None,
+            self._act_export, None,
+            self._act_quit,
+        ])
 
-        # Edit
-        edit_menu = mb.addMenu("Edit")
-        self._act_undo   = self._action("Undo",            "Ctrl+Z",         self._undo)
-        self._act_redo   = self._action("Redo",            "Ctrl+Shift+Z",   self._redo)
-        self._act_copy      = self._action("Copy",           "Ctrl+C",         self._copy)
-        self._act_paste     = self._action("Paste",          "Ctrl+V",         self._paste)
-        self._act_duplicate = self._action("Duplicate",      "Ctrl+D",         self._duplicate)
-        self._act_selall = self._action("Select All",      "Ctrl+A",         self._select_all)
-        self._act_delete = self._action("Delete",          "Delete",         self._delete_selected)
-        self._act_sweep = self._action("Sweep Parameter…", "Ctrl+W", self._sweep)
-        self._act_group   = self._action("Group",   "Ctrl+G",       self._group_selected)
-        self._act_ungroup = self._action("Ungroup", "Ctrl+Shift+G", self._ungroup_selected)
-        self._act_rot_cw  = self._action("Rotate 90° CW",  "R",             lambda: self._scene.rotate_selection(ccw=False))
-        self._act_rot_ccw = self._action("Rotate 90° CCW", "Shift+R",       lambda: self._scene.rotate_selection(ccw=True))
-        self._act_escape = self._action("Cancel / Select", "Escape",         self._escape)
-        for a in [self._act_undo, self._act_redo, None,
-                self._act_copy, self._act_paste, self._act_duplicate, None,
-                self._act_selall, self._act_delete,
-                self._act_sweep, self._act_group, self._act_ungroup,
-                self._act_rot_cw, self._act_rot_ccw,
-                None, self._act_escape]:
-            edit_menu.addSeparator() if a is None else edit_menu.addAction(a)
+    def _build_edit_menu(self, mb) -> None:
+        menu = mb.addMenu("Edit")
+        self._act_undo      = self._action("Undo",               "Ctrl+Z",       self._undo)
+        self._act_redo      = self._action("Redo",               "Ctrl+Shift+Z", self._redo)
+        self._act_copy      = self._action("Copy",               "Ctrl+C",       self._copy)
+        self._act_paste     = self._action("Paste",              "Ctrl+V",       self._paste)
+        self._act_duplicate = self._action("Duplicate",          "Ctrl+D",       self._duplicate)
+        self._act_selall    = self._action("Select All",         "Ctrl+A",       self._select_all)
+        self._act_delete    = self._action("Delete",             "Delete",       self._delete_selected)
+        self._act_sweep     = self._action("Sweep Parameter…",   "Ctrl+W",       self._sweep)
+        self._act_group     = self._action("Group",              "Ctrl+G",       self._group_selected)
+        self._act_ungroup   = self._action("Ungroup",            "Ctrl+Shift+G", self._ungroup_selected)
+        self._act_rot_cw    = self._action("Rotate 90° CW",      "R",            lambda: self._scene.rotate_selection(ccw=False))
+        self._act_rot_ccw   = self._action("Rotate 90° CCW",     "Shift+R",      lambda: self._scene.rotate_selection(ccw=True))
+        self._act_escape    = self._action("Cancel / Select",    "Escape",       self._escape)
+        self._populate_menu(menu, [
+            self._act_undo, self._act_redo, None,
+            self._act_copy, self._act_paste, self._act_duplicate, None,
+            self._act_selall, self._act_delete,
+            self._act_sweep, self._act_group, self._act_ungroup,
+            self._act_rot_cw, self._act_rot_ccw, None,
+            self._act_escape,
+        ])
 
-        # View
-        view_menu = mb.addMenu("View")
-        self._act_fit  = self._action("Fit All",           "F",              self._view.zoom_fit)
-        self._act_zin  = self._action("Zoom In",           "Ctrl+=",         self._view.zoom_in)
-        self._act_zout = self._action("Zoom Out",          "Ctrl+-",         self._view.zoom_out)
-        for a in [self._act_fit, None, self._act_zin, self._act_zout]:
-            view_menu.addSeparator() if a is None else view_menu.addAction(a)
+    def _build_view_menu(self, mb) -> None:
+        menu = mb.addMenu("View")
+        self._act_fit  = self._action("Fit All",  "F",      self._view.zoom_fit)
+        self._act_zin  = self._action("Zoom In",  "Ctrl+=", self._view.zoom_in)
+        self._act_zout = self._action("Zoom Out", "Ctrl+-", self._view.zoom_out)
+        self._populate_menu(menu, [self._act_fit, None, self._act_zin, self._act_zout])
 
-        # Help
-        help_menu = mb.addMenu("Help")
-        self._about = self._action("About…", "", self._about)
-        self._shortcuts = self._action("Keyboard Shortcuts", "Ctrl+H", self._shortcuts_help)
-        for a in [self._about, None, self._shortcuts]:
-            help_menu.addSeparator() if a is None else help_menu.addAction(a)
-            
+    def _build_help_menu(self, mb) -> None:
+        menu = mb.addMenu("Help")
+        self._act_about     = self._action("About…",             "",       self._about)
+        self._act_shortcuts = self._action("Keyboard Shortcuts", "Ctrl+H", self._shortcuts_help)
+        self._populate_menu(menu, [self._act_about, None, self._act_shortcuts])
+
     @staticmethod
     def _action(label: str, shortcut: str, slot) -> QAction:
         act = QAction(label)
@@ -330,6 +146,15 @@ class MainWindow(QMainWindow):
             act.setShortcut(QKeySequence(shortcut))
         act.triggered.connect(slot)
         return act
+
+    @staticmethod
+    def _populate_menu(menu, items: list) -> None:
+        """Add actions to a menu; None inserts a separator."""
+        for item in items:
+            if item is None:
+                menu.addSeparator()
+            else:
+                menu.addAction(item)
 
     # ── Toolbar ───────────────────────────────────────────────────────────────
 
@@ -340,57 +165,35 @@ class MainWindow(QMainWindow):
         self._toolbar.setIconSize(QSize(18, 18))
         self._toolbar.setFixedHeight(Geometry.TOOLBAR_HEIGHT)
 
-        # ── Undo / Redo ───────────────────────────────────────────────────────
         self._tb_undo = self._tb_button("fa5s.undo",  "Undo  Ctrl+Z",       self._undo)
         self._tb_redo = self._tb_button("fa5s.redo",  "Redo  Ctrl+Shift+Z", self._redo)
         self._toolbar.addSeparator()
 
-        # ── Tool Select  ────────────────────────
         self._tb_select = self._tb_button(
             "fa5s.mouse-pointer", "Select  (Esc)",
-            lambda: self._enter_mode(PlacementMode.SELECT)
+            lambda: self._enter_mode(PlacementMode.SELECT),
         )
         self._toolbar.addSeparator()
 
-        # ── Zoom ─────────────────────────────────────────────────────────────
         self._tb_button("fa5s.search-plus",       "Zoom In  (+)",  self._view.zoom_in)
         self._tb_button("fa5s.search-minus",      "Zoom Out  (−)", self._view.zoom_out)
         self._tb_button("fa5s.expand-arrows-alt", "Fit All  (F)",  self._view.zoom_fit)
         self._toolbar.addSeparator()
 
-        # ── Grouping ─────────────────────────────────────────────────────────────
         self._tb_group   = self._tb_button("fa5s.object-group",   "Group Selected  (Ctrl+G)",         self._group_selected)
         self._tb_ungroup = self._tb_button("fa5s.object-ungroup", "Ungroup Selected  (Ctrl+Shift+G)", self._ungroup_selected)
         self._toolbar.addSeparator()
 
-        # ── Rotation ──────────────────────────────────────────────────────────
-        # R = 90° CW, Shift+R = 90° CCW (matches keyPressEvent in canvas_scene)
-        self._tb_rot_cw  = self._tb_button(
-            "fa5s.redo-alt",
-            "Rotate 90° CW  (R)",
-            lambda: self._scene.rotate_selection(ccw=False),
-        )
-        self._tb_rot_ccw = self._tb_button(
-            "fa5s.undo-alt",
-            "Rotate 90° CCW  (Shift+R)",
-            lambda: self._scene.rotate_selection(ccw=True),
-        )
+        self._tb_rot_cw  = self._tb_button("fa5s.redo-alt",  "Rotate 90° CW  (R)",       lambda: self._scene.rotate_selection(ccw=False))
+        self._tb_rot_ccw = self._tb_button("fa5s.undo-alt",  "Rotate 90° CCW  (Shift+R)", lambda: self._scene.rotate_selection(ccw=True))
         self._toolbar.addSeparator()
 
-        # ── Delete ────────────────────────────────────────────────────────────
-        self._tb_button("fa5s.trash-alt", "Delete Selected  (Del)",
-                        self._delete_selected, color=Colors.ERROR)
-        
-        # ── Sweep Parameter ────────────────────────────────────────────────────────────
+        self._tb_button("fa5s.trash-alt",  "Delete Selected  (Del)",    self._delete_selected, color=Colors.ERROR)
         self._toolbar.addSeparator()
-        self._tb_button("fa5s.sliders-h", "Sweep Parameter  (Ctrl+W)", self._sweep,
-                color=Colors.ACCENT)
-        
-        # ── Export GDS ────────────────────────────────────────────────────────────
+        self._tb_button("fa5s.sliders-h",  "Sweep Parameter  (Ctrl+W)", self._sweep,           color=Colors.ACCENT)
         self._toolbar.addSeparator()
-        self._tb_button("fa5s.file-export", "Export GDS  (Ctrl+E)", self._export_gds, color=Colors.ACCENT)
+        self._tb_button("fa5s.file-export","Export GDS  (Ctrl+E)",       self._export_gds,      color=Colors.ACCENT)
 
-        # ── Spacer + zoom readout ─────────────────────────────────────────────
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
         self._toolbar.addWidget(spacer)
@@ -416,29 +219,30 @@ class MainWindow(QMainWindow):
         sb = self.statusBar()
         sb.setFixedHeight(Geometry.STATUSBAR_HEIGHT)
 
-        def stat_label(text: str = "") -> QLabel:
-            lbl = QLabel(text)
-            lbl.setStyleSheet(
-                f"color: {Colors.TEXT_MUTED}; font-family: {Fonts.MONO_FAMILY}; "
-                f"font-size: {Fonts.SIZE_XS}px; padding: 0 10px; "
-                f"border-right: 1px solid {Colors.BG_BORDER};"
-            )
-            return lbl
+        self._sb_mode   = self._stat_label("SELECT")
+        self._sb_cursor = self._stat_label("X: 0.000  Y: 0.000 µm")
+        self._sb_zoom   = self._stat_label("ZOOM")
+        self._sb_count  = self._stat_label("0 components")
+        self._sb_layer  = self._stat_label("LAYER  0")
 
-        self._sb_mode   = stat_label("SELECT")
-        self._sb_cursor = stat_label("X: 0.000  Y: 0.000 µm")
-        self._sb_zoom   = stat_label("ZOOM")
-        self._sb_count  = stat_label("0 components")
-        self._sb_layer  = stat_label("LAYER  0")
-        self._sb_msg    = QLabel("Ready")
+        self._sb_msg = QLabel("Ready")
         self._sb_msg.setStyleSheet(
             f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; padding: 0 10px;"
         )
 
-        for w in [self._sb_mode, self._sb_cursor, self._sb_zoom,
-                  self._sb_count, self._sb_layer]:
+        for w in [self._sb_mode, self._sb_cursor, self._sb_zoom, self._sb_count, self._sb_layer]:
             sb.addWidget(w)
         sb.addPermanentWidget(self._sb_msg)
+
+    @staticmethod
+    def _stat_label(text: str = "") -> QLabel:
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-family: {Fonts.MONO_FAMILY}; "
+            f"font-size: {Fonts.SIZE_XS}px; padding: 0 10px; "
+            f"border-right: 1px solid {Colors.BG_BORDER};"
+        )
+        return lbl
 
     def _flash_status(self, msg: str, ms: int = 2500) -> None:
         self._sb_msg.setText(msg)
@@ -452,15 +256,14 @@ class MainWindow(QMainWindow):
         self._props        = PropertiesPanel()
         self._build_toolbar()
 
-        # ── Left dock: tabbed panel (Shapes | Cells) ──────────────────────────
-        self._left_tabs = QTabWidget()
-        self._left_tabs.setFixedWidth(220)
-        self._left_tabs.setStyleSheet(
+        left_tabs = QTabWidget()
+        left_tabs.setFixedWidth(220)
+        left_tabs.setStyleSheet(
             "QTabWidget::pane { border: none; margin: 0; padding: 0; }"
             "QTabBar::tab { padding: 6px 12px; font-size: 11px; }"
         )
-        self._left_tabs.addTab(self._palette,      "Shapes")
-        self._left_tabs.addTab(self._cell_palette, "Cells")
+        left_tabs.addTab(self._palette,      "Shapes")
+        left_tabs.addTab(self._cell_palette, "Cells")
 
         center = QWidget()
         cl = QVBoxLayout(center)
@@ -473,7 +276,7 @@ class MainWindow(QMainWindow):
         rl = QHBoxLayout(root)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
-        rl.addWidget(self._left_tabs)
+        rl.addWidget(left_tabs)
         rl.addWidget(center)
         rl.addWidget(self._props)
 
@@ -482,37 +285,26 @@ class MainWindow(QMainWindow):
     # ── Signal wiring ─────────────────────────────────────────────────────────
 
     def _wire_signals(self) -> None:
-        self._scene.cursor_moved.connect(self._on_cursor_moved)
-        self._scene.item_selected.connect(self._on_item_selected)
-        self._scene.item_hovered.connect(self._on_item_hovered)
-        self._scene.scene_changed.connect(self._on_scene_changed)
-        self._scene.mode_changed.connect(self._on_mode_changed)
-        self._scene.connections_changed.connect(self._refresh_props_for_selection)
-        self._scene.group_edit_entered.connect(
-            lambda gid: self._flash_status(
-                "Editing group — click outside to exit", ms=2500
-            )
+        scene = self._scene
+
+        scene.cursor_moved.connect(self._on_cursor_moved)
+        scene.item_selected.connect(self._on_item_selected)
+        scene.item_hovered.connect(self._on_item_hovered)
+        scene.scene_changed.connect(self._on_scene_changed)
+        scene.mode_changed.connect(self._on_mode_changed)
+        scene.connections_changed.connect(self._refresh_props_for_selection)
+        scene.group_selected.connect(self._on_group_selected)
+        scene.group_edit_entered.connect(
+            lambda _: self._flash_status("Editing group — click outside to exit")
         )
-        self._scene.group_edit_exited.connect(
+        scene.group_edit_exited.connect(
             lambda: self._flash_status("Exited group edit")
         )
-        self._scene.group_selected.connect(self._on_group_selected)
 
-
-
-        # Phase 2: palette requests a mode, not an immediate placement
         self._palette.place_mode_requested.connect(self._on_place_mode_requested)
-
-        # Cell library: no longer emits a signal — placement is pure drag-and-drop.
-        # Cell parameter edits from the Properties panel:
         self._props.cell_param_change_requested.connect(self._on_cell_param_change_requested)
-
-        # Phase 2: properties panel layer edit
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
-
-        # Phase 3: properties panel geometry edits (width / height / path_width)
         self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
-
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -523,7 +315,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_item_selected(self, comp_id: str) -> None:
-        self._selected_group_id = None   # a component is now selected, not a group
+        self._selected_group_id = None
         if comp_id:
             comp = self._design.get(comp_id)
             if comp:
@@ -540,38 +332,19 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str)
     def _on_mode_changed(self, label: str) -> None:
-        self._sb_mode.setText(label.split("  —")[0])   # show first segment in status bar
+        self._sb_mode.setText(label.split("  —")[0])
 
     @pyqtSlot(object, int)
     def _on_place_mode_requested(self, kind: ComponentKind, layer: int) -> None:
-        """Palette button clicked — enter the corresponding placement mode."""
-        mode_map = {
-            ComponentKind.RECTANGLE: PlacementMode.PLACE_RECT,
-            ComponentKind.POLYGON:   PlacementMode.PLACE_POLYGON,
-            ComponentKind.PATH:      PlacementMode.PLACE_PATH,
-        }
-        self._enter_mode(mode_map[kind], layer)
+        self._enter_mode(self._KIND_TO_MODE[kind], layer)
 
     @pyqtSlot(str, str, str, object)
     def _on_cell_param_change_requested(self, group_id: str, cell_id: str,
-                                         param_key: str, new_value) -> None:
+                                        param_key: str, new_value) -> None:
         """
-        A cell parameter spinbox in the Properties panel changed.
-
-        Strategy: store the updated params on the group object as metadata
-        and show a flash hint.  Full re-place requires the user to drag again
-        with the updated defaults — or we re-place in-place here via a
-        compound undo command.
-
-        Implementation uses the existing cmd_stack: push a RemoveCellCommand
-        (ungroup + delete all members) then a PlaceCellCommand with updated
-        params at the same origin.  Both operations are atomic from the
-        undo stack's perspective via a BatchCommand.
+        Re-place a parametric cell in-place with an updated parameter value.
+        Wrapped in a single undo-able ReplaceCellCmd so the change is atomic.
         """
-        from core.cell_library import place_cell, CELL_BY_ID, CellResult
-        from core.commands import BatchCommand, PlaceCellCommand
-        from core.model import Point, ComponentGroup
-
         group = self._design.get_group(group_id)
         if group is None:
             return
@@ -579,68 +352,32 @@ class MainWindow(QMainWindow):
         if cdef is None:
             return
 
-        # Snapshot: current params + updated key
+        # Build updated params: defaults → any stored overrides → this change.
         params = dict(cdef.defaults)
-        # Carry over any previously stored param overrides on the group
         if hasattr(group, "_cell_params"):
             params.update(group._cell_params)
         params[param_key] = new_value
 
-        # Origin = bbox min corner of the existing group
         bb     = group.bbox_from(self._design.components)
         origin = Point(bb.x_min, bb.y_min)
 
         try:
             new_result = place_cell(cell_id, origin, params=params)
         except (KeyError, ValueError) as exc:
-            from PyQt6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Cell Parameter", str(exc))
             return
 
-        # Snapshot old state for the undo command
-        old_comp_ids = list(group.member_ids)
-        old_comps    = [self._design.get(cid) for cid in old_comp_ids]
-        old_comps    = [c for c in old_comps if c is not None]
-        old_group_id = group_id
+        old_comp_ids   = list(group.member_ids)
+        old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
         old_group_name = group.name
 
-        class _ReplaceCellCmd:
-            """Atomic remove-old + place-new, fully undo-able."""
-            def __init__(self, design_ref, scene_ref):
-                self._design = design_ref
-                self._scene  = scene_ref
-                self._new_cmd = PlaceCellCommand(new_result, cell_id=cell_id, cell_params=params)
-
-            @property
-            def description(self):
-                return f"Edit {cdef.name} parameter '{param_key}'"
-
-            def execute(self, design):
-                # Remove old group + members
-                design.remove_group(old_group_id)
-                for cid in old_comp_ids:
-                    design.remove(cid)
-                # Place rebuilt cell
-                self._new_cmd.execute(design)
-                # Tag new group with param overrides
-                if self._new_cmd._group is not None:
-                    self._new_cmd._group._cell_params = params
-
-            def undo(self, design):
-                # Undo new placement
-                self._new_cmd.undo(design)
-                # Restore old components
-                for comp in old_comps:
-                    design.add(comp)
-                old_g = ComponentGroup(
-                    name=old_group_name,
-                    member_ids=old_comp_ids,
-                    id=old_group_id,
-                )
-                design.add_group(old_g)
-
-        cmd = _ReplaceCellCmd(self._design, self._scene)
-        self._scene.cmd_stack.execute(cmd)
+        self._scene.cmd_stack.execute(
+            ReplaceCellCmd(
+                self._design, self._scene, new_result, cdef,
+                param_key, cell_id, params,
+                group_id, old_group_name, old_comp_ids, old_comps,
+            )
+        )
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
 
     @pyqtSlot(str)
@@ -656,32 +393,25 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(str, int)
     def _on_layer_change_requested(self, comp_id: str, new_layer: int) -> None:
-        """Properties panel layer spin changed — wrap in undo-able command."""
         comp = self._design.get(comp_id)
         if comp and comp.layer != new_layer:
             self._scene.cmd_stack.execute(EditComponent(comp, layer=new_layer))
-            # Use the public API — never reach into _items directly.
             self._scene.refresh_item_style(comp_id)
             self._flash_status(f"Layer → {new_layer}")
 
     @pyqtSlot(str, str, int)
     def _on_geometry_change_requested(self, comp_id: str, field: str, value_dbu: int) -> None:
-        """Properties panel dimension spinbox committed — wrap in undo-able command."""
         comp = self._design.get(comp_id)
         if comp is None:
             return
-        # Guard: editingFinished fires even when nothing changed (click in, click out).
         if getattr(comp, field, None) == value_dbu:
             return
         self._scene.cmd_stack.execute(EditComponent(comp, **{field: value_dbu}))
-        # Tell the Qt delegate to re-read the model — geometry changed.
         item = self._scene.item_for(comp_id)
         if item:
             item.sync_from_model()
-        # Refresh the panel so bbox and spinbox values reflect the new state.
         self._props.show_component(comp, self._design)
-        label = field.replace("_", " ").title()
-        self._flash_status(f"{label} → {value_dbu / 1000:.3f} µm")
+        self._flash_status(f"{field.replace('_', ' ').title()} → {value_dbu / 1000:.3f} µm")
 
     @pyqtSlot(float)
     def _on_zoom_changed(self, zoom: float) -> None:
@@ -690,146 +420,10 @@ class MainWindow(QMainWindow):
         self._tb_zoom_label.setText(f"{zoom * 1000:.2f} px/µm")
 
     @pyqtSlot()
-    def _sweep(self) -> None:
-        # ── Case 1: a cell group is selected → sweep its cell parameters ──────
-        if self._selected_group_id:
-            group = self._design.get_group(self._selected_group_id)
-            if group is not None and getattr(group, "cell_id", None):
-                dlg = CellSweepDialog(
-                    group, self._design, self._scene, self
-                )
-                dlg.exec()
-                return
-            # Group exists but has no cell_id (a user-drawn group) → fall through
-            # to the component path which will show the "select one component" message.
-
-        # ── Case 2: exactly one standalone component selected ─────────────────
-        selected = [
-            item.component
-            for item in self._scene.selectedItems()
-            if hasattr(item, "component")
-        ]
-        if len(selected) != 1:
-            QMessageBox.information(
-                self, "Sweep",
-                "Select exactly one component or cell group to sweep."
-            )
-            return
-        dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
-        dlg.exec()
-
-    @pyqtSlot()
     def _refresh_props_for_selection(self) -> None:
-        """Re-populate the properties panel after a wiring change."""
         selected = self._scene.selectedItems()
         if len(selected) == 1 and hasattr(selected[0], "component"):
             self._props.show_component(selected[0].component, self._design)
-
-    @pyqtSlot()
-    def _group_selected(self) -> None:
-        from PyQt6.QtWidgets import QInputDialog
-
-        selected_items = self._scene.selectedItems()
-
-        # Partition selection into GroupItems and bare ComponentItems
-        selected_groups: list = [
-            self._design.get_group(item.group.id)
-            for item in selected_items
-            if isinstance(item, GroupItem)
-        ]
-        selected_groups = [g for g in selected_groups if g is not None]
-
-        selected_comps = [
-            item.component
-            for item in selected_items
-            if hasattr(item, "component")
-        ]
-
-        # ── Case 1: groups present → merge into one flat group ────────────────
-        if selected_groups:
-            total_items = len(selected_groups) + len(selected_comps)
-            if total_items < 2 and not selected_comps:
-                # Only one group selected and nothing else — nothing to merge
-                QMessageBox.information(
-                    self, "Group",
-                    "Select two or more groups (or groups + components) to merge."
-                )
-                return
-
-            # Components already inside a selected group don't need special
-            # handling — MergeGroups will absorb their groups.
-            # Collect IDs of loose components (not already inside a selected group)
-            grouped_ids = {
-                cid for g in selected_groups for cid in g.member_ids
-            }
-            extra_ids = [c.id for c in selected_comps if c.id not in grouped_ids]
-
-            name, ok = QInputDialog.getText(
-                self, "Merge Groups", "New group name:",
-                text=f"group_{len(self._design.groups) + 1}"
-            )
-            if not ok or not name.strip():
-                return
-
-            self._scene.cmd_stack.execute(
-                MergeGroups(selected_groups, extra_ids, name.strip())
-            )
-            n_src = len(selected_groups)
-            self._flash_status(
-                f"Merged {n_src} group{'s' if n_src != 1 else ''}"
-                + (f" + {len(extra_ids)} component{'s' if len(extra_ids) != 1 else ''}"
-                   if extra_ids else "")
-                + f" → '{name.strip()}'"
-            )
-            return
-
-        # ── Case 2: only bare components selected → original group logic ──────
-        if len(selected_comps) < 2:
-            QMessageBox.information(
-                self, "Group", "Select two or more components — or two or more groups — to group."
-            )
-            return
-
-
-        name, ok = QInputDialog.getText(
-            self, "Group Name", "Group name:",
-            text=f"group_{len(self._design.groups) + 1}"
-        )
-        if not ok or not name.strip():
-            return
-
-        comp_ids = [c.id for c in selected_comps]
-        self._scene.cmd_stack.execute(GroupComponents(comp_ids, name.strip()))
-        self._flash_status(f"Grouped {len(selected_comps)} components as '{name.strip()}'")
-
-    @pyqtSlot()
-    def _ungroup_selected(self) -> None:
-        # Find groups that are selected or whose members are selected
-        selected_comp_ids = {
-            item.component.id
-            for item in self._scene.selectedItems()
-            if hasattr(item, "component")
-        }
-        # Also check if a GroupItem is directly selected
-        selected_group_ids = {
-            item.group.id
-            for item in self._scene.selectedItems()
-            if isinstance(item, GroupItem)  # import GroupItem at top
-        }
-        # Add groups whose members are all selected
-        for g in self._design.groups:
-            if any(cid in selected_comp_ids for cid in g.member_ids):
-                selected_group_ids.add(g.id)
-
-        if not selected_group_ids:
-            QMessageBox.information(self, "Ungroup", "No grouped components selected.")
-            return
-
-        for gid in selected_group_ids:
-            group = self._design.get_group(gid)
-            if group:
-                self._scene.cmd_stack.execute(UngroupComponents(group))
-        self._flash_status(f"Ungrouped {len(selected_group_ids)} group(s)")
 
     @pyqtSlot(str)
     def _on_group_selected(self, group_id: str) -> None:
@@ -841,16 +435,11 @@ class MainWindow(QMainWindow):
     # ── Mode helpers ──────────────────────────────────────────────────────────
 
     def _enter_mode(self, mode: PlacementMode, layer: Optional[int] = None) -> None:
-        if layer is None:
-            layer = self._palette.active_layer
-        self._scene.set_mode(mode, layer)  
-
-        # Select mode uses the standard arrow; placement modes use the crosshair.
+        self._scene.set_mode(mode, layer if layer is not None else self._palette.active_layer)
+        cursor = Qt.CursorShape.ArrowCursor if mode == PlacementMode.SELECT else Qt.CursorShape.CrossCursor
+        self._view.setCursor(cursor)
         if mode == PlacementMode.SELECT:
             self._tb_select.setChecked(True)
-            self._view.setCursor(Qt.CursorShape.ArrowCursor)
-        else:
-            self._view.setCursor(Qt.CursorShape.CrossCursor)
 
     def _escape(self) -> None:
         self._scene.cancel_placement()
@@ -871,18 +460,16 @@ class MainWindow(QMainWindow):
         self._update_undo_actions()
 
     def _update_undo_actions(self) -> None:
-        can_undo = self._scene.cmd_stack.can_undo
-        can_redo = self._scene.cmd_stack.can_redo
+        stack    = self._scene.cmd_stack
+        can_undo = stack.can_undo
+        can_redo = stack.can_redo
+
         self._act_undo.setEnabled(can_undo)
         self._act_redo.setEnabled(can_redo)
         self._tb_undo.setEnabled(can_undo)
         self._tb_redo.setEnabled(can_redo)
-        self._act_undo.setText(
-            f"Undo  {self._scene.cmd_stack.undo_description}" if can_undo else "Undo"
-        )
-        self._act_redo.setText(
-            f"Redo  {self._scene.cmd_stack.redo_description}" if can_redo else "Redo"
-        )
+        self._act_undo.setText(f"Undo  {stack.undo_description}" if can_undo else "Undo")
+        self._act_redo.setText(f"Redo  {stack.redo_description}" if can_redo else "Redo")
 
     def _select_all(self) -> None:
         for item in self._scene.items():
@@ -890,8 +477,6 @@ class MainWindow(QMainWindow):
 
     def _copy(self) -> None:
         self._scene.copy_selection()
-        # Reset paste-offset counter: next paste starts at +1 offset
-        from core.clipboard import Clipboard
         Clipboard.instance().reset_paste_count()
 
     def _paste(self) -> None:
@@ -901,49 +486,192 @@ class MainWindow(QMainWindow):
         self._scene.duplicate_selection()
 
     def _delete_selected(self) -> None:
-        from core.commands import RemoveComponent, BatchCommand
-        from ui.canvas_scene import GroupItem
-
-        sel = self._scene.selectedItems()
+        sel  = self._scene.selectedItems()
         cmds = []
-        deleted_comp_ids: set = set()   # guard against double-delete of group members
+        deleted_ids: set[str] = set()
 
-        # ── Delete selected groups (group record + all member components) ──────
+        # Groups first: delete the group record and all its member components.
         for item in sel:
             if not isinstance(item, GroupItem):
                 continue
             group = item.group
-            cmds.append(_RemoveGroup(group))
+            cmds.append(RemoveGroup(group))
             for cid in group.member_ids:
-                if cid not in deleted_comp_ids:
+                if cid not in deleted_ids:
                     comp = self._design.get(cid)
                     if comp:
                         cmds.append(RemoveComponent(comp))
-                        deleted_comp_ids.add(cid)
+                        deleted_ids.add(cid)
 
-        # ── Delete loose selected ComponentItems not already covered above ─────
+        # Loose components not already covered by a group deletion.
         for item in sel:
             if not hasattr(item, "component"):
                 continue
             comp = item.component
-            if comp.id not in deleted_comp_ids:
+            if comp.id not in deleted_ids:
                 cmds.append(RemoveComponent(comp))
-                deleted_comp_ids.add(comp.id)
+                deleted_ids.add(comp.id)
 
         if not cmds:
             return
 
-        if len(cmds) == 1:
-            self._scene.cmd_stack.execute(cmds[0])
-        else:
-            self._scene.cmd_stack.execute(
-                BatchCommand(cmds, f"Delete {len(deleted_comp_ids)} item(s)")
+        cmd = cmds[0] if len(cmds) == 1 else BatchCommand(cmds, f"Delete {len(deleted_ids)} item(s)")
+        self._scene.cmd_stack.execute(cmd)
+        self._flash_status(f"Deleted {len(deleted_ids)} item{'s' if len(deleted_ids) != 1 else ''}")
+
+    @pyqtSlot()
+    def _group_selected(self) -> None:
+        selected_items = self._scene.selectedItems()
+
+        selected_groups = [
+            g for g in (
+                self._design.get_group(item.group.id)
+                for item in selected_items
+                if isinstance(item, GroupItem)
             )
-        self._flash_status(
-            f"Deleted {len(deleted_comp_ids)} item{'s' if len(deleted_comp_ids) != 1 else ''}"
+            if g is not None
+        ]
+        selected_comps = [
+            item.component
+            for item in selected_items
+            if hasattr(item, "component")
+        ]
+
+        if selected_groups:
+            # Merge mode: requires ≥2 total items (groups + loose components).
+            if len(selected_groups) < 2 and not selected_comps:
+                QMessageBox.information(
+                    self, "Group",
+                    "Select two or more groups (or groups + components) to merge.",
+                )
+                return
+
+            grouped_ids = {cid for g in selected_groups for cid in g.member_ids}
+            extra_ids   = [c.id for c in selected_comps if c.id not in grouped_ids]
+
+            name, ok = QInputDialog.getText(
+                self, "Merge Groups", "New group name:",
+                text=f"group_{len(self._design.groups) + 1}",
+            )
+            if not ok or not name.strip():
+                return
+
+            self._scene.cmd_stack.execute(MergeGroups(selected_groups, extra_ids, name.strip()))
+            n = len(selected_groups)
+            suffix = (f" + {len(extra_ids)} component{'s' if len(extra_ids) != 1 else ''}"
+                      if extra_ids else "")
+            self._flash_status(f"Merged {n} group{'s' if n != 1 else ''}{suffix} → '{name.strip()}'")
+            return
+
+        # No groups in selection — group bare components.
+        if len(selected_comps) < 2:
+            QMessageBox.information(
+                self, "Group",
+                "Select two or more components — or two or more groups — to group.",
+            )
+            return
+
+        name, ok = QInputDialog.getText(
+            self, "Group Name", "Group name:",
+            text=f"group_{len(self._design.groups) + 1}",
         )
+        if not ok or not name.strip():
+            return
+
+        self._scene.cmd_stack.execute(GroupComponents([c.id for c in selected_comps], name.strip()))
+        self._flash_status(f"Grouped {len(selected_comps)} components as '{name.strip()}'")
+
+    @pyqtSlot()
+    def _ungroup_selected(self) -> None:
+        selected_comp_ids = {
+            item.component.id
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        }
+        target_group_ids = {
+            item.group.id
+            for item in self._scene.selectedItems()
+            if isinstance(item, GroupItem)
+        }
+        # Also include groups whose members appear in the selection.
+        for g in self._design.groups:
+            if any(cid in selected_comp_ids for cid in g.member_ids):
+                target_group_ids.add(g.id)
+
+        if not target_group_ids:
+            QMessageBox.information(self, "Ungroup", "No grouped components selected.")
+            return
+
+        for gid in target_group_ids:
+            group = self._design.get_group(gid)
+            if group:
+                self._scene.cmd_stack.execute(UngroupComponents(group))
+
+        self._flash_status(f"Ungrouped {len(target_group_ids)} group(s)")
+
+    @pyqtSlot()
+    def _sweep(self) -> None:
+        """
+        Route to the appropriate sweep dialog based on what is selected:
+          1. A parametric cell group  → CellSweepDialog
+          2. A user-drawn group       → GroupSweepDialog
+          3. A single loose component → SweepDialog
+        """
+        group = self._resolve_sweep_group()
+
+        if group is not None:
+            if getattr(group, "cell_id", None):
+                CellSweepDialog(group, self._design, self._scene, self).exec()
+            else:
+                GroupSweepDialog(group, self._design, self._scene.cmd_stack, self).exec()
+            return
+
+        selected = [
+            item.component
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        ]
+        if len(selected) != 1:
+            QMessageBox.information(self, "Sweep", "Select exactly one component or group to sweep.")
+            return
+        SweepDialog(selected[0], self._design, self._scene.cmd_stack, self).exec()
+
+    def _resolve_sweep_group(self):
+        """
+        Return the ComponentGroup to sweep, or None.
+
+        Prefers the explicitly group-selected ID; falls back to inferring the
+        group from the selected component items (handles the common case of
+        clicking into a cell group and pressing Ctrl+W without clicking the
+        group border).
+        """
+        if self._selected_group_id:
+            group = self._design.get_group(self._selected_group_id)
+            if group:
+                return group
+
+        selected_comps = [
+            item.component
+            for item in self._scene.selectedItems()
+            if hasattr(item, "component")
+        ]
+        if not selected_comps:
+            return None
+
+        candidate = self._design.group_of(selected_comps[0].id)
+        if candidate is None:
+            return None
+
+        # All selected components must belong to the same group.
+        all_same = all(
+            self._design.group_of(c.id) is not None
+            and self._design.group_of(c.id).id == candidate.id
+            for c in selected_comps
+        )
+        return candidate if all_same else None
 
     # ── File actions ──────────────────────────────────────────────────────────
+
     def _new_design(self) -> None:
         if not self._maybe_save_before("start a new design"):
             return
@@ -972,7 +700,7 @@ class MainWindow(QMainWindow):
     def _do_save(self, path: Path) -> None:
         try:
             save(self._design, path)
-            self._current_file  = path
+            self._current_file    = path
             self._design.is_dirty = False
             self._update_title()
             self._flash_status(f"Saved → {path.name}")
@@ -994,10 +722,9 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Open Failed", str(exc))
             return
 
-        # Swap in the loaded design
-        self._design = new_design
-        self._scene._design = new_design
-        self._scene.cmd_stack = type(self._scene.cmd_stack)(new_design)
+        self._design              = new_design
+        self._scene._design       = new_design
+        self._scene.cmd_stack     = type(self._scene.cmd_stack)(new_design)
         self._scene.cmd_stack.connect_change(self._scene._on_model_changed)
         self._scene._on_model_changed()
 
@@ -1008,7 +735,7 @@ class MainWindow(QMainWindow):
 
     def _maybe_save_before(self, action: str) -> bool:
         """
-        If the design is dirty, prompt Save / Discard / Cancel.
+        Prompt Save / Discard / Cancel when the design has unsaved changes.
         Returns True if the caller should proceed, False if the user cancelled.
         """
         if not self._design.is_dirty:
@@ -1016,17 +743,14 @@ class MainWindow(QMainWindow):
         reply = QMessageBox.question(
             self, "Unsaved Changes",
             f"Save changes before you {action}?",
-            QMessageBox.StandardButton.Save |
+            QMessageBox.StandardButton.Save    |
             QMessageBox.StandardButton.Discard |
             QMessageBox.StandardButton.Cancel,
         )
         if reply == QMessageBox.StandardButton.Save:
             self._save()
-            # If save was cancelled (e.g. no path chosen yet and user dismissed dialog)
-            return not self._design.is_dirty
-        if reply == QMessageBox.StandardButton.Discard:
-            return True
-        return False   # Cancel
+            return not self._design.is_dirty   # False if save was itself cancelled
+        return reply == QMessageBox.StandardButton.Discard
 
     def _update_title(self) -> None:
         name  = self._current_file.name if self._current_file else self._design.name
@@ -1038,34 +762,28 @@ class MainWindow(QMainWindow):
             event.accept()
         else:
             event.ignore()
-        
+
     def _export_gds(self) -> None:
         if not self._design.components:
             QMessageBox.warning(self, "Export GDS", "Nothing to export — add some shapes first.")
             return
-
         path, _ = QFileDialog.getSaveFileName(
             self, "Export GDS", f"{self._design.name}.gds",
             "GDS Files (*.gds);;All Files (*)",
         )
         if not path:
             return
-
-        # Identity map: app layer N → GDS (layer=N, datatype=0)
-        layers = {c.layer for c in self._design.components}
+        layers    = {c.layer for c in self._design.components}
         layer_map = {layer: (layer, 0) for layer in layers}
-
         try:
             summary = export_gds(self._design, path, layer_map)
         except ExportError as exc:
             QMessageBox.critical(self, "Export Failed", str(exc))
             return
-
         self._flash_status(f"Exported {summary['shapes']} shapes to {path}")
-        result_dlg = ExportResultDialog(summary, self)
-        result_dlg.exec()
+        ExportResultDialog(summary, self).exec()
 
-    # ── About / help ──────────────────────────────────────────────────────────
+    # ── Help dialogs ──────────────────────────────────────────────────────────
 
     def _about(self) -> None:
         QMessageBox.about(
@@ -1105,17 +823,3 @@ class MainWindow(QMainWindow):
         layout.addWidget(lbl)
         layout.addWidget(buttons)
         dlg.exec()
-
-    # ── Close guard ───────────────────────────────────────────────────────────
-
-    def closeEvent(self, event) -> None:
-        if self._design.is_dirty:
-            reply = QMessageBox.question(
-                self, "Unsaved Changes",
-                "You have unsaved changes. Quit anyway?",
-                QMessageBox.StandardButton.Discard | QMessageBox.StandardButton.Cancel,
-            )
-            if reply != QMessageBox.StandardButton.Discard:
-                event.ignore()
-                return
-        event.accept()

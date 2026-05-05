@@ -677,7 +677,6 @@ def apply_theme(app: QApplication) -> None:
     overlay = QColor(Colors.BG_OVERLAY)
     canvas  = QColor(Colors.CANVAS_BG)
     text    = QColor(Colors.TEXT_PRIMARY)
-    mid     = QColor(Colors.TEXT_SECONDARY)
     muted   = QColor(Colors.TEXT_MUTED)
     dis     = QColor(Colors.TEXT_DISABLED)
     accent  = QColor(Colors.ACCENT)

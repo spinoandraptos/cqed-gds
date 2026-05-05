@@ -210,8 +210,6 @@ class CanvasView(QGraphicsView):
 
     _MIME_SHAPE = "application/x-gds-shape"
     _MIME_CELL  = "application/x-gds-cell"
-    # Legacy alias so old code that references _MIME still works
-    _MIME = _MIME_SHAPE
 
     def dragEnterEvent(self, event) -> None:
         md = event.mimeData()
@@ -257,13 +255,11 @@ class CanvasView(QGraphicsView):
     # ── Event overrides ───────────────────────────────────────────────────────
 
     def wheelEvent(self, event: QWheelEvent) -> None:
+        delta = event.angleDelta().y()
         if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
-            delta = event.angleDelta().y()
             factor = ZOOM_STEP if delta > 0 else 1.0 / ZOOM_STEP
             self._zoom_by(factor)
         else:
-            # Plain scroll → pan vertically
-            delta = event.angleDelta().y()
             self.verticalScrollBar().setValue(
                 self.verticalScrollBar().value() - delta // 3
             )
