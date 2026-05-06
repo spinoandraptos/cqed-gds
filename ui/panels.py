@@ -168,6 +168,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
         "taper_segment":  _icon_taper_segment,
         "taper_pad":      _icon_taper_pad,
         "turn":           _icon_turn,
+        "t_junction":     _icon_t_junction,
     }
     painter_fn = _painters.get(cell_id, _icon_taper_segment)
     return painter_fn(size)
@@ -467,10 +468,73 @@ def _icon_turn(size: int) -> QPixmap:
     p.end()
     return pix
 
+def _icon_t_junction(size: int) -> QPixmap:
+    """
+    Miniature top-view T-junction icon (L1 blue).
+    Draws the correct T shape: two quarter-circle arc corners forming the
+    rounded bar, with a stem dropping from the centre.  Matches the actual
+    build_t_junction geometry (stem_dir=+y, arc radius ≈ 40% of icon width).
+    """
+    import math
+    pix, p = _pix(size)
+    m = 3
+
+    # Proportions scaled to icon pixel space.
+    # Stem enters from the bottom centre; bar runs left-right at ~60% height.
+    # Arc centres sit at (±R, bar_y) in icon coords where bar_y = size - m - R.
+    hw    = (size - m * 2) * 0.14   # half wire-width in pixels
+    R     = (size - m * 2) * 0.38   # arc radius in pixels
+    cy_bar = m + R                   # y of arc centres (Qt: y increases downward)
+    cx_mid = size / 2
+
+    l_cx = cx_mid - R   # left arc centre x
+    r_cx = cx_mid + R   # right arc centre x
+
+    # Arc sweeps (Qt coords: 0°=right, 90°=down, -90°=up).
+    # Left  arc: entry from below (+y), turns CCW  → exits left  (-x).
+    #   Centre to left of entry → at (l_cx, cy_bar).
+    #   Entry side (bottom of left arc) at angle +90° (pointing down from centre).
+    #   Sweep CCW: 90° → 0°  (i.e. end points right from centre = left arm exit).
+    # Right arc: symmetric.
+    N = 20
+
+    def arc_pts(cx, cy, r, a0_deg, a1_deg):
+        pts = []
+        for i in range(N + 1):
+            t = i / N
+            a = math.radians(a0_deg + (a1_deg - a0_deg) * t)
+            pts.append(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+        return pts
+
+    # Correct winding (mirrors build_t_junction logic):
+    # outer_left:          90°→180°  (bottom of left arc → left arm outer tip)
+    # reversed(outer_right): outer_right goes 90°→0°; reversed = 0°→90°
+    # reversed(inner_left):  inner_left goes 90°→180°; reversed = 180°→90°
+    # inner_right:           90°→0°
+
+    ol = arc_pts(l_cx, cy_bar, R + hw, 90, 180)   # bottom-right → left arm outer
+    il = arc_pts(l_cx, cy_bar, R - hw, 90, 180)   # bottom-right inner → left arm inner
+    or_ = arc_pts(r_cx, cy_bar, R + hw, 90,  0)   # bottom-left → right arm outer
+    ir  = arc_pts(r_cx, cy_bar, R - hw, 90,  0)   # bottom-left inner → right arm inner
+
+    pts = ol + list(reversed(or_)) + list(reversed(il)) + ir
+
+    path = QPainterPath()
+    path.moveTo(pts[0])
+    for pt in pts[1:]:
+        path.lineTo(pt)
+    path.closeSubpath()
+
+    c_l1 = QColor("#2563eb"); c_l1.setAlpha(160)
+    p.setBrush(c_l1)
+    p.setPen(QPen(QColor("#93c5fd"), 1.2))
+    p.drawPath(path)
+
+    p.end()
+    return pix
 
 
 
-# ── Draggable cell tile ───────────────────────────────────────────────────────
 
 class DraggableCellButton(QPushButton):
     """

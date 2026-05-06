@@ -1205,6 +1205,198 @@ def build_wire(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Cell: T-Junction  — two back-to-back arc turns forming a T shape
+# ═════════════════════════════════════════════════════════════════════════════
+
+_T_JCT_DEFAULTS = dict(
+    stem_dir    = "+y",   # direction the stem wire travels INTO the junction
+    taper_width = 2.0,    # arc width (µm)
+    turn_radius = 5.0,    # arc centreline radius (µm)
+)
+
+
+def build_t_junction(
+    origin:      Point,
+    stem_dir:    str   = _T_JCT_DEFAULTS["stem_dir"],
+    taper_width: float = _T_JCT_DEFAULTS["taper_width"],
+    turn_radius: float = _T_JCT_DEFAULTS["turn_radius"],
+) -> CellResult:
+    """
+    T-junction: a single solid polygon on L1.
+
+    Geometry (default stem_dir="+y", stem enters from below):
+
+              left_exit (−x)           right_exit (+x)
+        ────────────────────────────────────────────────
+        |                                              |
+        |   ╭──────────────────────────────────────╮  |
+        |   │      ← bar top (y = R+hw) →          │  |
+        |   ╰──────────╮            ╭──────────────╯  |
+        |               ╲          ╱
+        |                ╲        ╱   ← inner arcs (radius R−hw)
+        |                 |      |
+        |                 | stem |
+        |                 |      |
+                         stem port (origin)
+
+    The polygon boundary (CCW) traces:
+      1. right inner arc (R−hw, stem right-wall → right arm inner tip)
+      2. straight bar corners (right outer corner, bar top-right, bar top-left,
+                               left outer corner)
+      3. left inner arc reversed (left arm inner tip → stem left-wall)
+      4. stem base (left wall → right wall)
+
+    This correctly avoids the self-intersecting bowtie produced by the previous
+    outer-arc approach (outer arcs of radius R+hw cross each other between
+    y=0 and y=R−hw when their centres are only 2R apart).
+
+    Parameters
+    ----------
+    stem_dir    : direction the stem wire travels into the junction.
+                  "+y" → stem enters from below, bar runs left/right.
+                  Any of "+x" / "-x" / "+y" / "-y".
+    taper_width : full width of each arm and stem leg (µm).
+    turn_radius : centreline radius of each inner bend arc (µm).
+
+    Ports
+    -----
+    stem       — entry, at cell origin, faces opposite to stem_dir.
+    left_exit  — left  arm exit face centre, faces outward (left of stem).
+    right_exit — right arm exit face centre, faces outward (right of stem).
+    """
+    import math as _math
+
+    R  = turn_radius
+    hw = taper_width / 2
+    N  = 64   # arc segments per quarter-circle
+
+    _fwd_vec = {"+x": (1, 0), "-x": (-1, 0), "+y": (0, 1), "-y": (0, -1)}
+    _opp_side = {"+x": PortSide.WEST,  "-x": PortSide.EAST,
+                 "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+    _fwd_side = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+                 "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+
+    fx, fy = _fwd_vec[stem_dir]
+
+    # Perpendicular unit vectors (right and left of the forward direction)
+    rpx, rpy =  fy, -fx   # right_perp  (rotate fwd 90° CW)
+    lpx, lpy = -fy,  fx   # left_perp   (rotate fwd 90° CCW)
+
+    # ── Inner arc centres (distance R from origin, perpendicular to stem) ─────
+    # Right arc: bends the stem to the right arm.
+    # Left  arc: bends the stem to the left  arm.
+    r_cx, r_cy = R * rpx, R * rpy
+    l_cx, l_cy = R * lpx, R * lpy
+
+    # ── Arc angle spans ───────────────────────────────────────────────────────
+    # For each inner arc (radius R−hw), the start point is on the stem wall
+    # and the end point is at the arm's inner corner.
+    #
+    # Right arc start: vector from r_centre to stem right-wall point = −right_perp
+    #   a_start_right = atan2(−rpy, −rpx)
+    # Right arc end:   vector from r_centre to arm inner tip = fwd direction
+    #   a_end_right   = atan2(fy, fx)
+    # Left arc start (reversed arc used in polygon): vector = +right_perp from l_centre
+    #   a_start_left  = atan2(rpy, rpx)   (= a_end of the forward left arc)
+    # Left arc end (reversed):             vector = fwd direction
+    #   a_end_left    = atan2(fy, fx)
+    a_start_right = _math.atan2(-rpy, -rpx)
+    a_end_right   = _math.atan2(fy, fx)
+    a_start_left  = _math.atan2(rpy, rpx)
+    a_end_left    = _math.atan2(fy, fx)
+
+    def _arc_pts(cx, cy, radius, a_start, a_end, n=N):
+        """Uniformly-sampled arc from a_start to a_end (cell-frame µm)."""
+        return [
+            (cx + radius * _math.cos(a_start + (a_end - a_start) * i / n),
+             cy + radius * _math.sin(a_start + (a_end - a_start) * i / n))
+            for i in range(n + 1)
+        ]
+
+    # ── Inner arc strips ──────────────────────────────────────────────────────
+    # inner_right : stem right-wall → right arm inner tip  (forward sweep)
+    # inner_left_rev : left arm inner tip → stem left-wall (reverse of left arc)
+    inner_right   = _arc_pts(r_cx, r_cy, R - hw, a_start_right, a_end_right)
+    inner_left_rev = _arc_pts(l_cx, l_cy, R - hw, a_end_left,   a_start_left)
+
+    # ── Bar corner points (in cell-frame µm) ──────────────────────────────────
+    #
+    #  right inner tip  = R*right_perp + (R−hw)*fwd
+    #  right outer corner = (R+hw)*right_perp + (R−hw)*fwd
+    #  right bar top    = (R+hw)*right_perp + (R+hw)*fwd
+    #  left bar top     = (R+hw)*left_perp  + (R+hw)*fwd
+    #  left outer corner = (R+hw)*left_perp  + (R−hw)*fwd
+    #  (left inner tip  = R*left_perp  + (R−hw)*fwd  — provided by inner_left_rev[0])
+    r_outer_corner = ((R + hw) * rpx + (R - hw) * fx,
+                      (R + hw) * rpy + (R - hw) * fy)
+    r_bar_top      = ((R + hw) * rpx + (R + hw) * fx,
+                      (R + hw) * rpy + (R + hw) * fy)
+    l_bar_top      = ((R + hw) * lpx + (R + hw) * fx,
+                      (R + hw) * lpy + (R + hw) * fy)
+    l_outer_corner = ((R + hw) * lpx + (R - hw) * fx,
+                      (R + hw) * lpy + (R - hw) * fy)
+
+    # ── Assemble polygon (CCW, starting at stem right-wall) ───────────────────
+    body_pts = (
+        inner_right                                           # stem right → right arm inner tip
+        + [r_outer_corner, r_bar_top, l_bar_top, l_outer_corner]  # bar corners
+        + inner_left_rev                                      # left arm inner tip → stem left
+        # _poly() auto-closes: stem left-wall → stem right-wall (stem base)
+    )
+
+    body = _poly(origin, body_pts, LAYER_BRANCH)
+    body._no_auto_ports = False   # anchor — carries all three ports
+
+    # ── Ports ─────────────────────────────────────────────────────────────────
+    # Offsets are relative to body.origin = body_pts[0] (= stem right-wall point).
+    bx0, by0 = body_pts[0]
+
+    def _cell_to_body(cx_um, cy_um):
+        return Point(um_to_dbu(cx_um - bx0), um_to_dbu(cy_um - by0))
+
+    # Stem port: at cell origin (0, 0), faces opposite to stem_dir.
+    stem_port_pos = _cell_to_body(0.0, 0.0)
+
+    # Left exit: centre of left arm face = (R+hw)*left_perp + R*fwd
+    # (midpoint of the left outer corner's exit face, at the bar's left wall)
+    l_exit_x = (R + hw) * lpx + R * fx
+    l_exit_y = (R + hw) * lpy + R * fy
+    left_exit_pos = _cell_to_body(l_exit_x, l_exit_y)
+
+    # Right exit: centre of right arm face = (R+hw)*right_perp + R*fwd
+    r_exit_x = (R + hw) * rpx + R * fx
+    r_exit_y = (R + hw) * rpy + R * fy
+    right_exit_pos = _cell_to_body(r_exit_x, r_exit_y)
+
+    # Exit directions: left arm exits in left_perp direction, right in right_perp
+    _perp_side = {
+        ( 1,  0): PortSide.EAST,
+        (-1,  0): PortSide.WEST,
+        ( 0,  1): PortSide.NORTH,
+        ( 0, -1): PortSide.SOUTH,
+    }
+    left_exit_side  = _perp_side[(int(lpx), int(lpy))]
+    right_exit_side = _perp_side[(int(rpx), int(rpy))]
+
+    _assign_ports(body, [
+        Port("stem",       stem_port_pos,  _opp_side[stem_dir]),
+        Port("left_exit",  left_exit_pos,  left_exit_side),
+        Port("right_exit", right_exit_pos, right_exit_side),
+    ])
+
+    return CellResult(
+        components=[body],
+        group_name=(
+            f"TJunction ({stem_dir} R={turn_radius:.1f}µm w={taper_width:.1f}µm)"
+        ),
+        description=(
+            f"T-junction  stem={stem_dir}  R={turn_radius}µm  "
+            f"width={taper_width}µm  L1"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Cell catalogue  (what the palette reads)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -1248,6 +1440,14 @@ CELL_CATALOGUE: List[CellDef] = [
         category    = "Routing",
         defaults    = _TURN_DEFAULTS,
         builder     = build_turn,
+    ),
+    CellDef(
+        cell_id     = "t_junction",
+        name        = "T-Junction",
+        description = "Two back-to-back arc turns forming a T with rounded corners (L1)",
+        category    = "Routing",
+        defaults    = _T_JCT_DEFAULTS,
+        builder     = build_t_junction,
     ),
 ]
 
