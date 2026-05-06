@@ -360,13 +360,23 @@ class MainWindow(QMainWindow):
         old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
         old_group_name = group.name
 
-        self._scene.cmd_stack.execute(
-            ReplaceCellCmd(
-                self._design, self._scene, new_result, cdef,
-                param_key, cell_id, params,
-                group_id, old_group_name, old_comp_ids, old_comps,
-            )
+        cmd = ReplaceCellCmd(
+            self._design, self._scene, new_result, cdef,
+            param_key, cell_id, params,
+            group_id, old_group_name, old_comp_ids, old_comps,
         )
+        self._scene.cmd_stack.execute(cmd)
+
+        # Re-select the newly created GroupItem so the properties panel stays
+        # populated and the user doesn't lose their selection after each edit.
+        new_group = cmd._new_cmd._group
+        if new_group is not None:
+            new_gi = self._scene._group_items.get(new_group.id)
+            if new_gi is not None:
+                self._scene.clearSelection()
+                new_gi.setSelected(True)
+                self._scene.group_selected.emit(new_group.id)
+
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
 
     @pyqtSlot(str)

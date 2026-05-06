@@ -157,6 +157,31 @@ def _shape_icon(kind: "ComponentKind", size: int = 36) -> QPixmap:
     return pix
 
 
+class _ParamSpinBox(QDoubleSpinBox):
+    """
+    QDoubleSpinBox that keeps focus inside the properties panel after the user
+    commits a value with Enter.
+
+    The default QDoubleSpinBox behaviour on Enter is to confirm the value and
+    then return focus to whichever widget had focus before — usually the canvas
+    view.  The canvas view receiving focus triggers a click-through event that
+    clears the scene selection, so the selected cell is deselected immediately
+    after every parameter edit.
+
+    Fix: call super() first so editingFinished fires while this widget still
+    owns focus, then immediately re-grab focus so it never falls through to
+    the canvas.  clearFocus() alone would send focus to the next widget in the
+    focus chain (the canvas), which is exactly the problem we are preventing.
+    """
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+            super().keyPressEvent(event)   # editingFinished fires here, focus still on us
+            self.setFocus()                # reclaim focus — canvas never sees it
+            return
+        super().keyPressEvent(event)
+
+
 def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
     """
     Dispatch to the per-cell icon painter that matches the cell's actual geometry.
@@ -169,6 +194,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
         "taper_pad":      _icon_taper_pad,
         "turn":           _icon_turn,
         "t_junction":     _icon_t_junction,
+        "wire":           _icon_wire,
     }
     painter_fn = _painters.get(cell_id, _icon_taper_segment)
     return painter_fn(size)
@@ -468,97 +494,104 @@ def _icon_turn(size: int) -> QPixmap:
     p.end()
     return pix
 
+def _icon_wire(size: int) -> QPixmap:
+    """
+    Lead Segment icon (L1 blue): a plain horizontal rectangle matching
+    build_wire(direction='+x') geometry.
+    Port dots at left-centre and right-centre match the actual 'start' and
+    'end' port positions (Point(0,0) and Point(tx*L, 0) in body-local coords,
+    which land at the mid-height of each end face).
+    """
+    pix, p = _pix(size)
+    m = 4
+    hw = (size - m * 2) * 0.15   # half wire-width in pixels
+    cy = size / 2
+
+    c_l1   = QColor("#2563eb"); c_l1.setAlpha(160)
+    s_l1   = QColor("#93c5fd")
+    c_port = QColor("#93c5fd")
+
+    # Wire body
+    rect_pts = [
+        QPointF(m,        cy - hw),
+        QPointF(m,        cy + hw),
+        QPointF(size - m, cy + hw),
+        QPointF(size - m, cy - hw),
+    ]
+    _filled_poly(p, rect_pts, c_l1, s_l1, 1.2)
+
+    # Port dots at left-centre and right-centre (entry and exit face midpoints)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(c_port)
+    dot_r = hw * 0.6
+    p.drawEllipse(QPointF(m,        cy), dot_r, dot_r)
+    p.drawEllipse(QPointF(size - m, cy), dot_r, dot_r)
+
+    p.end()
+    return pix
+
+
 def _icon_t_junction(size: int) -> QPixmap:
     """
-    Miniature top-view T-junction icon (L1 blue).
+    Miniature top-view T-junction (L1 blue), stem_dir='+y'.
 
-    Faithfully mirrors build_t_junction(stem_dir='+y') geometry:
-      - A solid vertical stem rising from the bottom centre.
-      - Two back-to-back quarter-circle arc bands bending left and right
-        from the top of the stem, forming the horizontal bar with rounded
-        outer corners and rounded inner concave corners.
+    Directly mirrors the build_t_junction polygon construction in Qt pixel
+    space (y increases downward).  The cell origin is the stem entry point
+    at the bottom-centre of the icon.
 
-    Polygon winding matches build_t_junction exactly:
-      1. Right inner arc  (R−hw): stem right-wall → right arm inner tip
-      2. Bar straight corners: right outer, bar top-right, bar top-left, left outer
-      3. Left inner arc reversed (R−hw): left arm inner tip → stem left-wall
-      4. Stem base closes automatically (left-wall → right-wall).
+    For stem_dir='+y':
+      fwd = (0,+1) in cell-frame, but in Qt y-down fwd is (0,-1) (upward).
+      right_perp = (+1, 0),  left_perp = (-1, 0)  (unchanged — x is the same).
+
+    Arc centres in Qt pixel space (stem origin = bottom-centre):
+      r_cx = cx_mid + R,  r_cy = stem_y   (right arc centre)
+      l_cx = cx_mid - R,  l_cy = stem_y   (left  arc centre)
+
+    Inner arc angles (build_t_junction uses atan2 in math space; translated):
+      right inner: a_start = atan2(-rpy,-rpx) = atan2(0,-1) = 180°
+                   a_end   = atan2(-fy, fx)   = atan2(-1, 0) = 270°  (up in Qt)
+      left  inner (reversed): from 270° back to 0°/360°
+
+    Bar corners in Qt pixel space (y-down means fwd-y = -1):
+      r_outer_corner = (r_cx + (R+hw),  r_cy - (R-hw))
+      r_bar_top      = (r_cx + (R+hw),  r_cy - (R+hw))
+      l_bar_top      = (l_cx - (R+hw),  l_cy - (R+hw))
+      l_outer_corner = (l_cx - (R+hw),  l_cy - (R-hw))
     """
     import math
     pix, p = _pix(size)
     m = 3
 
-    # ── Pixel-space proportions (stem_dir='+y': stem enters from bottom) ────────
     W      = size - m * 2
-    hw     = W * 0.13          # half wire-width
-    R      = W * 0.34          # arc centreline radius
+    hw     = W * 0.13
+    R      = W * 0.32
     cx_mid = size / 2
+    stem_y = size - m        # stem entry at bottom of icon (Qt y-down)
 
-    # Arc centres are R to the left/right of the stem centreline,
-    # at the same y as the stem origin (= bottom of the junction = size-m).
-    stem_y  = size - m          # stem origin (bottom of icon, Qt y-down)
-    r_cx, r_cy = cx_mid + R, stem_y   # right arc centre
-    l_cx, l_cy = cx_mid - R, stem_y   # left  arc centre
+    r_cx, r_cy = cx_mid + R, stem_y
+    l_cx, l_cy = cx_mid - R, stem_y
 
-    # ── Arc angle math (matches build_t_junction) ────────────────────────────────
-    # For stem_dir='+y': fwd=(0,+1), right_perp=(+1,0), left_perp=(-1,0).
-    # In Qt coords Y increases downward so +1 in world-y = +1 in Qt-y.
-    #
-    # Inner arc (radius R−hw):
-    #   Right arc start: vector from r_centre to stem right-wall = −right_perp = (−1,0) → 180°
-    #   Right arc end:   vector from r_centre to arm inner tip  = fwd         = (0,+1) →  90°
-    #   Left arc start (reversed): vector from l_centre to left-wall = +right_perp=(+1,0) →  0°
-    #   Left arc end (reversed):   vector = fwd = (0,+1) → 90°
-    #
-    # Bar straight corners (in cell-frame µm, converted to pixel offsets from stem_y):
-    #   r_inner_tip  = R*right_perp + (R−hw)*fwd  → pixel: (cx+R, stem_y − (R−hw))  ... wait
-    #   Because Qt y increases downward and fwd=(0,+1) is downward in Qt,
-    #   "forward" from the stem origin goes further DOWN — but our stem origin is at the
-    #   BOTTOM of the icon, and the bar is ABOVE it. So cell-y increasing upward maps to
-    #   Qt-y decreasing. We negate fwd contributions in Qt coords:
-    #   pt_qt = (cx_stem + cell_x * R, stem_y_qt - cell_y * scale)
-    #
-    # Simpler approach: build all points directly in Qt pixel coords.
     N = 24
 
-    def arc_pts_qt(cx, cy, radius, a_start_deg, a_end_deg):
-        """Sample arc in Qt pixel coords (y-down)."""
+    def arc_pts(cx, cy, radius, a0_deg, a1_deg):
         pts = []
         for i in range(N + 1):
             t = i / N
-            a = math.radians(a_start_deg + (a_end_deg - a_start_deg) * t)
+            a = math.radians(a0_deg + (a1_deg - a0_deg) * t)
             pts.append(QPointF(cx + radius * math.cos(a),
                                cy + radius * math.sin(a)))
         return pts
 
-    # In Qt pixel space (y-down, stem origin at bottom):
-    #   Right arc centre: (cx_mid + R, stem_y)
-    #   Vector from right-arc-centre to stem right-wall point = left = 180°
-    #   Vector from right-arc-centre to right arm inner tip   = up   = −90° (270°)
-    r_inner = arc_pts_qt(r_cx, r_cy, R - hw, 180, 270)   # stem right → right arm inner tip
+    # inner_right: 180° → 270°  (left of r_centre → top of r_centre = upward in Qt)
+    r_inner     = arc_pts(r_cx, r_cy, R - hw, 180, 270)
+    # inner_left reversed: 270° → 360°
+    l_inner_rev = arc_pts(l_cx, l_cy, R - hw, 270, 360)
 
-    #   Left arc centre: (cx_mid − R, stem_y)
-    #   Left arc is traversed reversed in the polygon.
-    #   Forward: vector to left-wall = right = 0°; vector to left arm inner tip = up = −90°
-    #   Reversed means we go from left arm inner tip (270°) back to left-wall (360°/0°).
-    l_inner_rev = arc_pts_qt(l_cx, l_cy, R - hw, 270, 360)  # left arm inner tip → stem left
-
-    # Bar corners in Qt pixel coords:
-    #   r_outer_corner = arc-centre + (R+hw)*right + (R−hw)*up
-    #                  = (r_cx + (R+hw), r_cy − (R−hw))
-    #   r_bar_top      = (r_cx + (R+hw), r_cy − (R+hw))
-    #   l_bar_top      = (l_cx − (R+hw), l_cy − (R+hw))
-    #   l_outer_corner = (l_cx − (R+hw), l_cy − (R−hw))
     r_outer_corner = QPointF(r_cx + (R + hw), r_cy - (R - hw))
     r_bar_top      = QPointF(r_cx + (R + hw), r_cy - (R + hw))
     l_bar_top      = QPointF(l_cx - (R + hw), l_cy - (R + hw))
     l_outer_corner = QPointF(l_cx - (R + hw), l_cy - (R - hw))
 
-    # Assemble polygon (same order as build_t_junction):
-    #   1. right inner arc
-    #   2. bar corners
-    #   3. left inner arc reversed
-    #   (stem base closes automatically)
     all_pts = (
         r_inner
         + [r_outer_corner, r_bar_top, l_bar_top, l_outer_corner]
@@ -817,9 +850,7 @@ class ComponentPalette(QWidget):
         lay.addWidget(SectionLabel("Shapes"))
 
         shapes = [
-            (ComponentKind.RECTANGLE, "Lead Segment", "Click to stamp"),
-            (ComponentKind.POLYGON,   "Polygon",    "Click vertices, Enter/dbl-click to close"),
-            (ComponentKind.PATH,      "Path",       "Click vertices, Enter to commit"),
+            (ComponentKind.POLYGON, "Polygon", "Click vertices, Enter/dbl-click to close"),
         ]
         for kind, label, sub in shapes:
             lay.addWidget(self._make_shape_button(kind, label, sub))
@@ -1530,7 +1561,7 @@ class PropertiesPanel(QWidget):
             lbl.setFixedWidth(90)
 
             if isinstance(default, float):
-                sb = QDoubleSpinBox()
+                sb = _ParamSpinBox()
                 sb.setDecimals(3)
                 sb.setRange(0.001, 1000.0)
                 sb.setSingleStep(0.1)

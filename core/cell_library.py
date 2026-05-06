@@ -1201,10 +1201,10 @@ def build_wire(
 
     _assign_ports(body, [
         Port("start",
-             Point(0, 0),
+             Point(um_to_dbu(px * hw),            um_to_dbu(py * hw)),
              _opp[direction]),
         Port("end",
-             Point(um_to_dbu(tx * L), um_to_dbu(ty * L)),
+             Point(um_to_dbu(tx * L + px * hw),   um_to_dbu(ty * L + py * hw)),
              _fwd[direction]),
     ])
 
@@ -1418,7 +1418,7 @@ CELL_CATALOGUE: List[CellDef] = [
         cell_id     = "square_node",
         name        = "Square Node",
         description = "Biysk bonding square with cap strips and L-undercut",
-        category    = "Superconducting",
+        category    = "Junctions",
         defaults    = _SQ_DEFAULTS,
         builder     = build_square_node,
     ),
@@ -1426,9 +1426,17 @@ CELL_CATALOGUE: List[CellDef] = [
         cell_id     = "manhattan_jj",
         name        = "Manhattan JJ",
         description = "Manhattan-style Josephson junction (lead + JJ square + extensions)",
-        category    = "Superconducting",
+        category    = "Junctions",
         defaults    = _JJ_DEFAULTS,
         builder     = build_manhattan_jj,
+    ),
+    CellDef(
+        cell_id     = "wire",
+        name        = "Lead Segment",
+        description = "Straight uniform wire on any layer — configurable width, length, direction",
+        category    = "Routing",
+        defaults    = _WIRE_DEFAULTS,
+        builder     = build_wire,
     ),
     CellDef(
         cell_id     = "taper_segment",
