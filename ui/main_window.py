@@ -347,8 +347,38 @@ class MainWindow(QMainWindow):
             params.update(group._cell_params)
         params[param_key] = new_value
 
-        bb     = group.bbox_from(self._design.components)
-        origin = Point(bb.x_min, bb.y_min)
+        # Use the stored anchor origin the cell was originally placed with.
+        # Recomputing from bbox is wrong when the builder origin convention
+        # differs from bbox min-corner (centre, entry-point, etc.).
+        origin = getattr(group, "_cell_origin", None)
+        if origin is None:
+            # Legacy group placed before _cell_origin was stored.
+            # Recover the true origin by doing a dry-run placement at (0,0)
+            # using the ORIGINAL params (group._cell_params, not the new params)
+            # to find the offset from cell-origin to components[0].origin,
+            # then subtracting that from the live components[0].origin.
+            first_comp = next(
+                (self._design.get(cid) for cid in group.member_ids
+                 if self._design.get(cid)), None
+            )
+            if first_comp is not None:
+                zero = Point(0, 0)
+                original_params = dict(cdef.defaults)
+                original_params.update(getattr(group, "_cell_params", {}))
+                try:
+                    dry_result = place_cell(cell_id, zero, params=original_params)
+                    dry_anchor = dry_result.components[0]
+                    dx = dry_anchor.origin.x
+                    dy = dry_anchor.origin.y
+                    origin = Point(first_comp.origin.x - dx, first_comp.origin.y - dy)
+                    # Cache it so subsequent edits and moves use the stored value
+                    group._cell_origin = origin
+                except Exception:
+                    bb     = group.bbox_from(self._design.components)
+                    origin = Point(bb.x_min, bb.y_min)
+            else:
+                bb     = group.bbox_from(self._design.components)
+                origin = Point(bb.x_min, bb.y_min)
 
         try:
             new_result = place_cell(cell_id, origin, params=params)
@@ -360,10 +390,13 @@ class MainWindow(QMainWindow):
         old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
         old_group_name = group.name
 
+        rotation_steps = getattr(group, "_cell_rotation_steps", 0)
         cmd = ReplaceCellCmd(
             self._design, self._scene, new_result, cdef,
             param_key, cell_id, params,
             group_id, old_group_name, old_comp_ids, old_comps,
+            cell_origin=origin,
+            rotation_steps=rotation_steps,
         )
         self._scene.cmd_stack.execute(cmd)
 
@@ -409,8 +442,10 @@ class MainWindow(QMainWindow):
         item = self._scene.item_for(comp_id)
         if item:
             item.sync_from_model()
-        self._props.show_component(comp, self._design)
-        self._flash_status(f"{field.replace('_', ' ').title()} → {value_dbu / 1000:.3f} µm")
+        # Do NOT call show_component here — it would setValue() on spinboxes
+        # that didn't fire, causing Qt to shift focus away from the active
+        # spinbox and ultimately deselect the canvas item.
+        self._flash_status(f"{field.replace('_', ' ').title()} -> {value_dbu / 1000:.3f} µm")
 
     @pyqtSlot(float)
     def _on_zoom_changed(self, zoom: float) -> None:

@@ -300,7 +300,7 @@ class MergeGroups(Command):
         self._source_snapshots: List[ComponentGroup] = []
         for g in source_groups:
             snap = ComponentGroup(name=g.name, member_ids=list(g.member_ids), id=g.id)
-            for attr in ("cell_id", "_cell_params"):
+            for attr in ("cell_id", "_cell_params", "_cell_origin", "_cell_rotation_steps"):
                 if hasattr(g, attr):
                     setattr(snap, attr, getattr(g, attr))
             self._source_snapshots.append(snap)
@@ -343,6 +343,7 @@ class MergeGroups(Command):
                 "name":        snap.name,
                 "cell_id":     getattr(snap, "cell_id", None),
                 "cell_params": dict(getattr(snap, "_cell_params", {})),
+                "cell_rotation_steps": getattr(snap, "_cell_rotation_steps", 0),
                 "member_ids":  list(snap.member_ids),
             })
         # Loose components that were not part of any source group
@@ -394,6 +395,12 @@ class MoveGroup(Command):
                 comp = design.get(cid)
                 if comp:
                     comp.move_by(self._dx, self._dy)
+            # Keep _cell_origin in sync so param edits re-place at the
+            # current position, not the original drop position.
+            if hasattr(group, "_cell_origin") and group._cell_origin is not None:
+                from core.model import Point
+                o = group._cell_origin
+                group._cell_origin = Point(o.x + self._dx, o.y + self._dy)
             design.is_dirty = True
 
     def undo(self, design: DesignScene) -> None:
@@ -403,6 +410,10 @@ class MoveGroup(Command):
                 comp = design.get(cid)
                 if comp:
                     comp.move_by(-self._dx, -self._dy)
+            if hasattr(group, "_cell_origin") and group._cell_origin is not None:
+                from core.model import Point
+                o = group._cell_origin
+                group._cell_origin = Point(o.x - self._dx, o.y - self._dy)
             design.is_dirty = True
 
     @property
@@ -623,9 +634,24 @@ class RotateGroup(Command):
             comp = design.get(cid)
             if comp:
                 _rotate_component_in_place(comp, self._cx, self._cy, self._steps)
+        # Rotate _cell_origin around the same centre so param edits re-place
+        # at the correct rotated position.
+        if hasattr(group, "_cell_origin") and group._cell_origin is not None:
+            nx, ny = _rotate_point(group._cell_origin.x, group._cell_origin.y,
+                                   self._cx, self._cy, self._steps)
+            group._cell_origin = Point(nx, ny)
+        # Track cumulative rotation so ReplaceCellCmd can re-apply it.
+        group._cell_rotation_steps = (getattr(group, "_cell_rotation_steps", 0) + self._steps) % 4
         design.is_dirty = True
 
     def undo(self, design: DesignScene) -> None:
+        group = design.get_group(self._group_id)
+        if group and hasattr(group, "_cell_origin") and group._cell_origin is not None:
+            nx, ny = _rotate_point(group._cell_origin.x, group._cell_origin.y,
+                                   self._cx, self._cy, -self._steps)
+            group._cell_origin = Point(nx, ny)
+        if group:
+            group._cell_rotation_steps = (getattr(group, "_cell_rotation_steps", 0) - self._steps) % 4
         for snap in self._snaps:
             comp = design.get(snap["id"])
             if comp:
@@ -666,10 +692,15 @@ class PlaceCellCommand(Command):
     """
 
     def __init__(self, result: CellResult, cell_id: str = "",
-                 cell_params: dict | None = None) -> None:
+                 cell_params: dict | None = None,
+                 cell_origin=None) -> None:
         self._result      = result
         self._cell_id     = cell_id
         self._cell_params = dict(cell_params) if cell_params else {}
+        # Store the exact origin passed to place_cell so ReplaceCellCmd can
+        # re-place at the identical anchor point.  Recomputing from bbox
+        # shifts the cell when the builder origin != bbox min-corner.
+        self._cell_origin = cell_origin
         self._comp_ids    = [c.id for c in result.components]
         self._group: Optional[ComponentGroup] = None
 
@@ -681,8 +712,10 @@ class PlaceCellCommand(Command):
             member_ids=list(self._comp_ids),
         )
         # Tag the group so the Properties panel can identify and edit this cell
-        self._group.cell_id     = self._cell_id
+        self._group.cell_id      = self._cell_id
         self._group._cell_params = dict(self._cell_params)
+        if self._cell_origin is not None:
+            self._group._cell_origin = self._cell_origin
         design.add_group(self._group)
 
     def undo(self, design: DesignScene) -> None:
@@ -822,7 +855,7 @@ class RemoveGroup:
         )
         # Preserve any dynamic attrs (cell_id, _cell_params) so undo restores
         # parametric cell metadata correctly
-        for attr in ("cell_id", "_cell_params"):
+        for attr in ("cell_id", "_cell_params", "_cell_origin", "_cell_rotation_steps"):
             if hasattr(group, attr):
                 setattr(self._group, attr, getattr(group, attr))
 
@@ -839,7 +872,8 @@ class RemoveGroup:
 class ReplaceCellCmd:
     """Atomic remove-old + place-new, fully undo-able."""
     def __init__(self, design_ref, scene_ref, new_result, cdef, param_key, cell_id, params,
-                 old_group_id, old_group_name, old_comp_ids, old_comps):
+                 old_group_id, old_group_name, old_comp_ids, old_comps, cell_origin=None,
+                 rotation_steps=0):
         self._design = design_ref
         self._scene  = scene_ref
         self.cdef = cdef
@@ -849,27 +883,71 @@ class ReplaceCellCmd:
         self._old_group_name = old_group_name
         self._old_comp_ids = old_comp_ids
         self._old_comps = old_comps
-        self._new_cmd = PlaceCellCommand(new_result, cell_id=cell_id, cell_params=params)
+        self._cell_origin = cell_origin
+        self._rotation_steps = rotation_steps % 4
+        self._new_cmd = PlaceCellCommand(new_result, cell_id=cell_id, cell_params=params,
+                                         cell_origin=cell_origin)
 
     @property
     def description(self):
         return f"Edit {self.cdef.name} parameter '{self.param_key}'"
 
     def execute(self, design):
+        # Snapshot the old anchor position BEFORE removing anything.
+        # We use this to pin the new cell to exactly the same spot.
+        old_anchor = next(
+            (design.get(cid) for cid in self._old_comp_ids if design.get(cid)), None
+        )
+        old_anchor_origin = Point(old_anchor.origin.x, old_anchor.origin.y)             if old_anchor else None
+
         # Remove old group + members
         design.remove_group(self._old_group_id)
         for cid in self._old_comp_ids:
             design.remove(cid)
-        # Place rebuilt cell
+
+        # Place rebuilt cell at _cell_origin (axis-aligned)
         self._new_cmd.execute(design)
-        # Tag new group with param overrides
-        if self._new_cmd._group is not None:
-            self._new_cmd._group._cell_params = self.params
+        new_group = self._new_cmd._group
+        if new_group is not None:
+            new_group._cell_params = self.params
+            new_group._cell_rotation_steps = self._rotation_steps
+
+            if self._rotation_steps:
+                members = [design.get(cid) for cid in new_group.member_ids
+                           if design.get(cid)]
+                if members:
+                    # Step 1: rotate around origin (0,0) so we can measure
+                    # where the anchor component ends up after rotation.
+                    new_anchor_before = members[0]
+                    pre_ax = new_anchor_before.origin.x
+                    pre_ay = new_anchor_before.origin.y
+
+                    # Rotate everything around the cell origin point
+                    ox, oy = self._cell_origin.x, self._cell_origin.y
+                    for comp in members:
+                        _rotate_component_in_place(comp, ox, oy, self._rotation_steps)
+
+                    # Step 2: the anchor has moved to a new position after rotation.
+                    # Translate all members so the anchor sits exactly where the
+                    # old anchor was — this keeps the cell perfectly in place.
+                    if old_anchor_origin is not None:
+                        post_ax = members[0].origin.x
+                        post_ay = members[0].origin.y
+                        dx = old_anchor_origin.x - post_ax
+                        dy = old_anchor_origin.y - post_ay
+                        if dx or dy:
+                            for comp in members:
+                                comp.move_by(dx, dy)
+                            # Keep _cell_origin consistent with the translation
+                            new_group._cell_origin = Point(
+                                new_group._cell_origin.x + dx,
+                                new_group._cell_origin.y + dy,
+                            ) if hasattr(new_group, "_cell_origin") and                                new_group._cell_origin is not None                             else new_group._cell_origin
 
     def undo(self, design):
         # Undo new placement
         self._new_cmd.undo(design)
-        # Restore old components
+        # Restore old components (already have baked-in rotation)
         for comp in self._old_comps:
             design.add(comp)
         old_g = ComponentGroup(
@@ -877,4 +955,8 @@ class ReplaceCellCmd:
             member_ids=self._old_comp_ids,
             id=self._old_group_id,
         )
+        # Restore dynamic attrs
+        if self._cell_origin is not None:
+            old_g._cell_origin = self._cell_origin
+        old_g._cell_rotation_steps = self._rotation_steps
         design.add_group(old_g)

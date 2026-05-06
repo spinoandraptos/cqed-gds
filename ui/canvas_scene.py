@@ -1562,7 +1562,7 @@ class CanvasScene(QGraphicsScene):
 
         origin = Point(int(scene_pos.x()), int(scene_pos.y()))
         result = place_cell(cell_id, origin, params=params)
-        self.cmd_stack.execute(PlaceCellCommand(result, cell_id=cell_id, cell_params=params or {}))
+        self.cmd_stack.execute(PlaceCellCommand(result, cell_id=cell_id, cell_params=params or {}, cell_origin=origin))
 
     # ── Background ────────────────────────────────────────────────────────────
 

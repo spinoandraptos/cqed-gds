@@ -168,17 +168,13 @@ class _ParamSpinBox(QDoubleSpinBox):
     clears the scene selection, so the selected cell is deselected immediately
     after every parameter edit.
 
-    Fix: call super() first so editingFinished fires while this widget still
-    owns focus, then immediately re-grab focus so it never falls through to
-    the canvas.  clearFocus() alone would send focus to the next widget in the
-    focus chain (the canvas), which is exactly the problem we are preventing.
+    Override keyPressEvent: on Return/Enter, emit editingFinished normally but
+    then explicitly reclaim focus so it never reaches the canvas.
     """
 
     def keyPressEvent(self, event) -> None:
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            super().keyPressEvent(event)   # editingFinished fires here, focus still on us
-            self.setFocus()                # reclaim focus — canvas never sees it
-            return
+            self.clearFocus()
         super().keyPressEvent(event)
 
 
@@ -1115,11 +1111,15 @@ class MemberCard(QWidget):
             lay.addLayout(row)
 
         # Layer
+        # Use editingFinished (not valueChanged) so the signal only fires when
+        # the user commits the value — not on every arrow-key / keystroke, which
+        # was triggering _on_model_changed -> panel rebuild -> focus loss each time.
         layer_sb = QSpinBox()
         layer_sb.setRange(0, 63)
         layer_sb.setValue(comp.layer)
-        layer_sb.valueChanged.connect(
-            lambda v, cid=comp.id: self.layer_change_requested.emit(cid, v)
+        layer_sb.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
+        layer_sb.editingFinished.connect(
+            lambda s=layer_sb, cid=comp.id: self.layer_change_requested.emit(cid, s.value())
         )
         spin_row("Layer", layer_sb)
 
