@@ -130,7 +130,19 @@ class MainWindow(QMainWindow):
         self._act_fit  = self._action("Fit All",  "F",      self._view.zoom_fit)
         self._act_zin  = self._action("Zoom In",  "Ctrl+=", self._view.zoom_in)
         self._act_zout = self._action("Zoom Out", "Ctrl+-", self._view.zoom_out)
-        self._populate_menu(menu, [self._act_fit, None, self._act_zin, self._act_zout])
+
+        self._act_undercut = self._action(
+            "Show Undercut Ring  (0.8 µm)", "U",
+            self._toggle_undercut,
+        )
+        self._act_undercut.setCheckable(True)
+        self._act_undercut.setChecked(False)
+
+        self._populate_menu(menu, [
+            self._act_fit, None,
+            self._act_zin, self._act_zout, None,
+            self._act_undercut,
+        ])
 
     def _build_help_menu(self, mb) -> None:
         menu = mb.addMenu("Help")
@@ -192,6 +204,33 @@ class MainWindow(QMainWindow):
         self._tb_button("fa5s.sliders-h",  "Sweep Parameter  (Ctrl+W)", self._sweep,           color=Colors.ACCENT)
         self._toolbar.addSeparator()
         self._tb_button("fa5s.file-export","Export GDS  (Ctrl+E)",       self._export_gds,      color=Colors.ACCENT)
+        self._toolbar.addSeparator()
+
+        # Undercut ring toggle — checkable so its state is visually obvious.
+        icon_uc = qta.icon("fa5s.ring", color=Colors.TEXT_SECONDARY,
+                           color_active=Colors.ACCENT)
+        self._tb_undercut = QAction(icon_uc, "", self)
+        self._tb_undercut.setToolTip("Toggle Undercut Ring  (U)")
+        self._tb_undercut.setCheckable(True)
+        self._tb_undercut.setChecked(False)
+        self._tb_undercut.triggered.connect(self._toggle_undercut)
+        self._toolbar.addAction(self._tb_undercut)
+
+        # Undercut offset spinbox — only meaningful when the ring is on.
+        from PyQt6.QtWidgets import QDoubleSpinBox
+        self._tb_uc_spin = QDoubleSpinBox()
+        self._tb_uc_spin.setRange(0.05, 5.0)
+        self._tb_uc_spin.setSingleStep(0.1)
+        self._tb_uc_spin.setDecimals(2)
+        self._tb_uc_spin.setSuffix(" µm")
+        self._tb_uc_spin.setValue(0.8)
+        self._tb_uc_spin.setFixedWidth(88)
+        self._tb_uc_spin.setToolTip("Undercut ring expansion distance")
+        self._tb_uc_spin.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px;"
+        )
+        self._tb_uc_spin.valueChanged.connect(self._on_undercut_offset_changed)
+        self._toolbar.addWidget(self._tb_uc_spin)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -318,6 +357,30 @@ class MainWindow(QMainWindow):
         self._sb_count.setText(f"{count} component{'s' if count != 1 else ''}")
         self._update_title()
         self._update_undo_actions()
+
+    # ── Undercut ring ─────────────────────────────────────────────────────────
+
+    def _toggle_undercut(self) -> None:
+        """Toggle the undercut ring overlay and keep toolbar + menu in sync."""
+        overlay = self._scene._undercut
+        overlay.toggle()
+        on = overlay.is_enabled
+        # Keep toolbar button and menu item in visual sync regardless of which
+        # one triggered the toggle.
+        self._tb_undercut.setChecked(on)
+        self._act_undercut.setChecked(on)
+        label = f"Show Undercut Ring  ({overlay.offset_um:.2f} µm)"
+        self._act_undercut.setText(label)
+        self._flash_status(
+            f"Undercut ring {'ON' if on else 'OFF'} — {overlay.offset_um:.2f} µm"
+        )
+
+    def _on_undercut_offset_changed(self, value: float) -> None:
+        """Live-update the ring expansion distance from the toolbar spinbox."""
+        self._scene._undercut.set_offset_um(value)
+        label = f"Show Undercut Ring  ({value:.2f} µm)"
+        self._act_undercut.setText(label)
+
 
     @pyqtSlot(str)
     def _on_mode_changed(self, label: str) -> None:

@@ -46,6 +46,7 @@ from core.model import (
     Point, Port, PortSide, dbu_to_um, um_to_dbu,
 )
 from ui.theme import Colors
+from ui.undercut_overlay import UndercutOverlay
 
 
 # ── Scene constants ────────────────────────────────────────────────────────────
@@ -706,6 +707,11 @@ class CanvasScene(QGraphicsScene):
 
         self.selectionChanged.connect(self._on_selection_changed)
         self.group_edit_entered.connect(self._on_group_edit_entered)
+
+        # Undercut ring overlay — zero-config; wired to selectionChanged +
+        # scene_changed internally.  Disabled by default; toggle via
+        # self._undercut.toggle() or self._undercut.enable(True).
+        self._undercut = UndercutOverlay(self)
 
     # ── Public placement API ──────────────────────────────────────────────────
 

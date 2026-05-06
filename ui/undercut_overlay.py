@@ -54,7 +54,7 @@ from __future__ import annotations
 from typing import Dict, Optional, Set
 
 from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QBrush, QColor, QPainterPath, QPen, QTransform
+from PyQt6.QtGui import QBrush, QColor, QPainterPath, QPen, QPainterPathStroker
 from PyQt6.QtWidgets import (
     QGraphicsItem, QGraphicsPathItem, QGraphicsScene,
 )
@@ -87,15 +87,6 @@ def _expansion_pen(offset_dbu: int) -> QPen:
 
 
 def _filled_silhouette_for_path(comp) -> QPainterPath:
-    """
-    Convert a PATH component to its filled silhouette (the outline of the
-    stroke as a closed polygon), which is then treated like a filled shape
-    for offset purposes.
-
-    A PATH centreline with path_width W is expanded by strokedPath(W) to
-    get the physical filled area of the wire.  The undercut then grows from
-    the *outside* of that area.
-    """
     pts = comp.points or []
     if not pts:
         return QPainterPath()
@@ -105,10 +96,14 @@ def _filled_silhouette_for_path(comp) -> QPainterPath:
         centreline.lineTo(pt.x, pt.y)
 
     pw = comp.path_width or um_to_dbu(0.5)
-    fill_pen = QPen(Qt.GlobalColor.black, float(pw))
-    fill_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-    fill_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    return centreline.strokedPath(fill_pen)
+    
+    # Use stroker for the centerline expansion
+    stroker = QPainterPathStroker()
+    stroker.setWidth(float(pw))
+    stroker.setCapStyle(Qt.PenCapStyle.RoundCap)
+    stroker.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+    
+    return stroker.createStroke(centreline)
 
 
 def _shape_path_for_comp(comp) -> QPainterPath:
@@ -141,24 +136,20 @@ def _shape_path_for_comp(comp) -> QPainterPath:
 
 
 def _build_ring_path(base_path: QPainterPath, offset_dbu: int) -> QPainterPath:
-    """
-    Compute the annular ring path:  expanded_outline  −  original_shape.
-
-    base_path  — filled shape in scene coordinates.
-    offset_dbu — expansion in DBU units (= nm).
-
-    Returns a QPainterPath representing only the ring annulus, ready to be
-    set on a QGraphicsPathItem.  An empty path is returned on degenerate input.
-    """
     if base_path.isEmpty():
         return QPainterPath()
 
-    # Expand by offset_dbu on all sides.
-    expanded = base_path.strokedPath(_expansion_pen(offset_dbu))
-    # Unite the expanded shell with the original to fill any interior gaps that
-    # strokedPath might introduce on non-convex shapes.
+    # Create the stroker utility
+    stroker = QPainterPathStroker()
+    stroker.setWidth(2.0 * offset_dbu)
+    stroker.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    stroker.setCapStyle(Qt.PenCapStyle.FlatCap)
+
+    # Use the stroker to create the expanded outline
+    expanded = stroker.createStroke(base_path)
+    
+    # Rest of your logic remains the same
     outer = expanded.united(base_path)
-    # The ring annulus is the difference: outer_hull minus the original interior.
     ring = outer.subtracted(base_path)
     return ring
 
