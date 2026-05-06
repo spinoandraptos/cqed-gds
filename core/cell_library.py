@@ -687,27 +687,19 @@ def build_taper_segment(
         return (tx * travel + px * sign * hw,
                 ty * travel + py * sign * hw)
 
-    trap_pts = [
-        _pt(0, entry_hw, -1),
-        _pt(0, entry_hw, +1),
-        _pt(L, exit_hw,  +1),
-        _pt(L, exit_hw,  -1),
-    ]
-    taper_body = _poly(origin, trap_pts, LAYER_BRANCH)
-    taper_body._no_auto_ports = False   # anchor — gets ports below
-
-    # ── Narrow-tip clip slice (L11) ────────────────────────────────────────
-    # 1 µm thick rectangle centred on the narrow end, same transverse width.
+    # Linearly interpolated half-width at the clip boundary (1 µm from narrow end).
+    # The L1 body is trimmed to exclude the narrow tip so L1 and L11 never overlap —
+    # they share the clip boundary edge but have no duplicate region.
     if narrow_end == "start":
-        # clip is at travel = 0 end (entry)
-        clip_pts = [
-            _pt(0,    entry_hw, -1),
-            _pt(0,    entry_hw, +1),
-            _pt(CLIP, entry_hw, +1),
-            _pt(CLIP, entry_hw, -1),
-        ]
-        # Recalculate with actual hw at clip boundary (linear interpolation)
         hw_at_clip = entry_hw + (exit_hw - entry_hw) * (CLIP / L) if L > 0 else entry_hw
+        # L1 body: clip boundary → wide exit
+        trap_pts = [
+            _pt(CLIP, hw_at_clip, -1),
+            _pt(CLIP, hw_at_clip, +1),
+            _pt(L,    exit_hw,    +1),
+            _pt(L,    exit_hw,    -1),
+        ]
+        # L11 clip: narrow entry → clip boundary (exclusive tip slice)
         clip_pts = [
             _pt(0,    entry_hw,   -1),
             _pt(0,    entry_hw,   +1),
@@ -715,37 +707,58 @@ def build_taper_segment(
             _pt(CLIP, hw_at_clip, -1),
         ]
     else:
-        # clip is at travel = L end (exit)
         hw_at_clip = exit_hw + (entry_hw - exit_hw) * (CLIP / L) if L > 0 else exit_hw
+        # L1 body: wide entry → clip boundary
+        trap_pts = [
+            _pt(0,        entry_hw,   -1),
+            _pt(0,        entry_hw,   +1),
+            _pt(L - CLIP, hw_at_clip, +1),
+            _pt(L - CLIP, hw_at_clip, -1),
+        ]
+        # L11 clip: clip boundary → narrow exit (exclusive tip slice)
         clip_pts = [
             _pt(L - CLIP, hw_at_clip, -1),
             _pt(L - CLIP, hw_at_clip, +1),
             _pt(L,        exit_hw,    +1),
             _pt(L,        exit_hw,    -1),
         ]
+
+    taper_body = _poly(origin, trap_pts, LAYER_BRANCH)
+    taper_body._no_auto_ports = False   # anchor — gets ports below
+
+    # ── Narrow-tip clip slice (L11) ────────────────────────────────────────
+    # Exclusive 1 µm tip region — no overlap with the L1 body above.
     narrow_clip = _poly(origin, clip_pts, LAYER_NARROW_END)
     narrow_clip._no_auto_ports = True
 
     components = [taper_body, narrow_clip]
 
     # ── Ports on the anchor (taper_body) ──────────────────────────────────
-    # Entry port faces opposite to direction of travel (wire comes in).
-    # Exit  port faces in the direction of travel.
+    # Port offsets are relative to taper_body.origin = _poly's dbu_pts[0]
+    # = the first vertex of trap_pts.
+    #
+    # For narrow_end="start": first vertex = _pt(CLIP, hw_at_clip, -1)
+    #   body_origin_cell = (tx*CLIP - px*hw_at_clip, ty*CLIP - py*hw_at_clip)
+    # For narrow_end="end":   first vertex = _pt(0, entry_hw, -1)
+    #   body_origin_cell = (-px*entry_hw, -py*entry_hw)
+    #
+    # Desired port world positions (cell-frame, relative to cell origin):
+    #   entry midpoint = (0, 0)      exit midpoint = (tx*L, ty*L)
+    # Port offset = desired_world - body_origin_cell
     _opp = {"+x": PortSide.WEST, "-x": PortSide.EAST,
             "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
     _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
             "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
 
-    # Port offsets must be relative to body.origin = dbu_pts[0] = first polygon
-    # vertex = _pt(0, entry_hw, -1) = (-px*entry_hw, -py*entry_hw) in cell-frame µm.
-    # Desired world positions (cell-frame): entry midpoint = (0, 0), exit midpoint = (tx*L, ty*L).
-    # Offset = desired_world - first_vertex = desired_world - (-px*ehw, -py*ehw)
-    #        = desired_world + (px*entry_hw, py*entry_hw)
-    correction_x = px * entry_hw
-    correction_y = py * entry_hw
+    if narrow_end == "start":
+        bx = tx * CLIP - px * hw_at_clip
+        by = ty * CLIP - py * hw_at_clip
+    else:
+        bx = -px * entry_hw
+        by = -py * entry_hw
 
-    entry_offset = (correction_x,        correction_y)
-    exit_offset  = (tx * L + correction_x, ty * L + correction_y)
+    entry_offset = (0  - bx,       0  - by)
+    exit_offset  = (tx * L - bx,   ty * L - by)
 
     _assign_ports(taper_body, [
         Port(entry_label,
