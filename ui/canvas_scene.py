@@ -310,7 +310,12 @@ class GroupItem(QGraphicsItem):
         return self._current_bbox().adjusted(-4, -4, 4, 4)
 
     def paint(self, painter: QPainter, option, widget=None) -> None:
-        rect = self._current_bbox()
+        # Derive the inner rect from boundingRect() (which Qt already called for
+        # clipping) rather than querying _current_bbox() a second time.  A second
+        # live model read here could return a different rect if the model changed
+        # between Qt's boundingRect() call and paint(), causing the border to be
+        # drawn outside the clipped region and appear to jump.
+        rect = self.boundingRect().adjusted(4, 4, -4, -4)
 
         if self._editing:
             border = _GROUP_BORDER_EDITING
@@ -406,6 +411,13 @@ class ComponentItem(QGraphicsItem):
         self._comp      = component
         self._scene_ref = scene_ref
 
+        # ItemIsMovable is intentionally NOT set here.
+        # - Standalone components are moved by _on_unified_move calling comp.move_by()
+        #   directly, then sync_from_model() repaints — Qt's built-in move is bypassed.
+        # - Group members have ItemIsMovable toggled on/off by _set_group_members_movable
+        #   only when the group enters/exits edit mode.
+        # Adding ItemIsMovable globally would let Qt move items independently of the
+        # model, producing positions that disagree with comp.origin and causing jumps.
         self.setFlags(
             QGraphicsItem.GraphicsItemFlag.ItemIsSelectable |
             QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges |
@@ -850,6 +862,11 @@ class CanvasScene(QGraphicsScene):
         """Wire the snapped port pair after a group move commits."""
         snap = self.find_group_port_snap(group)
         if snap is None:
+            # Even with no new snap, all group members had their connections
+            # cleared in _on_unified_release — refresh their indicators so
+            # the edge-indicator arrows don't linger in a stale state.
+            for cid in group.member_ids:
+                self._refresh_indicators(cid)
             return
         _, _, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
         self.disconnect_component(my_comp_id)
@@ -859,7 +876,10 @@ class CanvasScene(QGraphicsScene):
             self.cmd_stack.execute(
                 ConnectPorts(my_comp_id, my_port_id, their_comp_id, their_port_id)
             )
-        self._refresh_indicators(my_comp_id)
+        # Refresh all group members (their connections were cleared on drag start)
+        # and the external target component.
+        for cid in group.member_ids:
+            self._refresh_indicators(cid)
         self._refresh_indicators(their_comp_id)
         self.connections_changed.emit()
 
@@ -1031,20 +1051,28 @@ class CanvasScene(QGraphicsScene):
         self._drag_committed = False
         self._snap_offset    = None
 
-        self._orig_comp_positions = {
-            i: Point(i._comp.origin.x, i._comp.origin.y)
-            for i in self.selectedItems()
-            if isinstance(i, ComponentItem)
-        }
+        # Collect all component IDs that belong to a selected non-editing group.
+        # These must NOT also appear in _orig_comp_positions — if they did, each
+        # component would be moved twice during the drag (once via the group path
+        # and once via the standalone-component path), causing a jump on release.
+        group_member_ids: set[str] = set()
         self._orig_group_positions = {}
         for gi in self.selectedItems():
             if not isinstance(gi, GroupItem) or gi.is_editing:
                 continue
+            group_member_ids.update(gi.group.member_ids)
             self._orig_group_positions[gi.group.id] = {
                 cid: Point(comp.origin.x, comp.origin.y)
                 for cid in gi.group.member_ids
                 if (comp := self._design.get(cid)) is not None
             }
+
+        self._orig_comp_positions = {
+            i: Point(i._comp.origin.x, i._comp.origin.y)
+            for i in self.selectedItems()
+            if isinstance(i, ComponentItem)
+            and i._comp.id not in group_member_ids
+        }
 
     # Legacy aliases kept for any external call sites.
     def _on_item_move(self, event) -> None:
@@ -1124,6 +1152,23 @@ class CanvasScene(QGraphicsScene):
                 if snap:
                     extra_dx, extra_dy, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
                     self._snap_offset = ("group", group_id, extra_dx, extra_dy)
+
+                    # Apply the snap correction visually so the group jumps flush
+                    # to the target port during drag — matching single-component
+                    # snap behaviour.  The live model positions are already at the
+                    # tentative drag location; we nudge by the residual gap only.
+                    if extra_dx or extra_dy:
+                        for cid in group.member_ids:
+                            comp = self._design.get(cid)
+                            if comp:
+                                comp.move_by(extra_dx, extra_dy)
+                                snap_item_vis = self._items.get(cid)
+                                if snap_item_vis:
+                                    snap_item_vis.sync_from_model()
+                        gi = self._group_items.get(group_id)
+                        if gi:
+                            gi.prepareGeometryChange()
+
                     my_item = self.item_for(my_comp_id)
                     if my_item:
                         my_item.set_port_active(my_port_id, True)
@@ -1174,16 +1219,26 @@ class CanvasScene(QGraphicsScene):
             if not group:
                 continue
 
-            total_dx = total_dy = int(round(delta.x())), int(round(delta.y()))
-            total_dx, total_dy  = int(round(delta.x())), int(round(delta.y()))
-
-            if (isinstance(self._snap_offset, tuple)
-                    and self._snap_offset[0] == "group"
-                    and self._snap_offset[1] == group_id):
-                _, _, extra_dx, extra_dy = self._snap_offset
-                total_dx += extra_dx
-                total_dy += extra_dy
+            is_snapped = (
+                isinstance(self._snap_offset, tuple)
+                and self._snap_offset[0] == "group"
+                and self._snap_offset[1] == group_id
+            )
+            if is_snapped:
                 snapped_group_id = group_id
+
+            # Derive total displacement from the live model position of the first
+            # member rather than from delta+extra_snap.  The visual snap nudge in
+            # _on_unified_move already applied extra_dx/dy to comp.origin, so
+            # reading the live position gives the exact committed displacement
+            # without any risk of applying the snap correction twice.
+            first_cid  = next(iter(origins), None)
+            first_comp = self._design.get(first_cid) if first_cid else None
+            if first_comp and first_cid in origins:
+                total_dx = first_comp.origin.x - origins[first_cid].x
+                total_dy = first_comp.origin.y - origins[first_cid].y
+            else:
+                total_dx, total_dy = int(round(delta.x())), int(round(delta.y()))
 
             # Revert live move so MoveGroup records correct before/after.
             for cid, orig in origins.items():
@@ -1564,8 +1619,18 @@ class CanvasScene(QGraphicsScene):
             dead_item.setSelected(False)
             self.removeItem(dead_item)
 
+        # Collect IDs of components that are locked inside a non-editing group.
+        # Their geometry is managed entirely by the group drag path — calling
+        # sync_from_model() on them here would produce a redundant repaint from
+        # a potentially stale model snapshot mid-drag, causing visible flicker.
+        locked_member_ids: set[str] = set()
+        for gi in self._group_items.values():
+            if not gi.is_editing:
+                locked_member_ids.update(gi.group.member_ids)
+
         for comp in self._design.components:
-            self._items[comp.id].sync_from_model()
+            if comp.id not in locked_member_ids:
+                self._items[comp.id].sync_from_model()
 
         # Group sync.
         model_gids = {g.id for g in self._design.groups}
