@@ -480,14 +480,23 @@ def _rotate_component_in_place(comp: "GDSComponent",
             comp.origin = comp.points[0]
 
     # ── Rotate port offsets and sides ─────────────────────────────────────────
-    # Port offsets are relative to comp.origin (local space).  After the
-    # geometry rotation above, comp.origin has moved in world space, but the
-    # local-space offsets still point in the old directions.  We rotate each
-    # offset vector around (0, 0) — i.e. the same steps, same formula, but
-    # with the rotation centre fixed at the local origin.
+    # A port's absolute world position before rotation is:
+    #   abs_old = old_origin + offset
+    # After rotating the whole component around (cx, cy) by `steps`:
+    #   abs_new = rotate(abs_old, cx, cy, steps)
+    # The new local offset must be:
+    #   new_offset = abs_new - new_origin
+    #
+    # At this point comp.origin is already new_origin (set by the geometry
+    # block above).  Recover old_origin by applying the inverse rotation:
+    #   old_origin = rotate(new_origin, cx, cy, -steps)
+    new_ox, new_oy = comp.origin.x, comp.origin.y
+    old_ox, old_oy = _rotate_point(new_ox, new_oy, cx, cy, (4 - steps) % 4)
     for port in comp.ports:
-        rx, ry = _rotate_point(port.offset.x, port.offset.y, 0, 0, steps)
-        port.offset = Point(rx, ry)
+        abs_old_x = old_ox + port.offset.x
+        abs_old_y = old_oy + port.offset.y
+        abs_new_x, abs_new_y = _rotate_point(abs_old_x, abs_old_y, cx, cy, steps)
+        port.offset = Point(abs_new_x - new_ox, abs_new_y - new_oy)
         port.side   = _rotate_port_side(port.side, steps)
 
 

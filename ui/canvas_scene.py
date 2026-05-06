@@ -504,6 +504,27 @@ class ComponentItem(QGraphicsItem):
 
     def sync_from_model(self) -> None:
         c = self._comp
+
+        # ── Delegate type may have changed (rect→polygon after first rotation) ──
+        # _rotate_component_in_place promotes RECTANGLE→POLYGON in the model.
+        # If the delegate is still a QGraphicsRectItem but the model is now a
+        # POLYGON (or PATH), we must replace the delegate so geometry is painted
+        # correctly and the bbox used for port recomputation is valid.
+        needs_new_delegate = (
+            (c.kind == ComponentKind.POLYGON and isinstance(self._delegate, QGraphicsRectItem))
+            or (c.kind == ComponentKind.PATH   and isinstance(self._delegate, QGraphicsRectItem))
+            or (c.kind == ComponentKind.RECTANGLE and not isinstance(self._delegate, QGraphicsRectItem))
+        )
+        if needs_new_delegate:
+            # Detach old delegate from the scene/parent before replacing it
+            old = self._delegate
+            old.setParentItem(None)
+            if self.scene():
+                self.scene().removeItem(old)
+            self._delegate = self._make_delegate()
+            # Re-apply the current visual style to the fresh delegate
+            self._apply_style(self.isSelected(), hovered=False)
+
         if isinstance(self._delegate, QGraphicsRectItem):
             self._delegate.setRect(c.origin.x, c.origin.y, c.width, c.height)
         elif isinstance(self._delegate, QGraphicsPolygonItem):
@@ -527,8 +548,11 @@ class ComponentItem(QGraphicsItem):
 
         Two cases:
           1. Standalone shape — ports have canonical names N/S/E/W (auto-generated
-             by build_default_ports()).  Recompute offsets from current bbox so they
-             stay edge-centred after rotation.
+             by build_default_ports()).  Recompute offsets from current bbox using
+             the port's current *side* (which has been rotated correctly by
+             _rotate_component_in_place) so they stay on the correct edge after
+             rotation.  Port names are NOT used for mapping — they are stale after
+             rotation (e.g. a port named "N" may now face WEST after a 90° turn).
           2. Cell anchor — ports have semantic names with explicit offsets set by
              the cell builder.  Do NOT overwrite those offsets; only reposition
              the PortItems to where the model already says.
@@ -552,15 +576,20 @@ class ComponentItem(QGraphicsItem):
             cx = (bb.x_min + bb.x_max) // 2
             cy = (bb.y_min + bb.y_max) // 2
             ox, oy = self._comp.origin.x, self._comp.origin.y
-            new_offsets = {
-                "N": Point(cx - ox, bb.y_min - oy),
-                "S": Point(cx - ox, bb.y_max - oy),
-                "W": Point(bb.x_min - ox, cy - oy),
-                "E": Point(bb.x_max - ox, cy - oy),
+            # Map each port to the edge-centre that matches its current *side*
+            # (which has already been updated by _rotate_component_in_place).
+            # Using port.side — not port.name — is critical after rotation: a port
+            # named "N" may face WEST after a 90° CCW turn, and it must sit on
+            # the WEST edge of the current bbox, not the top edge.
+            side_to_offset = {
+                PortSide.NORTH: Point(cx - ox, bb.y_min - oy),
+                PortSide.SOUTH: Point(cx - ox, bb.y_max - oy),
+                PortSide.WEST:  Point(bb.x_min - ox, cy - oy),
+                PortSide.EAST:  Point(bb.x_max - ox, cy - oy),
             }
             for port in self._comp.ports:
-                if port.name in new_offsets:
-                    port.offset = new_offsets[port.name]
+                if port.side in side_to_offset:
+                    port.offset = side_to_offset[port.side]
 
         for pi in self._port_items:
             abs_pos = pi.port.abs_pos(self._comp.origin)
@@ -776,7 +805,7 @@ class CanvasScene(QGraphicsScene):
         """
         Check whether any port on *moving_comp* (placed at *tentative_origin*)
         is within PORT_SNAP_RADIUS of a compatible port on another component.
-        Compatibility: ports must face each other (side == other.side.opposite).
+        Snapping is proximity-only — no side-compatibility check.
 
         Returns (snapped_origin, my_port_id, their_port_id, their_comp_id)
         or None.  snapped_origin is the exact origin placing my_port flush
@@ -794,8 +823,6 @@ class CanvasScene(QGraphicsScene):
                 if other_comp.id == moving_comp.id:
                     continue
                 for other_port in other_comp.ports:
-                    if other_port.side != port.side.opposite:
-                        continue
                     their_abs = other_port.abs_pos(other_comp.origin)
                     dx   = my_abs.x - their_abs.x
                     dy   = my_abs.y - their_abs.y
@@ -810,7 +837,7 @@ class CanvasScene(QGraphicsScene):
     def find_group_port_snap(self, moving_group: ComponentGroup) -> Optional[tuple]:
         """
         Check whether any port on any member of *moving_group* is within
-        PORT_SNAP_RADIUS of a compatible port outside the group.
+        PORT_SNAP_RADIUS of any port outside the group.
 
         Returns (extra_dx, extra_dy, my_comp_id, my_port_id,
                  their_comp_id, their_port_id) or None.
@@ -828,8 +855,6 @@ class CanvasScene(QGraphicsScene):
                     if other_comp.id in member_ids:
                         continue
                     for other_port in other_comp.ports:
-                        if other_port.side != my_port.side.opposite:
-                            continue
                         their_abs = other_port.abs_pos(other_comp.origin)
                         dx   = my_abs.x - their_abs.x
                         dy   = my_abs.y - their_abs.y
