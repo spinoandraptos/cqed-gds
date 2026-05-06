@@ -471,57 +471,103 @@ def _icon_turn(size: int) -> QPixmap:
 def _icon_t_junction(size: int) -> QPixmap:
     """
     Miniature top-view T-junction icon (L1 blue).
-    Draws the correct T shape: two quarter-circle arc corners forming the
-    rounded bar, with a stem dropping from the centre.  Matches the actual
-    build_t_junction geometry (stem_dir=+y, arc radius ≈ 40% of icon width).
+
+    Faithfully mirrors build_t_junction(stem_dir='+y') geometry:
+      - A solid vertical stem rising from the bottom centre.
+      - Two back-to-back quarter-circle arc bands bending left and right
+        from the top of the stem, forming the horizontal bar with rounded
+        outer corners and rounded inner concave corners.
+
+    Polygon winding matches build_t_junction exactly:
+      1. Right inner arc  (R−hw): stem right-wall → right arm inner tip
+      2. Bar straight corners: right outer, bar top-right, bar top-left, left outer
+      3. Left inner arc reversed (R−hw): left arm inner tip → stem left-wall
+      4. Stem base closes automatically (left-wall → right-wall).
     """
     import math
     pix, p = _pix(size)
     m = 3
 
-    # Proportions scaled to icon pixel space.
-    # Stem enters from the bottom centre; bar runs left-right at ~60% height.
-    # Arc centres sit at (±R, bar_y) in icon coords where bar_y = size - m - R.
-    hw    = (size - m * 2) * 0.14   # half wire-width in pixels
-    R     = (size - m * 2) * 0.38   # arc radius in pixels
-    cy_bar = m + R                   # y of arc centres (Qt: y increases downward)
+    # ── Pixel-space proportions (stem_dir='+y': stem enters from bottom) ────────
+    W      = size - m * 2
+    hw     = W * 0.13          # half wire-width
+    R      = W * 0.34          # arc centreline radius
     cx_mid = size / 2
 
-    l_cx = cx_mid - R   # left arc centre x
-    r_cx = cx_mid + R   # right arc centre x
+    # Arc centres are R to the left/right of the stem centreline,
+    # at the same y as the stem origin (= bottom of the junction = size-m).
+    stem_y  = size - m          # stem origin (bottom of icon, Qt y-down)
+    r_cx, r_cy = cx_mid + R, stem_y   # right arc centre
+    l_cx, l_cy = cx_mid - R, stem_y   # left  arc centre
 
-    # Arc sweeps (Qt coords: 0°=right, 90°=down, -90°=up).
-    # Left  arc: entry from below (+y), turns CCW  → exits left  (-x).
-    #   Centre to left of entry → at (l_cx, cy_bar).
-    #   Entry side (bottom of left arc) at angle +90° (pointing down from centre).
-    #   Sweep CCW: 90° → 0°  (i.e. end points right from centre = left arm exit).
-    # Right arc: symmetric.
-    N = 20
+    # ── Arc angle math (matches build_t_junction) ────────────────────────────────
+    # For stem_dir='+y': fwd=(0,+1), right_perp=(+1,0), left_perp=(-1,0).
+    # In Qt coords Y increases downward so +1 in world-y = +1 in Qt-y.
+    #
+    # Inner arc (radius R−hw):
+    #   Right arc start: vector from r_centre to stem right-wall = −right_perp = (−1,0) → 180°
+    #   Right arc end:   vector from r_centre to arm inner tip  = fwd         = (0,+1) →  90°
+    #   Left arc start (reversed): vector from l_centre to left-wall = +right_perp=(+1,0) →  0°
+    #   Left arc end (reversed):   vector = fwd = (0,+1) → 90°
+    #
+    # Bar straight corners (in cell-frame µm, converted to pixel offsets from stem_y):
+    #   r_inner_tip  = R*right_perp + (R−hw)*fwd  → pixel: (cx+R, stem_y − (R−hw))  ... wait
+    #   Because Qt y increases downward and fwd=(0,+1) is downward in Qt,
+    #   "forward" from the stem origin goes further DOWN — but our stem origin is at the
+    #   BOTTOM of the icon, and the bar is ABOVE it. So cell-y increasing upward maps to
+    #   Qt-y decreasing. We negate fwd contributions in Qt coords:
+    #   pt_qt = (cx_stem + cell_x * R, stem_y_qt - cell_y * scale)
+    #
+    # Simpler approach: build all points directly in Qt pixel coords.
+    N = 24
 
-    def arc_pts(cx, cy, r, a0_deg, a1_deg):
+    def arc_pts_qt(cx, cy, radius, a_start_deg, a_end_deg):
+        """Sample arc in Qt pixel coords (y-down)."""
         pts = []
         for i in range(N + 1):
             t = i / N
-            a = math.radians(a0_deg + (a1_deg - a0_deg) * t)
-            pts.append(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+            a = math.radians(a_start_deg + (a_end_deg - a_start_deg) * t)
+            pts.append(QPointF(cx + radius * math.cos(a),
+                               cy + radius * math.sin(a)))
         return pts
 
-    # Correct winding (mirrors build_t_junction logic):
-    # outer_left:          90°→180°  (bottom of left arc → left arm outer tip)
-    # reversed(outer_right): outer_right goes 90°→0°; reversed = 0°→90°
-    # reversed(inner_left):  inner_left goes 90°→180°; reversed = 180°→90°
-    # inner_right:           90°→0°
+    # In Qt pixel space (y-down, stem origin at bottom):
+    #   Right arc centre: (cx_mid + R, stem_y)
+    #   Vector from right-arc-centre to stem right-wall point = left = 180°
+    #   Vector from right-arc-centre to right arm inner tip   = up   = −90° (270°)
+    r_inner = arc_pts_qt(r_cx, r_cy, R - hw, 180, 270)   # stem right → right arm inner tip
 
-    ol = arc_pts(l_cx, cy_bar, R + hw, 90, 180)   # bottom-right → left arm outer
-    il = arc_pts(l_cx, cy_bar, R - hw, 90, 180)   # bottom-right inner → left arm inner
-    or_ = arc_pts(r_cx, cy_bar, R + hw, 90,  0)   # bottom-left → right arm outer
-    ir  = arc_pts(r_cx, cy_bar, R - hw, 90,  0)   # bottom-left inner → right arm inner
+    #   Left arc centre: (cx_mid − R, stem_y)
+    #   Left arc is traversed reversed in the polygon.
+    #   Forward: vector to left-wall = right = 0°; vector to left arm inner tip = up = −90°
+    #   Reversed means we go from left arm inner tip (270°) back to left-wall (360°/0°).
+    l_inner_rev = arc_pts_qt(l_cx, l_cy, R - hw, 270, 360)  # left arm inner tip → stem left
 
-    pts = ol + list(reversed(or_)) + list(reversed(il)) + ir
+    # Bar corners in Qt pixel coords:
+    #   r_outer_corner = arc-centre + (R+hw)*right + (R−hw)*up
+    #                  = (r_cx + (R+hw), r_cy − (R−hw))
+    #   r_bar_top      = (r_cx + (R+hw), r_cy − (R+hw))
+    #   l_bar_top      = (l_cx − (R+hw), l_cy − (R+hw))
+    #   l_outer_corner = (l_cx − (R+hw), l_cy − (R−hw))
+    r_outer_corner = QPointF(r_cx + (R + hw), r_cy - (R - hw))
+    r_bar_top      = QPointF(r_cx + (R + hw), r_cy - (R + hw))
+    l_bar_top      = QPointF(l_cx - (R + hw), l_cy - (R + hw))
+    l_outer_corner = QPointF(l_cx - (R + hw), l_cy - (R - hw))
+
+    # Assemble polygon (same order as build_t_junction):
+    #   1. right inner arc
+    #   2. bar corners
+    #   3. left inner arc reversed
+    #   (stem base closes automatically)
+    all_pts = (
+        r_inner
+        + [r_outer_corner, r_bar_top, l_bar_top, l_outer_corner]
+        + l_inner_rev
+    )
 
     path = QPainterPath()
-    path.moveTo(pts[0])
-    for pt in pts[1:]:
+    path.moveTo(all_pts[0])
+    for pt in all_pts[1:]:
         path.lineTo(pt)
     path.closeSubpath()
 
