@@ -184,13 +184,15 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
     Falls back to a generic rectangle icon for unknown cell_ids.
     """
     _painters = {
-        "square_node":    _icon_square_node,
-        "manhattan_jj":   _icon_manhattan_jj,
-        "taper_segment":  _icon_taper_segment,
-        "taper_pad":      _icon_taper_pad,
-        "turn":           _icon_turn,
-        "t_junction":     _icon_t_junction,
-        "wire":           _icon_wire,
+        "square_node":      _icon_square_node,
+        "manhattan_jj":     _icon_manhattan_jj,
+        "taper_segment":    _icon_taper_segment,
+        "taper_pad":        _icon_taper_pad,
+        "smooth_taper_pad": _icon_taper_pad,
+        "branch_segment":   _icon_wire,
+        "turn":             _icon_turn,
+        "t_junction":       _icon_t_junction,
+        "wire":             _icon_wire,
     }
     painter_fn = _painters.get(cell_id, _icon_taper_segment)
     return painter_fn(size)
@@ -410,36 +412,48 @@ def _icon_taper_segment(size: int) -> QPixmap:
 
 def _icon_taper_pad(size: int) -> QPixmap:
     """
-    Two-stage shape (both L1 blue): narrow-to-wide trapezoid + wide flat pad rectangle.
-    The pad is clearly wider and longer than the taper.
+    Two-stage shape (both L1 blue): cosine-curved taper + wide flat pad rectangle.
+
+    The taper uses a cosine width profile (matching smooth_taper() in primitives.py
+    and build_smooth_taper_pad() in cell_library.py) so it is visually distinct
+    from the linear _icon_taper_segment.  The pad is a plain rectangle abutting
+    the wide end of the taper.
     """
+    import math
     pix, p = _pix(size)
     m = 4
     W = size - m * 2
 
-    nh = W * 0.09   # narrow half-height
-    wh = W * 0.38   # wide half-height
-    taper_w = W * 0.45  # taper portion width
-    pad_w   = W * 0.45  # pad portion width
+    nh = W * 0.09   # narrow half-height (entry)
+    wh = W * 0.38   # wide  half-height  (exit / pad)
+    taper_w = W * 0.48   # taper portion pixel-width
+    pad_w   = W * 0.42   # pad   portion pixel-width
 
     c_l1 = QColor("#2563eb"); c_l1.setAlpha(160)
     s_l1 = QColor("#93c5fd")
 
-    # Taper trapezoid
-    trap_pts = [
-        QPointF(m,            size/2 - nh),
-        QPointF(m,            size/2 + nh),
-        QPointF(m + taper_w,  size/2 + wh),
-        QPointF(m + taper_w,  size/2 - wh),
+    # ── Cosine taper (N-segment polygon) ─────────────────────────────────────
+    # w(t) = nh + (wh - nh) * 0.5 * (1 - cos(pi*t)),  t in [0,1]
+    N = 24
+    upper = [
+        QPointF(m + taper_w * t,
+                size/2 - (nh + (wh - nh) * 0.5 * (1 - math.cos(math.pi * t))))
+        for t in (i / N for i in range(N + 1))
     ]
-    _filled_poly(p, trap_pts, c_l1, s_l1, 1.2)
+    lower = [
+        QPointF(m + taper_w * t,
+                size/2 + (nh + (wh - nh) * 0.5 * (1 - math.cos(math.pi * t))))
+        for t in (i / N for i in range(N, -1, -1))
+    ]
+    taper_pts = upper + lower
+    _filled_poly(p, taper_pts, c_l1, s_l1, 1.2)
 
-    # Flat pad
+    # ── Flat pad (rectangle) ─────────────────────────────────────────────────
     pad_pts = [
-        QPointF(m + taper_w,           size/2 - wh),
-        QPointF(m + taper_w,           size/2 + wh),
-        QPointF(m + taper_w + pad_w,   size/2 + wh),
-        QPointF(m + taper_w + pad_w,   size/2 - wh),
+        QPointF(m + taper_w,            size/2 - wh),
+        QPointF(m + taper_w,            size/2 + wh),
+        QPointF(m + taper_w + pad_w,    size/2 + wh),
+        QPointF(m + taper_w + pad_w,    size/2 - wh),
     ]
     _filled_poly(p, pad_pts, c_l1, s_l1, 1.2)
 

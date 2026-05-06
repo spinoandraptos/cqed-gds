@@ -906,6 +906,156 @@ def build_taper_pad(
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Smooth Taper Pad  (→ smooth_taper + add_taper_pad in primitives.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors the Config values used in the reference layout:
+#   TAPER_WIDTH        → narrow_width  (entry, wire-side)
+#   FINAL_TAPER_WIDTH  → pad_width     (exit,  pad-side)
+#   FINAL_TAPER_LENGTH → taper_length
+#   FINAL_PAD_LENGTH   → pad_length
+_SMOOTH_TAPER_PAD_DEFAULTS = dict(
+    direction    = "+x",   # "+x" | "-x" | "+y" | "-y"
+    narrow_width = 2.0,    # entry (wire-side) width µm  → cfg.TAPER_WIDTH
+    pad_width    = 5.0,    # exit  (pad-side)  width µm  → cfg.FINAL_TAPER_WIDTH
+    taper_length = 6.1,    # cosine-taper length µm      → cfg.FINAL_TAPER_LENGTH
+    pad_length   = 4.0,    # flat pad length µm           → cfg.FINAL_PAD_LENGTH
+    n_segments   = 128,    # polygon vertex count for the cosine curve
+)
+
+
+def build_smooth_taper_pad(
+    origin: Point,
+    direction:    str   = _SMOOTH_TAPER_PAD_DEFAULTS["direction"],
+    narrow_width: float = _SMOOTH_TAPER_PAD_DEFAULTS["narrow_width"],
+    pad_width:    float = _SMOOTH_TAPER_PAD_DEFAULTS["pad_width"],
+    taper_length: float = _SMOOTH_TAPER_PAD_DEFAULTS["taper_length"],
+    pad_length:   float = _SMOOTH_TAPER_PAD_DEFAULTS["pad_length"],
+    n_segments:   int   = _SMOOTH_TAPER_PAD_DEFAULTS["n_segments"],
+) -> CellResult:
+    """
+    Two-stage transition on LAYER_BRANCH (L1):
+
+    Stage 1 — Smooth cosine taper (polygon):
+        Runs from *origin* for *taper_length* in *direction*.
+        Entry width = narrow_width, exit width = pad_width.
+        Width profile: w(t) = w0 + (w1 − w0) × ½(1 − cos(πt)), t ∈ [0, 1].
+        Approximated as a 2×n_segments-vertex polygon, identical to the
+        output of ``smooth_taper()`` in the reference primitives.py.
+
+    Stage 2 — Flat overlap pad (rectangle):
+        Runs from the taper exit for *pad_length* in *direction*.
+        Uniform width = pad_width throughout.
+        Shares the taper exit edge as its entry boundary (no gap).
+
+    Both stages are on LAYER_BRANCH (L1).  No LAYER_NARROW_END clip is
+    emitted — this is the wide termination end, not the narrow tip.
+
+    Origin convention
+    -----------------
+    *origin* is the centreline of the **entry (narrow) end**, matching the
+    (x0, y0) convention used by ``smooth_taper()`` and ``add_taper_pad()``
+    in the reference codebase.
+
+    Ports (on the taper anchor)
+    ---------------------------
+    "narrow" — entry face, faces opposite to direction of travel.
+    "wide"   — exit face (at the far end of the flat pad), faces direction.
+
+    Port offsets are relative to taper_body.origin (first polygon vertex).
+    """
+    import math
+
+    if direction not in ("+x", "-x", "+y", "-y"):
+        raise ValueError(
+            f"direction must be '+x', '-x', '+y', or '-y'; got {direction!r}"
+        )
+
+    nw = narrow_width
+    pw = pad_width
+    tL = taper_length
+    pL = pad_length
+    n  = n_segments
+
+    # ── Direction unit vectors ─────────────────────────────────────────────
+    # Convention matches _dir_map used throughout this file.
+    _dir_map = {
+        "+x": (( 1,  0), (0,  1)),
+        "-x": ((-1,  0), (0,  1)),
+        "+y": (( 0,  1), (1,  0)),
+        "-y": (( 0, -1), (1,  0)),
+    }
+    (tx, ty), (px, py) = _dir_map[direction]
+
+    # ── Cosine width profile ───────────────────────────────────────────────
+    # half-width at fractional taper position t ∈ [0, 1]
+    def _hw(t: float) -> float:
+        return (nw + (pw - nw) * 0.5 * (1.0 - math.cos(math.pi * t))) / 2.0
+
+    # upper edge: entry → exit along +transverse
+    upper: list[tuple[float, float]] = [
+        (tx * tL * t + px * _hw(t),
+         ty * tL * t + py * _hw(t))
+        for t in (i / n for i in range(n + 1))
+    ]
+    # lower edge: exit → entry along -transverse (reversed for CCW winding)
+    lower: list[tuple[float, float]] = [
+        (tx * tL * t - px * _hw(t),
+         ty * tL * t - py * _hw(t))
+        for t in (i / n for i in range(n, -1, -1))
+    ]
+
+    taper_body = _poly(origin, upper + lower, LAYER_BRANCH)
+    taper_body._no_auto_ports = False   # anchor — carries all ports
+
+    # ── Flat pad (rectangle) ──────────────────────────────────────────────
+    pad_pts: list[tuple[float, float]] = [
+        (tx * tL        - px * pw / 2,  ty * tL        - py * pw / 2),
+        (tx * tL        + px * pw / 2,  ty * tL        + py * pw / 2),
+        (tx * (tL + pL) + px * pw / 2,  ty * (tL + pL) + py * pw / 2),
+        (tx * (tL + pL) - px * pw / 2,  ty * (tL + pL) - py * pw / 2),
+    ]
+    pad_body = _poly(origin, pad_pts, LAYER_BRANCH)
+    pad_body._no_auto_ports = True
+
+    # ── Ports on the anchor ────────────────────────────────────────────────
+    # taper_body.origin is the first polygon vertex = upper[0]
+    # = (px * nw/2, py * nw/2) in cell-frame µm.
+    # Port offset = desired_cell_frame_pos − body_origin_cell_frame
+    bx = px * nw / 2
+    by = py * nw / 2
+
+    _opp_side = {
+        "+x": PortSide.WEST,  "-x": PortSide.EAST,
+        "+y": PortSide.NORTH, "-y": PortSide.SOUTH,
+    }
+    _fwd_side = {
+        "+x": PortSide.EAST,  "-x": PortSide.WEST,
+        "+y": PortSide.SOUTH, "-y": PortSide.NORTH,
+    }
+
+    _assign_ports(taper_body, [
+        Port("narrow",
+             Point(um_to_dbu(0.0 - bx),              um_to_dbu(0.0 - by)),
+             _opp_side[direction]),
+        Port("wide",
+             Point(um_to_dbu(tx * (tL + pL) - bx),  um_to_dbu(ty * (tL + pL) - by)),
+             _fwd_side[direction]),
+    ])
+
+    return CellResult(
+        components=[taper_body, pad_body],
+        group_name=(
+            f"SmoothTaperPad ({direction} tL={taper_length:.1f}µm pL={pad_length:.1f}µm)"
+        ),
+        description=(
+            f"Cosine taper pad  {direction}  "
+            f"taper {taper_length}µm  pad {pad_length}µm  "
+            f"nw={narrow_width}µm → pw={pad_width}µm  L1"
+        ),
+    )
+
 
 # ═════════════════════════════════════════════════════════════════════════════
 # Cell: Branch Segment  (→ add_branch_segment in components_lib.py)
@@ -1453,6 +1603,14 @@ CELL_CATALOGUE: List[CellDef] = [
         category    = "Routing",
         defaults    = _TAPER_PAD_DEFAULTS,
         builder     = build_taper_pad,
+    ),
+    CellDef(
+        cell_id     = "smooth_taper_pad",
+        name        = "Smooth Taper Pad",
+        description = "Cosine-profile taper wedge (L1) → flat overlap pad (L1)",
+        category    = "Routing",
+        defaults    = _SMOOTH_TAPER_PAD_DEFAULTS,
+        builder     = build_smooth_taper_pad,
     ),
     CellDef(
         cell_id     = "turn",
