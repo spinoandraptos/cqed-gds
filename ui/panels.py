@@ -184,7 +184,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
     Falls back to a generic rectangle icon for unknown cell_ids.
     """
     _painters = {
-        "square_node":      _icon_square_node,
+        "byisk_jj":         _icon_byisk_jj,
         "manhattan_jj":     _icon_manhattan_jj,
         "taper_segment":    _icon_taper_segment,
         "taper_pad":        _icon_taper_pad,
@@ -193,6 +193,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
         "turn":             _icon_turn,
         "t_junction":       _icon_t_junction,
         "wire":             _icon_wire,
+        "undercut_ring":    _icon_undercut_ring,
     }
     painter_fn = _painters.get(cell_id, _icon_taper_segment)
     return painter_fn(size)
@@ -223,11 +224,11 @@ def _filled_poly(painter: QPainter, pts: list, fill: QColor, stroke: QColor, lw:
     painter.drawPath(path)
 
 
-def _icon_square_node(size: int) -> QPixmap:
+def _icon_byisk_jj(size: int) -> QPixmap:
     """
     Square body (L5 violet) centred, with a cap strip on the top edge (L4 teal +
     L6 green) and an L-bracket on the right edge (L4 teal outline).
-    Faithfully mirrors build_square_node(cap_style='top', undercut_style='right').
+    Faithfully mirrors build_byisk_jj(cap_style='top', undercut_style='right').
     """
     import math
     pix, p = _pix(size)
@@ -623,6 +624,54 @@ def _icon_t_junction(size: int) -> QPixmap:
     return pix
 
 
+def _icon_undercut_ring(size: int) -> QPixmap:
+    """
+    Top-view icon for the undercut_ring cell.
+
+    Draws a hollow square frame on L2 (orange-red) — four strips forming a
+    perimeter ring with mitred corners — exactly as the ring appears on canvas.
+    A faint interior background hints at the target cell it surrounds.
+    """
+    pix, p = _pix(size)
+    m = 4
+    t = max(2.0, size * 0.12)   # ring strip thickness in icon pixels
+
+    outer_x = float(m)
+    outer_y = float(m)
+    outer_w = float(size - m * 2)
+    outer_h = float(size - m * 2)
+
+    # Faint interior fill (suggests the enclosed cell)
+    interior_fill = QColor("#334155")
+    interior_fill.setAlpha(60)
+    p.setBrush(interior_fill)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawRect(int(outer_x + t), int(outer_y + t),
+               int(outer_w - t * 2), int(outer_h - t * 2))
+
+    # Ring strips on L2 (orange-red, matching LAYER_UNDERCUT_RING display colour)
+    ring_fill   = QColor("#b45309")   # amber-700
+    ring_fill.setAlpha(210)
+    ring_stroke = QColor("#fbbf24")   # amber-400
+
+    p.setBrush(ring_fill)
+    p.setPen(QPen(ring_stroke, 1.0))
+
+    # Top strip  (owns corner squares)
+    p.drawRect(int(outer_x),     int(outer_y),
+               int(outer_w),     int(t))
+    # Bottom strip (owns corner squares)
+    p.drawRect(int(outer_x),     int(outer_y + outer_h - t),
+               int(outer_w),     int(t))
+    # Left strip  (inner height only)
+    p.drawRect(int(outer_x),     int(outer_y + t),
+               int(t),           int(outer_h - t * 2))
+    # Right strip (inner height only)
+    p.drawRect(int(outer_x + outer_w - t), int(outer_y + t),
+               int(t),                     int(outer_h - t * 2))
+
+    p.end()
+    return pix
 
 
 class DraggableCellButton(QPushButton):

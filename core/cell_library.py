@@ -22,7 +22,7 @@ Design rules (matching the rest of this codebase):
 
 Cells implemented
 -----------------
-  square_node       — bonding square with caps + L-undercut (from add_square_node)
+  byisk_jj       — bonding square with caps + L-undercut (from add_byisk_jj)
   manhattan_jj      — Manhattan-style Josephson junction stack (from add_manhattan_junction)
   taper_segment     — linear taper wedge L1 + L11 narrow-tip slice (from add_taper_segment)
   taper_pad         — linear taper + flat overlap pad, both L1 (from add_taper_pad)
@@ -44,12 +44,12 @@ Fixes applied (v3)
     space; no more redundant round-trip through the cell-centre frame.
   - place_cell() validates param keys against catalogue defaults and raises a
     clear ValueError for unknown keys instead of letting the builder fail.
-  - build_square_node() port positions computed geometrically from face centres
+  - build_byisk_jj() port positions computed geometrically from face centres
     instead of four hand-coded combinatorial branches — extensible to new styles.
-  - FIX: build_square_node() caps now emit TWO layers (CAP1 inner strip +
+  - FIX: build_byisk_jj() caps now emit TWO layers (CAP1 inner strip +
     CAP2 outer strip) matching add_top_caps/add_side_caps in undercuts.py.
     Previously only CAP1 was emitted; CAP2 was silently missing.
-  - FIX: build_square_node() L-undercut is now drawn OUTSIDE the body body on
+  - FIX: build_byisk_jj() L-undercut is now drawn OUTSIDE the body body on
     LAYER_CAP1 (L outline) + LAYER_CAP2 (interior fill), matching
     add_L_undercut_right / add_L_undercut_top in undercuts.py exactly.
     Previously the undercut was drawn inside the body on LAYER_UNDERCUT_RING
@@ -210,7 +210,7 @@ def _face_ports(
 
     All offsets are in µm relative to comp.origin (the bbox min-corner).
 
-    This replaces the old combinatorial if/elif ladder in build_square_node
+    This replaces the old combinatorial if/elif ladder in build_byisk_jj
     and scales to any number of style combinations without extra code.
     """
     bb     = comp.bbox
@@ -245,7 +245,7 @@ def _face_ports(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: Square Node  (→ add_square_node in components_lib.py)
+# Cell: Square Node  (→ add_byisk_jj in components_lib.py)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Default geometry (µm) — mirrors cfg defaults from the reference codebase
@@ -261,7 +261,7 @@ _SQ_DEFAULTS = dict(
 )
 
 
-def build_square_node(
+def build_byisk_jj(
     origin: Point,
     square_x:       float = _SQ_DEFAULTS["square_x"],
     square_y:       float = _SQ_DEFAULTS["square_y"],
@@ -276,7 +276,7 @@ def build_square_node(
     (LAYER_CAP1 inner + LAYER_CAP2 outer) and an L-shaped undercut drawn
     outside the body (LAYER_CAP1 outline + LAYER_CAP2 fill).
 
-    Mirrors add_square_node() / add_top_caps() / add_side_caps() /
+    Mirrors add_byisk_jj() / add_top_caps() / add_side_caps() /
     add_L_undercut_right() / add_L_undercut_top() from components_lib.py
     exactly.  Origin is the **centre** of the square body (cx, cy convention).
 
@@ -1565,12 +1565,12 @@ def build_t_junction(
 
 CELL_CATALOGUE: List[CellDef] = [
     CellDef(
-        cell_id     = "square_node",
-        name        = "Square Node",
+        cell_id     = "byisk_jj",
+        name        = "Biysk JJ",
         description = "Biysk bonding square with cap strips and L-undercut",
         category    = "Junctions",
         defaults    = _SQ_DEFAULTS,
-        builder     = build_square_node,
+        builder     = build_byisk_jj,
     ),
     CellDef(
         cell_id     = "manhattan_jj",
@@ -1628,10 +1628,215 @@ CELL_CATALOGUE: List[CellDef] = [
         defaults    = _T_JCT_DEFAULTS,
         builder     = build_t_junction,
     ),
+    # ── Undercut ring ─────────────────────────────────────────────────────────
+    # Registered here so the palette and place_cell() can reach it.
+    # bbox_um is expressed as four separate floats (x0, y0, x1, y1) because
+    # CellDef.defaults must be a flat dict of JSON-serialisable scalars
+    # (the MIME drag payload encodes defaults as JSON).  The builder lambda
+    # reassembles them into the tuple that build_undercut_ring expects.
+    CellDef(
+        cell_id     = "undercut_ring",
+        name        = "Undercut Ring",
+        description = "Perimeter undercut ring on L2 — place around any cell group",
+        category    = "Undercut",
+        defaults    = dict(
+            bbox_x0      = 0.0,   # µm — left edge of target bbox
+            bbox_y0      = 0.0,   # µm — bottom edge of target bbox
+            bbox_x1      = 4.0,   # µm — right edge of target bbox
+            bbox_y1      = 4.0,   # µm — top edge of target bbox
+            thickness_um = 0.8,   # µm — ring strip thickness
+        ),
+        builder     = lambda origin, bbox_x0=0.0, bbox_y0=0.0,
+                                     bbox_x1=4.0, bbox_y1=4.0,
+                                     thickness_um=0.8, **_:
+                          build_undercut_ring(
+                              bbox_um=(bbox_x0, bbox_y0, bbox_x1, bbox_y1),
+                              thickness_um=thickness_um,
+                              origin=origin,
+                          ),
+    ),
 ]
 
 # Fast lookup by cell_id
 CELL_BY_ID: dict[str, CellDef] = {c.cell_id: c for c in CELL_CATALOGUE}
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Undercut ring  (also registered in CELL_CATALOGUE above for palette access)
+# ═════════════════════════════════════════════════════════════════════════════
+
+def build_undercut_ring(
+    bbox_um: tuple[float, float, float, float],
+    thickness_um: float = 0.8,
+    sides: dict[str, bool] | None = None,
+    origin: Point | None = None,
+) -> CellResult:
+    """
+    Build a 0.8 µm perimeter undercut ring around any rectangular bounding box.
+
+    The ring is decomposed into up to four axis-aligned rectangles on
+    LAYER_UNDERCUT_RING (L2) with fully mitred corners — no gdspy boolean
+    operations required, zero Qt dependency.
+
+    Corner convention  (mitre = full thickness square at each corner)
+    -----------------------------------------------------------------
+    Each active side owns the corner squares at BOTH its ends, so corners
+    are always filled when both adjacent sides are active.  When one side is
+    inactive its strip is simply omitted; the corner square is then owned by
+    the remaining adjacent side — this keeps the ring gapless for any
+    combination of active sides.
+
+    Specifically:
+      top    strip : x ∈ [x0 − t, x1 + t],  y ∈ [y1, y1 + t]
+      bottom strip : x ∈ [x0 − t, x1 + t],  y ∈ [y0 − t, y0]
+      left   strip : x ∈ [x0 − t, x0],       y ∈ [y0, y1]
+      right  strip : x ∈ [x1, x1 + t],        y ∈ [y0, y1]
+
+    Top and bottom each span the full outer width (including corner squares).
+    Left and right span only the inner height (corner squares belong to top/bottom).
+    When top is inactive, left/right each gain their own corner square by
+    spanning y ∈ [y0 − t, y1 + t] (handled automatically by the side logic).
+
+    Parameters
+    ----------
+    bbox_um   : (x0, y0, x1, y1) — bounding box of the target object in µm,
+                world-space (same coordinate frame as cell origins).
+                x0 < x1, y0 < y1.
+    thickness_um : ring thickness in µm (default 0.8 — matches UNDERCUT_RING_THICKNESS).
+    sides     : dict of which sides to emit.  Missing keys default to True.
+                Keys: "top", "bottom", "left", "right".
+                Example: {"top": True, "bottom": True, "left": False, "right": True}
+    origin    : optional Point (DBU) to use as the anchor for the returned CellResult.
+                Defaults to the bbox min-corner (x0, y0) in DBU.
+
+    Returns
+    -------
+    CellResult whose components are the active side strips on LAYER_UNDERCUT_RING.
+    The first component (anchor) carries four ports at the midpoints of each
+    bbox edge — "top", "bottom", "left", "right" — for snap connections.
+    All sub-components carry _no_auto_ports = True.
+
+    Usage
+    -----
+    Typical call (place a full ring around a cell group's bbox):
+
+        from core.cell_library import build_undercut_ring, place_cell
+        from core.model import Point
+
+        result = place_cell("byisk_jj", Point(0, 0))
+        # Compute µm bbox of the result:
+        comps = result.components
+        xs = [dbu_to_um(c.bbox.x_min) for c in comps] + [dbu_to_um(c.bbox.x_max) for c in comps]
+        ys = [dbu_to_um(c.bbox.y_min) for c in comps] + [dbu_to_um(c.bbox.y_max) for c in comps]
+        ring = build_undercut_ring((min(xs), min(ys), max(xs), max(ys)))
+
+    Then push ring through PlaceCellCommand as usual.
+    """
+    # ── Resolve sides ─────────────────────────────────────────────────────────
+    if sides is None:
+        sides = {}
+    top_on    = sides.get("top",    True)
+    bottom_on = sides.get("bottom", True)
+    left_on   = sides.get("left",   True)
+    right_on  = sides.get("right",  True)
+
+    x0, y0, x1, y1 = bbox_um
+    t = thickness_um
+
+    # ── Origin for the CellResult ─────────────────────────────────────────────
+    # Use the provided origin, or default to bbox min-corner.
+    if origin is None:
+        origin = Point(um_to_dbu(x0), um_to_dbu(y0))
+
+    # ── Strip geometry helpers ────────────────────────────────────────────────
+    # All coords are in µm, offset from a cell-frame origin of (x0, y0).
+    # _rect(origin, dx0, dy0, dx1, dy1, layer) converts µm offsets to DBU
+    # relative to `origin`.  We express everything as offsets from (x0, y0).
+
+    # Cell-frame offsets (so that _rect's origin + offset = world coords):
+    #   world_x = x0 + dx   →   dx = world_x − x0
+    #   world_y = y0 + dy   →   dy = world_y − y0
+    W = x1 - x0   # bbox width  in µm
+    H = y1 - y0   # bbox height in µm
+
+    # Top strip    : y ∈ [H, H+t],  x ∈ [-t, W+t]  (owns corner squares)
+    # Bottom strip : y ∈ [-t, 0],   x ∈ [-t, W+t]  (owns corner squares)
+    # Left strip   : y ∈ [0, H],    x ∈ [-t, 0]    (inner height only)
+    # Right strip  : y ∈ [0, H],    x ∈ [W, W+t]   (inner height only)
+    #
+    # When top is absent, left/right each extend to y ∈ [-t, H+t] to keep
+    # corners filled.  Same logic for bottom.
+
+    left_y0  = -t if bottom_on else -t   # always starts at -t (bottom owns it when on)
+    left_y1  =  H + t if not top_on else H   # extends to H+t only when top is absent
+    # Simplify: left/right get inner y when BOTH top and bottom are on;
+    # they gain one corner when the adjacent horizontal side is absent.
+    ly0 = 0  - (t if not bottom_on else 0)
+    ly1 = H  + (t if not top_on    else 0)
+
+    components: list[GDSComponent] = []
+
+    # Track whether we have an anchor yet
+    anchor: GDSComponent | None = None
+
+    def _add_strip(dx0: float, dy0: float, dx1: float, dy1: float) -> None:
+        nonlocal anchor
+        comp = _rect(origin, dx0, dy0, dx1, dy1, LAYER_UNDERCUT_RING)
+        if anchor is None:
+            comp._no_auto_ports = False   # first strip is anchor
+            anchor = comp
+        else:
+            comp._no_auto_ports = True
+        components.append(comp)
+
+    if top_on:
+        _add_strip(-t,   H,   W + t, H + t)
+    if bottom_on:
+        _add_strip(-t,  -t,   W + t, 0)
+    if left_on:
+        _add_strip(-t,  ly0,  0,     ly1)
+    if right_on:
+        _add_strip( W,  ly0,  W + t, ly1)
+
+    # Fallback: if ALL sides are off, return an empty CellResult
+    if not components:
+        return CellResult(
+            components=[],
+            group_name="UnderCutRing (empty — all sides off)",
+            description="Undercut ring — no sides active",
+        )
+
+    # ── Ports on the anchor ───────────────────────────────────────────────────
+    # Four ports at the midpoints of each bbox edge (not the ring outer edge),
+    # expressed relative to the anchor component's own .origin.
+    # anchor.origin = _rect origin for the first strip = Point(um_to_dbu(x0), um_to_dbu(y0))
+    # = our `origin`.  So the offset is simply the bbox-edge midpoint in cell-frame µm.
+
+    # bbox edge midpoints in cell-frame (offset from (x0, y0)):
+    #   top    : (W/2, H)
+    #   bottom : (W/2, 0)
+    #   left   : (0,   H/2)
+    #   right  : (W,   H/2)
+
+    _assign_ports(anchor, [
+        Port("top",    Point(um_to_dbu(W / 2), um_to_dbu(H)),     PortSide.NORTH),
+        Port("bottom", Point(um_to_dbu(W / 2), um_to_dbu(0)),     PortSide.SOUTH),
+        Port("left",   Point(um_to_dbu(0),     um_to_dbu(H / 2)), PortSide.WEST),
+        Port("right",  Point(um_to_dbu(W),     um_to_dbu(H / 2)), PortSide.EAST),
+    ])
+
+    active = [s for s, on in [("top", top_on), ("bottom", bottom_on),
+                               ("left", left_on), ("right", right_on)] if on]
+    sides_label = "+".join(active) if active else "none"
+
+    return CellResult(
+        components=components,
+        group_name=f"UnderCutRing (t={thickness_um}µm sides={sides_label})",
+        description=(
+            f"0.8 µm perimeter undercut ring  thickness={thickness_um}µm  "
+            f"sides={sides_label}  L2"
+        ),
+    )
 
 
 # ── Public placement API ──────────────────────────────────────────────────────
