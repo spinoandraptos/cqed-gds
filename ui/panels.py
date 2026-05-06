@@ -20,8 +20,8 @@ from PyQt6.QtWidgets import (
     QFrame, QPushButton, QSizePolicy, QScrollArea,
     QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray
-from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QDrag, QMouseEvent
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray, QPointF
+from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QPen, QPainterPath, QDrag, QMouseEvent
 
 from ui.theme import Colors, Fonts, Geometry
 from core.model import GDSComponent, ComponentKind, PortSide, dbu_to_um, um_to_dbu
@@ -89,15 +89,514 @@ def _layer_icon(layer: int, size: int = 14) -> QIcon:
     return QIcon(pix)
 
 
+def _shape_icon(kind: "ComponentKind", size: int = 36) -> QPixmap:
+    """
+    Draw a clear, recognisable icon for each primitive shape.
+    Returns a QPixmap with transparent background.
+
+    Rectangle  — filled rounded rect with a bright border
+    Polygon    — filled 5-sided polygon
+    Path       — open dashed polyline with round caps
+    """
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+    accent      = QColor("#7c3aed")
+    accent_fill = QColor("#7c3aed")
+    accent_fill.setAlpha(55)
+    pen_bright  = QPen(QColor("#a78bfa"), 1.6)
+    m = 4   # margin
+
+    if kind == ComponentKind.RECTANGLE:
+        p.setBrush(accent_fill)
+        p.setPen(pen_bright)
+        p.drawRoundedRect(m, m + 4, size - m * 2, size - m * 2 - 4, 2, 2)
+
+    elif kind == ComponentKind.POLYGON:
+        import math
+        cx, cy, r = size / 2, size / 2 + 1, size / 2 - m
+        pts = []
+        for i in range(5):
+            angle = math.radians(-90 + i * 72)
+            pts.append(QPointF(cx + r * math.cos(angle), cy + r * math.sin(angle)))
+        path = QPainterPath()
+        path.moveTo(pts[0])
+        for pt in pts[1:]:
+            path.lineTo(pt)
+        path.closeSubpath()
+        p.setBrush(accent_fill)
+        p.setPen(pen_bright)
+        p.drawPath(path)
+
+    elif kind == ComponentKind.PATH:
+        # Dashed open polyline: three segments in a gentle Z shape
+        pen = QPen(QColor("#a78bfa"), 2.2)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        pen.setStyle(Qt.PenStyle.DashLine)
+        pen.setDashPattern([3, 2])
+        p.setPen(pen)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        pts = [
+            QPointF(m,          size - m - 4),
+            QPointF(size * 0.35, m + 6),
+            QPointF(size * 0.65, size - m - 4),
+            QPointF(size - m,   m + 4),
+        ]
+        for i in range(len(pts) - 1):
+            p.drawLine(pts[i], pts[i + 1])
+        # Draw solid dots at vertices
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor("#a78bfa"))
+        for pt in pts:
+            p.drawEllipse(pt, 2.0, 2.0)
+
+    p.end()
+    return pix
+
+
+def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
+    """
+    Dispatch to the per-cell icon painter that matches the cell's actual geometry.
+    Falls back to a generic rectangle icon for unknown cell_ids.
+    """
+    _painters = {
+        "square_node":    _icon_square_node,
+        "manhattan_jj":   _icon_manhattan_jj,
+        "taper_segment":  _icon_taper_segment,
+        "taper_pad":      _icon_taper_pad,
+        "turn":           _icon_turn,
+    }
+    painter_fn = _painters.get(cell_id, _icon_taper_segment)
+    return painter_fn(size)
+
+
+# ── Per-cell icon painters ────────────────────────────────────────────────────
+# Each function draws a miniature top-view of the cell's actual shape.
+# Colours follow the layer palette: L1 branch=blue, L5 junction=violet,
+# L10 JJ square=yellow, L4 cap=teal, L6 cap2=green.
+
+def _pix(size: int) -> tuple:
+    """Return (pix, painter) with antialiasing enabled."""
+    pix = QPixmap(size, size)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    return pix, p
+
+
+def _filled_poly(painter: QPainter, pts: list, fill: QColor, stroke: QColor, lw: float = 1.2):
+    path = QPainterPath()
+    path.moveTo(pts[0])
+    for pt in pts[1:]:
+        path.lineTo(pt)
+    path.closeSubpath()
+    painter.setBrush(fill)
+    painter.setPen(QPen(stroke, lw))
+    painter.drawPath(path)
+
+
+def _icon_square_node(size: int) -> QPixmap:
+    """
+    Square body (L5 violet) centred, with a cap strip on the top edge (L4 teal +
+    L6 green) and an L-bracket on the right edge (L4 teal outline).
+    Faithfully mirrors build_square_node(cap_style='top', undercut_style='right').
+    """
+    import math
+    pix, p = _pix(size)
+    m = 4
+    s = size - m * 2           # body occupies ~80% of icon
+    bx = m + s * 0.18          # left of body
+    by_bot = size - m - s * 0.18
+    by_top = m + s * 0.18
+    bw = s * 0.64              # body width
+    bh = s * 0.55              # body height
+    cap_h  = bh * 0.18         # cap strip thickness (CAP1)
+    cap2_h = bh * 0.14         # outer cap (CAP2)
+    l_w    = bh * 0.18         # L arm width (same as cap_h)
+    l_reach = cap_h + cap2_h   # L arm extent outward
+
+    # L5 body (violet)
+    body_fill   = QColor("#7c3aed"); body_fill.setAlpha(160)
+    body_stroke = QColor("#a78bfa")
+    p.setBrush(body_fill)
+    p.setPen(QPen(body_stroke, 1.2))
+    p.drawRoundedRect(int(bx), int(by_top), int(bw), int(bh), 1, 1)
+
+    # CAP1 strip above body (teal)
+    cap1_fill = QColor("#0d9488"); cap1_fill.setAlpha(200)
+    p.setBrush(cap1_fill)
+    p.setPen(QPen(QColor("#5eead4"), 1.0))
+    p.drawRect(int(bx), int(by_top - cap_h), int(bw), int(cap_h))
+
+    # CAP2 strip above CAP1 (green)
+    cap2_fill = QColor("#16a34a"); cap2_fill.setAlpha(200)
+    p.setBrush(cap2_fill)
+    p.setPen(QPen(QColor("#86efac"), 1.0))
+    p.drawRect(int(bx), int(by_top - cap_h - cap2_h), int(bw), int(cap2_h))
+
+    # L-undercut on right side: vertical arm + horizontal arm (teal outline)
+    l_vert = bh - l_w           # vertical extent = body height minus wire width
+    lx = bx + bw               # right edge of body
+    ly_bot = by_top + bh        # bottom of body
+    ly_top_arm = ly_bot - l_vert  # top of the L vertical arm
+
+    p.setBrush(QColor(0, 0, 0, 0))
+    lpen = QPen(QColor("#5eead4"), 1.5)
+    lpen.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    p.setPen(lpen)
+    # Draw L as a polyline: bottom-right → top-right → top-left (the two outer edges)
+    p.drawPolyline([
+        QPointF(lx,             ly_bot),
+        QPointF(lx + l_reach,   ly_bot),
+        QPointF(lx + l_reach,   ly_top_arm),
+        QPointF(lx,             ly_top_arm),
+    ])
+
+    p.end()
+    return pix
+
+
+def _icon_manhattan_jj(size: int) -> QPixmap:
+    """
+    Horizontal lead (L5 violet) → JJ square (L10 amber) → right arm (L4 teal + L6 green)
+    and upward arm (L4 teal + L6 green). Faithfully mirrors build_manhattan_jj geometry.
+    """
+    pix, p = _pix(size)
+    m = 3
+
+    # Layout proportions (all in px, left-to-right = horizontal lead direction)
+    total_w = size - m * 2
+    sq_frac  = 0.18            # JJ square as fraction of total width
+    lead_frac = 0.30           # horizontal lead
+    ext_frac  = sq_frac        # right L5 continuation = 1 square-width
+    e2_frac   = 0.07           # CAP1 strip
+    e3_frac   = 0.18           # CAP2 bar
+
+    lw = total_w * lead_frac
+    sq = total_w * sq_frac
+    e2 = total_w * e2_frac
+    e3 = total_w * e3_frac
+
+    lead_x  = m
+    sq_x    = lead_x + lw
+    ext_x   = sq_x + sq        # right L5 start
+    cap1_x  = ext_x + sq
+    cap2_x  = cap1_x + e2
+
+    # Vertical centre for horizontal lead
+    cy   = size / 2
+    lead_hw = total_w * 0.07   # half-width of lead (thin)
+    sq_hw   = sq / 2           # half-height of JJ square (= sq)
+
+    # Colours
+    c_l5   = QColor("#7c3aed"); c_l5.setAlpha(180)
+    c_l10  = QColor("#d97706"); c_l10.setAlpha(220)   # amber
+    c_cap1 = QColor("#0d9488"); c_cap1.setAlpha(200)  # teal
+    c_cap2 = QColor("#16a34a"); c_cap2.setAlpha(200)  # green
+    s_l5   = QColor("#a78bfa")
+    s_l10  = QColor("#fcd34d")
+    s_cap1 = QColor("#5eead4")
+    s_cap2 = QColor("#86efac")
+
+    # Horizontal lead (L5)
+    p.setBrush(c_l5); p.setPen(QPen(s_l5, 0.8))
+    p.drawRect(int(lead_x), int(cy - lead_hw), int(lw), int(lead_hw * 2))
+
+    # JJ square (L10 amber)
+    p.setBrush(c_l10); p.setPen(QPen(s_l10, 0.8))
+    p.drawRect(int(sq_x), int(cy - sq_hw), int(sq), int(sq))
+
+    # Right continuation L5
+    p.setBrush(c_l5); p.setPen(QPen(s_l5, 0.8))
+    p.drawRect(int(ext_x), int(cy - lead_hw), int(sq), int(lead_hw * 2))
+
+    # Right CAP1 strip
+    p.setBrush(c_cap1); p.setPen(QPen(s_cap1, 0.8))
+    p.drawRect(int(cap1_x), int(cy - sq_hw), int(e2), int(sq))
+
+    # Right CAP2 bar
+    p.setBrush(c_cap2); p.setPen(QPen(s_cap2, 0.8))
+    p.drawRect(int(cap2_x), int(cy - sq_hw), int(e3), int(sq))
+
+    # Top continuation L5 (upward arm above JJ square)
+    top_ext_y  = cy - sq_hw - sq
+    p.setBrush(c_l5); p.setPen(QPen(s_l5, 0.8))
+    p.drawRect(int(sq_x), int(top_ext_y), int(sq), int(sq))
+
+    # Top CAP1
+    top_cap1_y = top_ext_y - e2
+    p.setBrush(c_cap1); p.setPen(QPen(s_cap1, 0.8))
+    p.drawRect(int(sq_x), int(top_cap1_y), int(sq), int(e2))
+
+    # Top CAP2
+    top_cap2_y = top_cap1_y - e3
+    p.setBrush(c_cap2); p.setPen(QPen(s_cap2, 0.8))
+    p.drawRect(int(sq_x), int(top_cap2_y), int(sq), int(e3))
+
+    # Downward lead (L5) below JJ square
+    down_y = cy + sq_hw
+    down_len = lw * 0.9
+    p.setBrush(c_l5); p.setPen(QPen(s_l5, 0.8))
+    p.drawRect(int(sq_x), int(down_y), int(sq), int(down_len))
+
+    p.end()
+    return pix
+
+
+def _icon_taper_segment(size: int) -> QPixmap:
+    """
+    Trapezoid: narrow on left, wide on right (L1 blue), with a small
+    contrasting slice at the narrow tip (L11 orange) — matches taper_segment geometry.
+    """
+    pix, p = _pix(size)
+    m = 4
+    W = size - m * 2
+    H = size - m * 2
+
+    # Narrow end half-height and wide end half-height
+    nh = H * 0.10
+    wh = H * 0.42
+
+    # Main trapezoid (L1 blue)
+    trap_pts = [
+        QPointF(m,     size/2 - nh),
+        QPointF(m,     size/2 + nh),
+        QPointF(m + W, size/2 + wh),
+        QPointF(m + W, size/2 - wh),
+    ]
+    c_l1 = QColor("#2563eb"); c_l1.setAlpha(160)
+    _filled_poly(p, trap_pts, c_l1, QColor("#93c5fd"), 1.2)
+
+    # Narrow-tip clip slice (L11, orange) — small rect at left edge
+    clip_w = W * 0.14
+    c_l11 = QColor("#ea580c"); c_l11.setAlpha(220)
+    clip_pts = [
+        QPointF(m,           size/2 - nh),
+        QPointF(m,           size/2 + nh),
+        QPointF(m + clip_w,  size/2 + nh * 1.4),
+        QPointF(m + clip_w,  size/2 - nh * 1.4),
+    ]
+    _filled_poly(p, clip_pts, c_l11, QColor("#fed7aa"), 0.8)
+
+    p.end()
+    return pix
+
+
+def _icon_taper_pad(size: int) -> QPixmap:
+    """
+    Two-stage shape (both L1 blue): narrow-to-wide trapezoid + wide flat pad rectangle.
+    The pad is clearly wider and longer than the taper.
+    """
+    pix, p = _pix(size)
+    m = 4
+    W = size - m * 2
+
+    nh = W * 0.09   # narrow half-height
+    wh = W * 0.38   # wide half-height
+    taper_w = W * 0.45  # taper portion width
+    pad_w   = W * 0.45  # pad portion width
+
+    c_l1 = QColor("#2563eb"); c_l1.setAlpha(160)
+    s_l1 = QColor("#93c5fd")
+
+    # Taper trapezoid
+    trap_pts = [
+        QPointF(m,            size/2 - nh),
+        QPointF(m,            size/2 + nh),
+        QPointF(m + taper_w,  size/2 + wh),
+        QPointF(m + taper_w,  size/2 - wh),
+    ]
+    _filled_poly(p, trap_pts, c_l1, s_l1, 1.2)
+
+    # Flat pad
+    pad_pts = [
+        QPointF(m + taper_w,           size/2 - wh),
+        QPointF(m + taper_w,           size/2 + wh),
+        QPointF(m + taper_w + pad_w,   size/2 + wh),
+        QPointF(m + taper_w + pad_w,   size/2 - wh),
+    ]
+    _filled_poly(p, pad_pts, c_l1, s_l1, 1.2)
+
+    p.end()
+    return pix
+
+
+def _icon_turn(size: int) -> QPixmap:
+    """
+    Quarter-circle arc band (L1 blue): entry from the left, exit downward.
+    Drawn as a filled annular sector — matches build_turn(entry=+x, turn=r) appearance.
+    """
+    import math
+    pix, p = _pix(size)
+    m = 3
+
+    # Arc parameters in pixel space
+    # Centre of curvature at bottom-left of icon (entry from left → turn right → exit down)
+    cx = m
+    cy = size - m
+
+    # Make the arc fill most of the icon
+    r_mid  = (size - m * 2) * 0.72
+    hw     = r_mid * 0.38   # band half-width
+
+    r_out  = r_mid + hw
+    r_in   = r_mid - hw
+
+    # Sweep from 0° (right/east) to -90° (up/north) — entry +x, exit -y (upward in Qt)
+    # In Qt coords Y increases downward, so: east=0°, north=-90°, south=+90°
+    start_angle_deg = 0.0     # pointing right = entry direction +x
+    end_angle_deg   = -90.0   # pointing up (Qt: north = negative Y = -90°)
+
+    N = 24
+    outer_pts = []
+    inner_pts = []
+    for i in range(N + 1):
+        t = i / N
+        angle = math.radians(start_angle_deg + (end_angle_deg - start_angle_deg) * t)
+        ca, sa = math.cos(angle), math.sin(angle)
+        outer_pts.append(QPointF(cx + r_out * ca, cy + r_out * sa))
+        inner_pts.append(QPointF(cx + r_in  * ca, cy + r_in  * sa))
+
+    fan_pts = outer_pts + list(reversed(inner_pts))
+    c_l1 = QColor("#2563eb"); c_l1.setAlpha(160)
+    _filled_poly(p, fan_pts, c_l1, QColor("#93c5fd"), 1.2)
+
+    p.end()
+    return pix
+
+
+
+
+# ── Draggable cell tile ───────────────────────────────────────────────────────
+
+class DraggableCellButton(QPushButton):
+    """
+    Palette tile for one parametric cell.
+
+    Mouse-move-while-pressed starts a Qt drag carrying:
+      MIME type : application/x-gds-cell
+      Payload   : "<cell_id>:<json_defaults>"
+
+    The canvas view decodes this in dropEvent and calls
+    scene.drop_cell(cell_id, scene_pos, params).
+    """
+
+    MIME_TYPE = "application/x-gds-cell"
+
+    def __init__(self, cdef, parent=None) -> None:
+        super().__init__(parent)
+        self._cdef       = cdef
+        self._drag_start: Optional[QPoint] = None
+
+        self.setFixedHeight(58)
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+
+        # ── Outer horizontal layout: icon | text column ───────────────────────
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(10, 7, 12, 7)
+        outer.setSpacing(10)
+
+        # Icon
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_cell_icon(cdef.cell_id, size=36))
+        icon_lbl.setFixedSize(36, 36)
+        icon_lbl.setStyleSheet("background: transparent;")
+        outer.addWidget(icon_lbl)
+
+        # Text column
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        text_col.setContentsMargins(0, 0, 0, 0)
+
+        top = QLabel(cdef.name)
+        top.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; "
+            f"font-size: {Fonts.SIZE_SM}px; background: transparent;"
+        )
+        bot = QLabel("Drag to canvas to place")
+        bot.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; "
+            f"font-size: {Fonts.SIZE_XS}px; background: transparent;"
+        )
+        text_col.addWidget(top)
+        text_col.addWidget(bot)
+        outer.addLayout(text_col)
+
+        self.setStyleSheet(f"""
+            QPushButton {{
+                background: {Colors.BG_ELEVATED};
+                border: 1px solid {Colors.BG_BORDER};
+                border-radius: {Geometry.BORDER_RADIUS}px;
+                text-align: left;
+            }}
+            QPushButton:hover {{
+                background: {Colors.BG_OVERLAY};
+                border-color: {Colors.ACCENT_DIM};
+            }}
+            QPushButton:pressed {{
+                background: {Colors.ACCENT_GLOW};
+                border-color: {Colors.ACCENT};
+            }}
+        """)
+
+    def mousePressEvent(self, event: QMouseEvent) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_start = event.pos()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if (self._drag_start is not None
+                and event.buttons() & Qt.MouseButton.LeftButton):
+            dist = (event.pos() - self._drag_start).manhattanLength()
+            if dist >= QApplication.startDragDistance():
+                self._start_drag()
+                return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        self._drag_start = None
+        super().mouseReleaseEvent(event)
+
+    def _start_drag(self) -> None:
+        import json
+        payload = f"{self._cdef.cell_id}:{json.dumps(self._cdef.defaults)}".encode()
+
+        mime = QMimeData()
+        mime.setData(self.MIME_TYPE, QByteArray(payload))
+
+        pix = QPixmap(120, 32)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        p.setOpacity(0.80)
+        p.fillRect(pix.rect(), QColor("#1e293b"))
+        p.setPen(QColor("#7c3aed"))
+        p.drawRect(0, 0, pix.width() - 1, pix.height() - 1)
+        p.setPen(QColor("#c4b5fd"))
+        p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, f"⬡ {self._cdef.name}")
+        p.end()
+
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.setPixmap(pix)
+        drag.setHotSpot(QPoint(pix.width() // 2, pix.height() // 2))
+        drag.exec(Qt.DropAction.CopyAction)
+
+
 # ── Component Palette ─────────────────────────────────────────────────────────
 
 class ComponentPalette(QWidget):
     """
-    Left dock: layer selector + shape buttons.
+    Left dock: unified scrollable panel with three sections in order:
+      1. Active Layer selector
+      2. Shapes  (Rectangle / Polygon / Path — drag or click to place)
+      3. Cell Library  (parametric cells grouped by category — drag to place)
 
-    Phase 2 signal change: place_mode_requested(kind_value, layer)
-    — tells the main window to put the scene into placement mode,
-      rather than immediately dropping a component at view center.
+    Replaces the previous two-tab layout (Shapes tab + Cells tab) with a
+    single continuous panel.  No QTabWidget needed.
     """
 
     place_mode_requested = pyqtSignal(object, int)   # ComponentKind, layer
@@ -111,15 +610,62 @@ class ComponentPalette(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        root.addWidget(self._build_layer_section())
-        root.addWidget(Separator())
-        root.addWidget(self._build_shapes_section())
-        root.addStretch()
+        # Fixed header
+        root.addWidget(self._build_header())
+
+        # Single scrollable body containing all sections
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+
+        body = QWidget()
+        body.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        body_lay = QVBoxLayout(body)
+        body_lay.setContentsMargins(0, 0, 0, 0)
+        body_lay.setSpacing(0)
+
+        body_lay.addWidget(self._build_layer_section())
+        body_lay.addWidget(Separator())
+        body_lay.addWidget(self._build_shapes_section())
+        body_lay.addWidget(Separator())
+        body_lay.addWidget(self._build_cells_section())
+        body_lay.addStretch()
+
+        scroll.setWidget(body)
+        root.addWidget(scroll)
+
+    # ── Header ────────────────────────────────────────────────────────────────
+
+    def _build_header(self) -> QWidget:
+        header = QWidget()
+        header.setStyleSheet(
+            f"background: {Colors.BG_ELEVATED}; "
+            f"border-bottom: 1px solid {Colors.BG_BORDER};"
+        )
+        hl = QVBoxLayout(header)
+        hl.setContentsMargins(Geometry.PANEL_PADDING, 10,
+                              Geometry.PANEL_PADDING, 10)
+        hl.setSpacing(2)
+        title = QLabel("Palette")
+        title.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: 13px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        sub = QLabel("Drag shapes or cells onto the canvas")
+        sub.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+            f"background: transparent; border: none;"
+        )
+        hl.addWidget(title)
+        hl.addWidget(sub)
+        return header
 
     # ── Layer selector ────────────────────────────────────────────────────────
 
     def _build_layer_section(self) -> QWidget:
-        w = QWidget(); w.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        w = QWidget()
+        w.setStyleSheet(f"background: {Colors.BG_SURFACE};")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(Geometry.PANEL_PADDING, Geometry.PANEL_PADDING,
                                Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
@@ -149,10 +695,11 @@ class ComponentPalette(QWidget):
     def active_layer(self) -> int:
         return self._layer_combo.currentData()
 
-    # ── Shape buttons ─────────────────────────────────────────────────────────
+    # ── Shapes section ────────────────────────────────────────────────────────
 
     def _build_shapes_section(self) -> QWidget:
-        w = QWidget(); w.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        w = QWidget()
+        w.setStyleSheet(f"background: {Colors.BG_SURFACE};")
         lay = QVBoxLayout(w)
         lay.setContentsMargins(Geometry.PANEL_PADDING, Geometry.PANEL_PADDING,
                                Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
@@ -160,9 +707,9 @@ class ComponentPalette(QWidget):
         lay.addWidget(SectionLabel("Shapes"))
 
         shapes = [
-            (ComponentKind.RECTANGLE, "▭  Rectangle",  "Click to stamp"),
-            (ComponentKind.POLYGON,   "⬠  Polygon",    "Click vertices, Enter/dbl-click to close"),
-            (ComponentKind.PATH,      "╌  Path",        "Click vertices, Enter to commit"),
+            (ComponentKind.RECTANGLE, "Lead Segment", "Click to stamp"),
+            (ComponentKind.POLYGON,   "Polygon",    "Click vertices, Enter/dbl-click to close"),
+            (ComponentKind.PATH,      "Path",       "Click vertices, Enter to commit"),
         ]
         for kind, label, sub in shapes:
             lay.addWidget(self._make_shape_button(kind, label, sub))
@@ -170,12 +717,25 @@ class ComponentPalette(QWidget):
 
     def _make_shape_button(self, kind: ComponentKind, label: str, sub: str) -> "DraggableShapeButton":
         btn = DraggableShapeButton(kind, self)
-        btn.setFixedHeight(52)
+        btn.setFixedHeight(58)
         btn.setCursor(Qt.CursorShape.PointingHandCursor)
 
-        inner = QVBoxLayout(btn)
-        inner.setContentsMargins(12, 7, 12, 7)
-        inner.setSpacing(2)
+        # ── Outer horizontal layout: icon | text column ───────────────────────
+        outer = QHBoxLayout(btn)
+        outer.setContentsMargins(10, 7, 12, 7)
+        outer.setSpacing(10)
+
+        # Icon
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_shape_icon(kind, size=36))
+        icon_lbl.setFixedSize(36, 36)
+        icon_lbl.setStyleSheet("background: transparent;")
+        outer.addWidget(icon_lbl)
+
+        # Text column
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        text_col.setContentsMargins(0, 0, 0, 0)
 
         top = QLabel(label)
         top.setStyleSheet(
@@ -188,8 +748,9 @@ class ComponentPalette(QWidget):
             f"font-size: {Fonts.SIZE_XS}px; background: transparent;"
         )
         bot.setWordWrap(True)
-        inner.addWidget(top)
-        inner.addWidget(bot)
+        text_col.addWidget(top)
+        text_col.addWidget(bot)
+        outer.addLayout(text_col)
 
         btn.setStyleSheet(f"""
             QPushButton {{
@@ -208,11 +769,48 @@ class ComponentPalette(QWidget):
             }}
         """)
 
-        # Also keep click-to-enter-mode as a fallback
+        # Click-to-enter-mode fallback (drag is handled by DraggableShapeButton)
         btn.clicked.connect(
             lambda _, k=kind: self.place_mode_requested.emit(k, self.active_layer)
         )
         return btn
+
+    # ── Cell Library section ──────────────────────────────────────────────────
+
+    def _build_cells_section(self) -> QWidget:
+        """
+        Inline version of CellLibraryPanel: all CELL_CATALOGUE entries grouped
+        by category, each rendered as a DraggableCellButton.
+        Scrolling is handled by the parent QScrollArea so no inner scroll needed.
+        """
+        from core.cell_library import CELL_CATALOGUE
+
+        w = QWidget()
+        w.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(Geometry.PANEL_PADDING, Geometry.PANEL_PADDING,
+                               Geometry.PANEL_PADDING, Geometry.PANEL_PADDING)
+        lay.setSpacing(4)
+
+        # Group cells by category, preserving insertion order
+        seen: list[str] = []
+        by_cat: dict[str, list] = {}
+        for cdef in CELL_CATALOGUE:
+            if cdef.category not in by_cat:
+                seen.append(cdef.category)
+                by_cat[cdef.category] = []
+            by_cat[cdef.category].append(cdef)
+
+        for cat in seen:
+            lay.addWidget(SectionLabel(cat))
+            for cdef in by_cat[cat]:
+                lay.addWidget(DraggableCellButton(cdef))
+            sep = QFrame()
+            sep.setFrameShape(QFrame.Shape.HLine)
+            sep.setStyleSheet(f"color: {Colors.BG_BORDER}; margin-top: 4px;")
+            lay.addWidget(sep)
+
+        return w
 
 
 class DraggableShapeButton(QPushButton):

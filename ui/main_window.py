@@ -19,7 +19,7 @@ from PyQt6.QtGui import QAction, QKeySequence
 from PyQt6.QtWidgets import (
     QApplication, QDialog, QDialogButtonBox, QFileDialog,
     QHBoxLayout, QInputDialog, QLabel, QMainWindow, QMessageBox,
-    QSizePolicy, QTabWidget, QToolBar, QVBoxLayout, QWidget,
+    QSizePolicy, QToolBar, QVBoxLayout, QWidget,
 )
 
 from core.cell_library import CELL_BY_ID, Point, place_cell
@@ -33,7 +33,6 @@ from core.model import ComponentKind, DesignScene
 from core.serialiser import SerialisationError, load, save
 from ui.canvas_scene import CanvasScene, GroupItem, PlacementMode
 from ui.canvas_view import CanvasView
-from ui.cell_palette import CellLibraryPanel
 from ui.export_dialog import ExportResultDialog
 from ui.panels import ComponentPalette, PropertiesPanel
 from ui.sweep_dialog import CellSweepDialog, GroupSweepDialog, SweepDialog
@@ -251,19 +250,9 @@ class MainWindow(QMainWindow):
     # ── Central widget ────────────────────────────────────────────────────────
 
     def _build_central_widget(self) -> None:
-        self._palette      = ComponentPalette()
-        self._cell_palette = CellLibraryPanel()
-        self._props        = PropertiesPanel()
+        self._palette = ComponentPalette()
+        self._props   = PropertiesPanel()
         self._build_toolbar()
-
-        left_tabs = QTabWidget()
-        left_tabs.setFixedWidth(220)
-        left_tabs.setStyleSheet(
-            "QTabWidget::pane { border: none; margin: 0; padding: 0; }"
-            "QTabBar::tab { padding: 6px 12px; font-size: 11px; }"
-        )
-        left_tabs.addTab(self._palette,      "Shapes")
-        left_tabs.addTab(self._cell_palette, "Cells")
 
         center = QWidget()
         cl = QVBoxLayout(center)
@@ -276,7 +265,7 @@ class MainWindow(QMainWindow):
         rl = QHBoxLayout(root)
         rl.setContentsMargins(0, 0, 0, 0)
         rl.setSpacing(0)
-        rl.addWidget(left_tabs)
+        rl.addWidget(self._palette)
         rl.addWidget(center)
         rl.addWidget(self._props)
 

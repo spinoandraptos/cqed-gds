@@ -24,6 +24,11 @@ Cells implemented
 -----------------
   square_node       — bonding square with caps + L-undercut (from add_square_node)
   manhattan_jj      — Manhattan-style Josephson junction stack (from add_manhattan_junction)
+  taper_segment     — linear taper wedge L1 + L11 narrow-tip slice (from add_taper_segment)
+  taper_pad         — linear taper + flat overlap pad, both L1 (from add_taper_pad)
+  branch_segment    — straight uniform-width branch rect on L1 (from add_branch_segment)
+  turn              — 90° arc turn, configurable direction+handedness, L1 (from add_turn)
+  wire              — plain rectangle on any layer, configurable width/length/layer
 
 Adding new cells
 ----------------
@@ -598,6 +603,608 @@ def build_manhattan_jj(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Cell: Taper Segment  (→ add_taper_segment in components_lib.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors taper_segment ComponentType in component_model.py
+_TAPER_SEG_DEFAULTS = dict(
+    direction    = "+x",    # "+x" | "-x" | "+y" | "-y"
+    length       = 6.1,     # taper length (µm)
+    narrow_end   = "start", # "start" — narrow at entry, "end" — narrow at exit
+    narrow_width = 0.3,     # narrow-end width (µm)  → cfg.WIRE_WIDTH
+    taper_width  = 2.0,     # wide-end width  (µm)  → cfg.TAPER_WIDTH
+)
+
+
+def build_taper_segment(
+    origin: Point,
+    direction:    str   = _TAPER_SEG_DEFAULTS["direction"],
+    length:       float = _TAPER_SEG_DEFAULTS["length"],
+    narrow_end:   str   = _TAPER_SEG_DEFAULTS["narrow_end"],
+    narrow_width: float = _TAPER_SEG_DEFAULTS["narrow_width"],
+    taper_width:  float = _TAPER_SEG_DEFAULTS["taper_width"],
+) -> CellResult:
+    """
+    Linear taper wedge on LAYER_BRANCH (L1) with a 1 µm narrow-tip slice
+    re-assigned to LAYER_NARROW_END (L11).
+
+    Mirrors add_taper_segment() from components_lib.py and the taper_segment
+    ComponentType from component_model.py.
+
+    The taper is a trapezoid: one end is narrow_width wide, the other is
+    taper_width wide.  narrow_end controls which end is which:
+      "start" — narrow at origin, widens toward exit  (w0=narrow_width, w1=taper_width)
+      "end"   — wide  at origin, narrows toward exit  (w0=taper_width,  w1=narrow_width)
+
+    The 1 µm narrow-tip slice is a thin rectangle on LAYER_NARROW_END (L11)
+    that trims the very end of the taper, matching clip_narrow_end /
+    clip_start_narrow_end in the reference code.
+
+    Origin is the centreline of the ENTRY end of the taper (matching the
+    (x, y) start convention used everywhere in components_lib.py).
+
+    Ports
+    -----
+      entry — face the wire comes in from (opposite to direction of travel)
+      exit  — face the wire exits through (in direction of travel)
+    Port names also reflect narrow_end:
+      "narrow" / "wide" instead of "entry" / "exit" when narrow_end is clear.
+    """
+    if narrow_end not in ("start", "end"):
+        raise ValueError(f"narrow_end must be 'start' or 'end'; got {narrow_end!r}")
+
+    nw = narrow_width   # narrow-end half-width
+    tw = taper_width    # wide-end half-width
+    L  = length
+    CLIP = 1.0          # narrow-tip slice thickness (µm) — matches reference
+
+    # Determine which end is narrow based on narrow_end
+    if narrow_end == "start":
+        entry_hw, exit_hw = nw / 2, tw / 2
+        entry_label, exit_label = "narrow", "wide"
+    else:
+        entry_hw, exit_hw = tw / 2, nw / 2
+        entry_label, exit_label = "wide", "narrow"
+
+    # Build polygon vertices for a trapezoid travelling in `direction`.
+    # All coords are µm offsets from origin (entry centreline).
+    # The narrow-tip clip rectangle is on the narrow end — 1 µm thick.
+    #
+    # Direction map: travel axis, transverse axis, signs
+    _dir_map = {
+        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
+        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
+        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
+        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
+    }
+    d = _dir_map[direction]
+    tx, ty = d["tx"], d["ty"]   # unit vector along travel
+    px, py = d["px"], d["py"]   # unit vector along transverse (always positive)
+
+    # Entry corners (at travel=0):  ±entry_hw transverse
+    # Exit  corners (at travel=L):  ±exit_hw  transverse
+    def _pt(travel: float, hw: float, sign: int) -> tuple[float, float]:
+        return (tx * travel + px * sign * hw,
+                ty * travel + py * sign * hw)
+
+    trap_pts = [
+        _pt(0, entry_hw, -1),
+        _pt(0, entry_hw, +1),
+        _pt(L, exit_hw,  +1),
+        _pt(L, exit_hw,  -1),
+    ]
+    taper_body = _poly(origin, trap_pts, LAYER_BRANCH)
+    taper_body._no_auto_ports = False   # anchor — gets ports below
+
+    # ── Narrow-tip clip slice (L11) ────────────────────────────────────────
+    # 1 µm thick rectangle centred on the narrow end, same transverse width.
+    if narrow_end == "start":
+        # clip is at travel = 0 end (entry)
+        clip_pts = [
+            _pt(0,    entry_hw, -1),
+            _pt(0,    entry_hw, +1),
+            _pt(CLIP, entry_hw, +1),
+            _pt(CLIP, entry_hw, -1),
+        ]
+        # Recalculate with actual hw at clip boundary (linear interpolation)
+        hw_at_clip = entry_hw + (exit_hw - entry_hw) * (CLIP / L) if L > 0 else entry_hw
+        clip_pts = [
+            _pt(0,    entry_hw,   -1),
+            _pt(0,    entry_hw,   +1),
+            _pt(CLIP, hw_at_clip, +1),
+            _pt(CLIP, hw_at_clip, -1),
+        ]
+    else:
+        # clip is at travel = L end (exit)
+        hw_at_clip = exit_hw + (entry_hw - exit_hw) * (CLIP / L) if L > 0 else exit_hw
+        clip_pts = [
+            _pt(L - CLIP, hw_at_clip, -1),
+            _pt(L - CLIP, hw_at_clip, +1),
+            _pt(L,        exit_hw,    +1),
+            _pt(L,        exit_hw,    -1),
+        ]
+    narrow_clip = _poly(origin, clip_pts, LAYER_NARROW_END)
+    narrow_clip._no_auto_ports = True
+
+    components = [taper_body, narrow_clip]
+
+    # ── Ports on the anchor (taper_body) ──────────────────────────────────
+    # Entry port faces opposite to direction of travel (wire comes in).
+    # Exit  port faces in the direction of travel.
+    _opp = {"+x": PortSide.WEST, "-x": PortSide.EAST,
+            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+
+    # Port offsets must be relative to body.origin = dbu_pts[0] = first polygon
+    # vertex = _pt(0, entry_hw, -1) = (-px*entry_hw, -py*entry_hw) in cell-frame µm.
+    # Desired world positions (cell-frame): entry midpoint = (0, 0), exit midpoint = (tx*L, ty*L).
+    # Offset = desired_world - first_vertex = desired_world - (-px*ehw, -py*ehw)
+    #        = desired_world + (px*entry_hw, py*entry_hw)
+    correction_x = px * entry_hw
+    correction_y = py * entry_hw
+
+    entry_offset = (correction_x,        correction_y)
+    exit_offset  = (tx * L + correction_x, ty * L + correction_y)
+
+    _assign_ports(taper_body, [
+        Port(entry_label,
+             Point(um_to_dbu(entry_offset[0]), um_to_dbu(entry_offset[1])),
+             _opp[direction]),
+        Port(exit_label,
+             Point(um_to_dbu(exit_offset[0]), um_to_dbu(exit_offset[1])),
+             _fwd[direction]),
+    ])
+
+    dir_label = direction.replace("+", "+").replace("-", "-")
+    return CellResult(
+        components=components,
+        group_name=f"TaperSeg ({direction} L={length:.1f}µm nw={narrow_width:.2f}µm)",
+        description=(
+            f"Linear taper  {direction}  L={length}µm  "
+            f"narrow={narrow_width}µm → wide={taper_width}µm  "
+            f"narrow_end={narrow_end}"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Taper Pad  (→ add_taper_pad in primitives.py / component_model.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors taper_pad ComponentType in component_model.py
+# FINAL_TAPER_LENGTH + FINAL_PAD_LENGTH represent the two stages:
+#   Stage 1: linear taper from narrow_width → pad_width over taper_length
+#   Stage 2: uniform rectangular pad of pad_width × pad_length
+_TAPER_PAD_DEFAULTS = dict(
+    direction    = "+x",   # "+x" | "-x" | "+y" | "-y"
+    narrow_width = 0.3,    # entry (narrow) width  (µm) → cfg.WIRE_WIDTH
+    pad_width    = 5.0,    # exit  (wide)   width  (µm) → cfg.TAPER_WIDTH / PAD_W
+    taper_length = 6.1,    # length of the tapered wedge (µm) → FINAL_TAPER_LENGTH
+    pad_length   = 4.0,    # length of the flat pad       (µm) → FINAL_PAD_LENGTH
+)
+
+
+def build_taper_pad(
+    origin: Point,
+    direction:    str   = _TAPER_PAD_DEFAULTS["direction"],
+    narrow_width: float = _TAPER_PAD_DEFAULTS["narrow_width"],
+    pad_width:    float = _TAPER_PAD_DEFAULTS["pad_width"],
+    taper_length: float = _TAPER_PAD_DEFAULTS["taper_length"],
+    pad_length:   float = _TAPER_PAD_DEFAULTS["pad_length"],
+) -> CellResult:
+    """
+    Two-stage transition: linear taper wedge (L1) followed by a flat
+    overlap pad (L1), both on LAYER_BRANCH.
+
+    Mirrors add_taper_pad() from primitives.py as called by add_top_branch(),
+    add_snake_right_branch(), and the taper_pad ComponentType in
+    component_model.py.
+
+    Stage 1 — Taper (trapezoid):
+      Runs from origin for taper_length in `direction`.
+      Entry width = narrow_width, exit width = pad_width.
+
+    Stage 2 — Pad (rectangle):
+      Runs from end of taper for pad_length in `direction`.
+      Width = pad_width throughout.
+
+    Both stages are on LAYER_BRANCH (L1).  No LAYER_NARROW_END clip is
+    emitted here — taper_pad is the wide termination end, not the narrow tip.
+
+    Origin is the centreline of the entry (narrow) end, matching the
+    (x, y) convention in the reference codebase.
+
+    Ports
+    -----
+      narrow — entry face (wire comes in, opposite to direction)
+      wide   — exit face  (pad terminus, in direction of travel)
+    """
+    nw = narrow_width
+    pw = pad_width
+    tL = taper_length
+    pL = pad_length
+
+    _dir_map = {
+        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
+        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
+        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
+        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
+    }
+    d = _dir_map[direction]
+    tx, ty = d["tx"], d["ty"]
+    px, py = d["px"], d["py"]
+
+    def _pt(travel: float, hw: float, sign: int) -> tuple[float, float]:
+        return (tx * travel + px * sign * hw,
+                ty * travel + py * sign * hw)
+
+    # ── Stage 1: taper trapezoid ───────────────────────────────────────────
+    taper_pts = [
+        _pt(0,  nw / 2, -1),
+        _pt(0,  nw / 2, +1),
+        _pt(tL, pw / 2, +1),
+        _pt(tL, pw / 2, -1),
+    ]
+    taper_body = _poly(origin, taper_pts, LAYER_BRANCH)
+    taper_body._no_auto_ports = False   # anchor
+
+    # ── Stage 2: flat pad rectangle ───────────────────────────────────────
+    pad_pts = [
+        _pt(tL,      pw / 2, -1),
+        _pt(tL,      pw / 2, +1),
+        _pt(tL + pL, pw / 2, +1),
+        _pt(tL + pL, pw / 2, -1),
+    ]
+    pad_body = _poly(origin, pad_pts, LAYER_BRANCH)
+    pad_body._no_auto_ports = True
+
+    components = [taper_body, pad_body]
+
+    # ── Ports on the anchor (taper_body) ──────────────────────────────────
+    _opp = {"+x": PortSide.WEST, "-x": PortSide.EAST,
+            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+
+    # Port offsets must be relative to body.origin = dbu_pts[0] = taper_pts[0]
+    # = _pt(0, nw/2, -1) = (-px*nw/2, -py*nw/2) in cell-frame µm.
+    # Correction = (px*nw/2, py*nw/2) added to all desired world positions.
+    correction_x = px * nw / 2
+    correction_y = py * nw / 2
+    total_L = tL + pL
+    _assign_ports(taper_body, [
+        Port("narrow",
+             Point(um_to_dbu(correction_x), um_to_dbu(correction_y)),
+             _opp[direction]),
+        Port("wide",
+             Point(um_to_dbu(tx * total_L + correction_x),
+                   um_to_dbu(ty * total_L + correction_y)),
+             _fwd[direction]),
+    ])
+
+    return CellResult(
+        components=components,
+        group_name=f"TaperPad ({direction} tL={taper_length:.1f}µm pL={pad_length:.1f}µm)",
+        description=(
+            f"Taper pad  {direction}  taper {taper_length}µm  pad {pad_length}µm  "
+            f"nw={narrow_width}µm → pw={pad_width}µm"
+        ),
+    )
+
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Branch Segment  (→ add_branch_segment in components_lib.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors branch_segment ComponentType in component_model.py
+_BRANCH_SEG_DEFAULTS = dict(
+    direction  = "+x",    # "+x" | "-x" | "+y" | "-y"
+    length     = 10.0,    # segment length (µm)
+    taper_width = 2.0,    # uniform width (µm) → cfg.TAPER_WIDTH
+)
+
+
+def build_branch_segment(
+    origin: Point,
+    direction:   str   = _BRANCH_SEG_DEFAULTS["direction"],
+    length:      float = _BRANCH_SEG_DEFAULTS["length"],
+    taper_width: float = _BRANCH_SEG_DEFAULTS["taper_width"],
+) -> CellResult:
+    """
+    Straight uniform-width branch segment on LAYER_BRANCH (L1).
+
+    Mirrors add_branch_segment() from components_lib.py — a plain rectangular
+    path of width taper_width travelling in `direction` for `length` µm.
+
+    Origin is the centreline of the entry end, matching the (x, y) convention
+    used throughout components_lib.py.
+
+    Ports
+    -----
+      entry — centreline of the entry face (opposite to direction of travel)
+      exit  — centreline of the exit  face (in direction of travel)
+    """
+    tw = taper_width
+    L  = length
+
+    _dir_map = {
+        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
+        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
+        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
+        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
+    }
+    d  = _dir_map[direction]
+    tx, ty = d["tx"], d["ty"]   # travel axis unit vector
+    px, py = d["px"], d["py"]   # transverse axis unit vector
+
+    # Rectangle: entry at travel=0, exit at travel=L, half-width tw/2 transverse
+    rect_pts = [
+        (tx * 0 + px * (-tw / 2), ty * 0 + py * (-tw / 2)),
+        (tx * 0 + px * ( tw / 2), ty * 0 + py * ( tw / 2)),
+        (tx * L + px * ( tw / 2), ty * L + py * ( tw / 2)),
+        (tx * L + px * (-tw / 2), ty * L + py * (-tw / 2)),
+    ]
+    body = _poly(origin, rect_pts, LAYER_BRANCH)
+    body._no_auto_ports = False   # anchor
+
+    # ── Ports ──────────────────────────────────────────────────────────────
+    _opp = {"+x": PortSide.WEST,  "-x": PortSide.EAST,
+            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+
+    _assign_ports(body, [
+        Port("entry",
+             Point(0, 0),
+             _opp[direction]),
+        Port("exit",
+             Point(um_to_dbu(tx * L), um_to_dbu(ty * L)),
+             _fwd[direction]),
+    ])
+
+    return CellResult(
+        components=[body],
+        group_name=f"BranchSeg ({direction} L={length:.1f}µm w={taper_width:.1f}µm)",
+        description=(
+            f"Branch segment  {direction}  L={length}µm  width={taper_width}µm  L1"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Turn 90°  (→ add_turn in components_lib.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors turn ComponentType in component_model.py
+_TURN_DEFAULTS = dict(
+    entry_dir   = "+x",   # direction wire travels INTO the turn
+    turn_dir    = "l",    # "l" (CCW / left) | "r" (CW / right)
+    taper_width = 2.0,    # arc width (µm) → cfg.TAPER_WIDTH
+    turn_radius = 5.0,    # arc centreline radius (µm) → cfg.TURN_RADIUS
+)
+
+
+def build_turn(
+    origin: Point,
+    entry_dir:   str   = _TURN_DEFAULTS["entry_dir"],
+    turn_dir:    str   = _TURN_DEFAULTS["turn_dir"],
+    taper_width: float = _TURN_DEFAULTS["taper_width"],
+    turn_radius: float = _TURN_DEFAULTS["turn_radius"],
+) -> CellResult:
+    """
+    90-degree arc turn on LAYER_BRANCH (L1).
+
+    Mirrors add_turn() from components_lib.py.  The arc is approximated
+    as a polygon fan (32 segments) so it renders correctly in the canvas
+    without requiring gdspy at build time.
+
+    Origin is the centreline of the arc entry point, matching the (x, y)
+    convention used throughout components_lib.py.
+
+    The arc sweeps from entry_dir to the exit direction:
+      left  (CCW, "l") — rotates heading +90°
+      right (CW,  "r") — rotates heading −90°
+
+    Exit offset from origin (arc centre-of-curvature geometry):
+      The centre of curvature sits turn_radius perpendicular to entry,
+      so the exit point is at:
+        dx = R * (perp_x + exit_x_component)
+        dy = R * (perp_y + exit_y_component)
+
+    Ports
+    -----
+      entry — centreline of the arc entry (at origin, faces opposite to entry_dir)
+      exit  — centreline of the arc exit  (offset by arc geometry, faces exit_dir)
+    """
+    import math
+
+    R  = turn_radius
+    hw = taper_width / 2
+    N  = 32   # polygon segments for the arc
+
+    # ── Direction arithmetic ───────────────────────────────────────────────
+    # Unit vectors
+    _fwd_vec = {"+x": (1, 0), "-x": (-1, 0), "+y": (0, 1), "-y": (0, -1)}
+    _opp_dir = {"+x": "-x",  "-x": "+x",  "+y": "-y",  "-y": "+y"}
+
+    # Left (CCW) perpendicular of a vector (dx, dy): (-dy, dx)
+    # Right (CW)                                   : ( dy, -dx)
+    fx, fy = _fwd_vec[entry_dir]
+    if turn_dir == "l":
+        perp_x, perp_y = -fy,  fx    # CCW: rotate entry +90° to get left normal
+    else:
+        perp_x, perp_y =  fy, -fx    # CW:  rotate entry -90° to get right normal
+
+    # Centre of curvature is R in the perpendicular (inward) direction
+    cx_oc = perp_x * R   # offset of arc centre from origin (µm)
+    cy_oc = perp_y * R
+
+    # Arc sweeps 90° — determine start and end angles
+    # Start angle: vector from arc centre → origin = -(perp) direction
+    start_angle = math.atan2(-perp_y, -perp_x)
+    if turn_dir == "l":
+        end_angle = start_angle + math.pi / 2
+    else:
+        end_angle = start_angle - math.pi / 2
+
+    # ── Build fan polygon ─────────────────────────────────────────────────
+    # Outer arc: radius R + hw, inner arc: radius R - hw
+    # Points in µm relative to origin
+    outer_pts = []
+    inner_pts = []
+    for i in range(N + 1):
+        t = i / N
+        angle = start_angle + (end_angle - start_angle) * t
+        ca, sa = math.cos(angle), math.sin(angle)
+        outer_pts.append((cx_oc + (R + hw) * ca, cy_oc + (R + hw) * sa))
+        inner_pts.append((cx_oc + (R - hw) * ca, cy_oc + (R - hw) * sa))
+
+    # Fan: outer arc forward, inner arc reversed → closed polygon
+    fan_pts = outer_pts + list(reversed(inner_pts))
+
+    body = _poly(origin, fan_pts, LAYER_BRANCH)
+    body._no_auto_ports = False   # anchor
+
+    # ── Exit port offset ──────────────────────────────────────────────────
+    #
+    # Port positions match _make_turn_ports() in component_model.py exactly.
+    # The exit centreline is at (R, R), (R, -R), etc. relative to the entry
+    # centreline (origin) — derived from the arc geometry: the centre of
+    # curvature is R in the perpendicular direction, and the exit point is
+    # R away from the centre in the exit direction.
+    #
+    # Simple lookup (entry_dir, turn_dir) → (dx, dy) µm, exit_dir string.
+    # This is exactly _make_turn_ports._exit_map — keep in sync.
+    _exit_map = {
+        ("+x", "l"): (( R,  R), "+y"),
+        ("+x", "r"): (( R, -R), "-y"),
+        ("-x", "l"): ((-R, -R), "-y"),
+        ("-x", "r"): ((-R,  R), "+y"),
+        ("+y", "l"): ((-R,  R), "-x"),
+        ("+y", "r"): (( R,  R), "+x"),
+        ("-y", "l"): (( R, -R), "+x"),
+        ("-y", "r"): ((-R, -R), "-x"),
+    }
+    (ex_dx, ex_dy), exit_dir = _exit_map[(entry_dir, turn_dir)]
+
+    # Entry port faces opposite to entry_dir (wire comes in from that side).
+    # Exit  port faces in exit_dir (wire leaves in that direction).
+    _opp_side = {"+x": PortSide.WEST,  "-x": PortSide.EAST,
+                 "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+    _fwd_side = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+                 "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+
+    # Port offsets must be relative to body.origin = dbu_pts[0] = outer_pts[0]
+    # (the first polygon vertex = outer arc start point).
+    # Correction vector = -(outer_pts[0]) so that adding it to a cell-frame
+    # world position yields the correct body-local offset.
+    first_x = cx_oc + (R + hw) * math.cos(start_angle)
+    first_y = cy_oc + (R + hw) * math.sin(start_angle)
+    corr_x  = -first_x
+    corr_y  = -first_y
+
+    _assign_ports(body, [
+        Port("entry",
+             Point(um_to_dbu(corr_x), um_to_dbu(corr_y)),
+             _opp_side[entry_dir]),
+        Port("exit",
+             Point(um_to_dbu(ex_dx + corr_x), um_to_dbu(ex_dy + corr_y)),
+             _fwd_side[exit_dir]),
+    ])
+
+    return CellResult(
+        components=[body],
+        group_name=f"Turn90 ({entry_dir} {turn_dir} R={turn_radius:.1f}µm)",
+        description=(
+            f"90° arc turn  entry={entry_dir}  turn={turn_dir}  "
+            f"R={turn_radius}µm  width={taper_width}µm  L1"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Wire Segment  (→ "wire" ComponentType in component_model.py)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — mirrors wire ComponentType in component_model.py
+_WIRE_DEFAULTS = dict(
+    direction = "+x",   # "+x" | "-x" | "+y" | "-y"
+    length    = 5.0,    # wire length  (µm)
+    width     = 0.3,    # wire width   (µm) → cfg.WIRE_WIDTH
+    layer     = 5,      # GDS layer    (int) → LAYER_BIYSK_JUNCTION default
+)
+
+
+def build_wire(
+    origin: Point,
+    direction: str   = _WIRE_DEFAULTS["direction"],
+    length:    float = _WIRE_DEFAULTS["length"],
+    width:     float = _WIRE_DEFAULTS["width"],
+    layer:     int   = _WIRE_DEFAULTS["layer"],
+) -> CellResult:
+    """
+    Simple rectangular wire segment on any layer.
+
+    Mirrors the "wire" ComponentType from component_model.py.  Unlike
+    branch_segment (which is always L1 / TAPER_WIDTH), this cell is fully
+    configurable: any layer and any width, making it the go-to primitive
+    for connecting leads on L5, L10, or any other layer.
+
+    Origin is the centreline of the entry end.
+
+    Ports
+    -----
+      start — centreline of the entry face (opposite to direction)
+      end   — centreline of the exit  face (in direction of travel)
+    """
+    L  = length
+    hw = width / 2
+
+    _dir_map = {
+        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
+        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
+        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
+        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
+    }
+    d  = _dir_map[direction]
+    tx, ty = d["tx"], d["ty"]
+    px, py = d["px"], d["py"]
+
+    rect_pts = [
+        (tx * 0 + px * (-hw), ty * 0 + py * (-hw)),
+        (tx * 0 + px * ( hw), ty * 0 + py * ( hw)),
+        (tx * L + px * ( hw), ty * L + py * ( hw)),
+        (tx * L + px * (-hw), ty * L + py * (-hw)),
+    ]
+    body = _poly(origin, rect_pts, layer)
+    body._no_auto_ports = False   # anchor
+
+    _opp = {"+x": PortSide.WEST,  "-x": PortSide.EAST,
+            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
+    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
+            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
+
+    _assign_ports(body, [
+        Port("start",
+             Point(0, 0),
+             _opp[direction]),
+        Port("end",
+             Point(um_to_dbu(tx * L), um_to_dbu(ty * L)),
+             _fwd[direction]),
+    ])
+
+    return CellResult(
+        components=[body],
+        group_name=f"Wire ({direction} L={length:.1f}µm w={width:.2f}µm L{layer})",
+        description=(
+            f"Wire segment  {direction}  L={length}µm  width={width}µm  layer={layer}"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Cell catalogue  (what the palette reads)
 # ═════════════════════════════════════════════════════════════════════════════
 
@@ -617,6 +1224,30 @@ CELL_CATALOGUE: List[CellDef] = [
         category    = "Superconducting",
         defaults    = _JJ_DEFAULTS,
         builder     = build_manhattan_jj,
+    ),
+    CellDef(
+        cell_id     = "taper_segment",
+        name        = "Taper Segment",
+        description = "Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with L11 narrow-tip slice",
+        category    = "Routing",
+        defaults    = _TAPER_SEG_DEFAULTS,
+        builder     = build_taper_segment,
+    ),
+    CellDef(
+        cell_id     = "taper_pad",
+        name        = "Taper Pad",
+        description = "Linear taper wedge (L1) → flat overlap pad (L1)",
+        category    = "Routing",
+        defaults    = _TAPER_PAD_DEFAULTS,
+        builder     = build_taper_pad,
+    ),
+    CellDef(
+        cell_id     = "turn",
+        name        = "Turn 90°",
+        description = "90° arc turn — configurable entry direction and handedness (L1)",
+        category    = "Routing",
+        defaults    = _TURN_DEFAULTS,
+        builder     = build_turn,
     ),
 ]
 

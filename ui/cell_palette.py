@@ -21,11 +21,11 @@ import json
 from typing import Optional
 
 from PyQt6.QtWidgets import (
-    QWidget, QVBoxLayout, QLabel, QPushButton,
+    QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
     QScrollArea, QFrame, QSizePolicy, QApplication,
 )
-from PyQt6.QtCore import Qt, QMimeData, QPoint, QByteArray
-from PyQt6.QtGui import QColor, QPixmap, QPainter, QDrag, QMouseEvent
+from PyQt6.QtCore import Qt, QMimeData, QPoint, QByteArray, QPointF
+from PyQt6.QtGui import QColor, QPixmap, QPainter, QPen, QPainterPath, QDrag, QMouseEvent
 
 from ui.theme import Colors, Fonts, Geometry
 from core.cell_library import CELL_CATALOGUE, CellDef
@@ -42,6 +42,25 @@ class _CategoryLabel(QLabel):
             letter-spacing: 1.5px;
             padding: 10px 0 4px 0;
         """)
+
+
+
+# ── Icon helper ───────────────────────────────────────────────────────────────
+# Import the accurate per-cell icon painters from panels.py so both palette
+# widgets show identical icons without duplicating drawing code.
+# If panels is not importable (standalone usage), fall back to a plain rect.
+try:
+    from ui.panels import _cell_icon  # noqa: F401  (re-exported for DraggableCellButton below)
+except ImportError:
+    def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:  # type: ignore[misc]
+        pix = QPixmap(size, size)
+        pix.fill(Qt.GlobalColor.transparent)
+        p = QPainter(pix)
+        c = QColor("#7c3aed"); c.setAlpha(120)
+        p.setBrush(c); p.setPen(QPen(QColor("#a78bfa"), 1.2))
+        p.drawRoundedRect(4, 4, size - 8, size - 8, 2, 2)
+        p.end()
+        return pix
 
 
 # ── Draggable cell tile ───────────────────────────────────────────────────────
@@ -74,12 +93,24 @@ class DraggableCellButton(QPushButton):
         self.setCursor(Qt.CursorShape.PointingHandCursor)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
 
-        # ── Inner layout: icon col + text col ────────────────────────────────
-        inner = QVBoxLayout(self)
-        inner.setContentsMargins(12, 7, 12, 7)
-        inner.setSpacing(2)
+        # ── Outer horizontal layout: icon | text column ───────────────────────
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(10, 7, 12, 7)
+        outer.setSpacing(10)
 
-        top = QLabel(f"⬡  {cdef.name}")
+        # Icon (hexagon with centre dot)
+        icon_lbl = QLabel()
+        icon_lbl.setPixmap(_cell_icon(cdef.cell_id, size=36))
+        icon_lbl.setFixedSize(36, 36)
+        icon_lbl.setStyleSheet("background: transparent;")
+        outer.addWidget(icon_lbl)
+
+        # Text column
+        text_col = QVBoxLayout()
+        text_col.setSpacing(2)
+        text_col.setContentsMargins(0, 0, 0, 0)
+
+        top = QLabel(cdef.name)
         top.setStyleSheet(
             f"color: {Colors.TEXT_PRIMARY}; "
             f"font-size: {Fonts.SIZE_SM}px; background: transparent;"
@@ -89,8 +120,9 @@ class DraggableCellButton(QPushButton):
             f"color: {Colors.TEXT_MUTED}; "
             f"font-size: {Fonts.SIZE_XS}px; background: transparent;"
         )
-        inner.addWidget(top)
-        inner.addWidget(bot)
+        text_col.addWidget(top)
+        text_col.addWidget(bot)
+        outer.addLayout(text_col)
 
         self.setStyleSheet(f"""
             QPushButton {{

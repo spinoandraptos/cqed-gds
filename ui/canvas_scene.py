@@ -58,7 +58,7 @@ DEFAULT_H_DBU    = um_to_dbu(0.2)
 DEFAULT_PW_DBU   = um_to_dbu(1)
 MIN_POLY_PTS     = 3
 VERTEX_DOT_R     = um_to_dbu(0.4)
-PORT_SNAP_RADIUS = um_to_dbu(1)
+PORT_SNAP_RADIUS = um_to_dbu(0.5)
 PASTE_OFFSET_DBU = um_to_dbu(10)
 
 # Connection indicator colours
