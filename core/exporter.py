@@ -269,6 +269,10 @@ def _add_component(cell, comp: GDSComponent, gds_layer: int, datatype: int) -> N
 UNDERCUT_RING_LAYER = 2
 UNDERCUT_RING_DATATYPE = 0
 
+# Only components on this app-layer contribute geometry to undercut rings.
+# Components on other layers are ignored when building the ring base shape.
+UNDERCUT_SOURCE_LAYER = 1
+
 
 def export_undercut_rings(
     cell,
@@ -281,8 +285,14 @@ def export_undercut_rings(
     """
     Compute and emit undercut ring polygons for all non-excluded objects.
 
+    Only geometry on UNDERCUT_SOURCE_LAYER (app-layer 1) contributes to the
+    ring base shape — components on other layers are ignored.  For groups this
+    means only the Layer-1 members are unioned; if a group has no Layer-1
+    members at all, no ring is emitted for it.  For ungrouped components, only
+    those on Layer 1 receive a ring.
+
     The ring is built the same way as the visual overlay:
-      1. Collect the filled shape polygon(s) for the object (or union of group members).
+      1. Collect the Layer-1 filled shape polygon(s) for the object.
       2. Offset outward by overlay.offset_um using gdstk.offset().
       3. Boolean-subtract the original shape → hollow ring.
 
@@ -312,11 +322,16 @@ def export_undercut_rings(
         if not members:
             continue
 
-        # Union all member shapes (any layer) into one base polygon set.
+        # Only Layer-1 members contribute geometry to the ring base.
         base_polys: list[gdstk.Polygon] = []
         for comp in members:
-            # Use layer/datatype=0 here — only geometry matters for the ring.
+            if comp.layer != UNDERCUT_SOURCE_LAYER:
+                continue
+            # layer/datatype=0 here — only geometry matters for ring building.
             base_polys.extend(_comp_to_gdstk_polys(comp, 0, 0))
+
+        if not base_polys:
+            continue  # group has no Layer-1 members — skip entirely
 
         masks_um = overlay.get_masks_um(group.id)
         ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype,
@@ -331,6 +346,8 @@ def export_undercut_rings(
             continue
         if overlay.is_excluded(comp.id):
             continue
+        if comp.layer != UNDERCUT_SOURCE_LAYER:
+            continue  # only Layer-1 components get a ring
 
         base_polys = _comp_to_gdstk_polys(comp, 0, 0)
         masks_um = overlay.get_masks_um(comp.id)

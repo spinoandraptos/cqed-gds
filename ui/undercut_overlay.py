@@ -74,6 +74,10 @@ _RING_Z          = 5                   # between fill (0) and ports (8)
 
 _DEFAULT_OFFSET_UM = 0.8              # µm — physical undercut expansion
 
+# Only components on this app-layer contribute geometry to undercut rings.
+# Must stay in sync with UNDERCUT_SOURCE_LAYER in core/exporter.py.
+_UNDERCUT_SOURCE_LAYER = 1
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _expansion_pen(offset_dbu: int) -> QPen:
@@ -350,40 +354,6 @@ class UndercutOverlay:
         """Return True if *obj_id* has at least one mask applied."""
         return bool(self._masks.get(obj_id))
 
-    def get_masks_um(self, obj_id: str) -> list:
-        """
-        Return the eraser masks for *obj_id* as a list of
-        ``(x_min, y_min, x_max, y_max)`` tuples in µm, using the GDS
-        Y-negation convention (Y is flipped relative to scene/DBU coords).
-
-        Each QPainterPath mask is reduced to its axis-aligned bounding
-        rectangle — the same region the visual eraser painted — which is
-        then converted from DBU (nm) to µm and Y-flipped so it lines up
-        with the gdstk geometry written by the exporter.
-
-        Returns an empty list when no masks exist for this object.
-        """
-        masks = self._masks.get(obj_id)
-        if not masks:
-            return []
-
-        result = []
-        for path in masks:
-            br = path.boundingRect()       # QRectF in scene (DBU) coordinates
-            x0_um =  br.left()   / 1000.0
-            x1_um =  br.right()  / 1000.0
-            # Negate Y to match GDS convention used throughout exporter.py
-            y0_um = -br.top()    / 1000.0
-            y1_um = -br.bottom() / 1000.0
-            # Normalise so x_min < x_max and y_min < y_max after the flip
-            result.append((
-                min(x0_um, x1_um),
-                min(y0_um, y1_um),
-                max(x0_um, x1_um),
-                max(y0_um, y1_um),
-            ))
-        return result
-
     def _apply_masks(self, obj_id: str, ring_path: "QPainterPath") -> "QPainterPath":
         """Subtract all stored mask paths from *ring_path* and return the result."""
         masks = self._masks.get(obj_id)
@@ -487,6 +457,16 @@ class UndercutOverlay:
 
     def _ensure_comp_ring(self, comp, parent_item: QGraphicsItem) -> None:
         """Create or update the ring for a single ComponentItem."""
+        # Only Layer-1 components get an undercut ring.
+        if comp.layer != _UNDERCUT_SOURCE_LAYER:
+            # Remove any stale ring that may exist from before a layer change.
+            if comp.id in self._comp_rings:
+                ring = self._comp_rings.pop(comp.id)
+                ring.setParentItem(None)
+                if ring.scene():
+                    ring.scene().removeItem(ring)
+            return
+
         ring = self._comp_rings.get(comp.id)
         if ring is None:
             ring = _ComponentRingItem(parent_item, self._offset_dbu)
@@ -501,9 +481,16 @@ class UndercutOverlay:
         ring.setVisible(self._enabled and comp.id not in self._excluded_ids)
 
     def _ensure_group_ring(self, group) -> None:
-        """Create or update the ring for a group (union of all members)."""
+        """Create or update the ring for a group (union of Layer-1 members only)."""
         member_comps = self._resolve_group_members(group)
-        if not member_comps:
+        # Only Layer-1 members contribute geometry to the ring.
+        layer1_comps = [c for c in member_comps if c.layer == _UNDERCUT_SOURCE_LAYER]
+        if not layer1_comps:
+            # No Layer-1 members — remove any stale ring and bail out.
+            if group.id in self._group_rings:
+                ring = self._group_rings.pop(group.id)
+                if ring.scene():
+                    ring.scene().removeItem(ring)
             return
 
         ring = self._group_rings.get(group.id)
@@ -512,9 +499,9 @@ class UndercutOverlay:
             self._scene.addItem(ring)
             self._group_rings[group.id] = ring
 
-        # Build the union shape → raw ring → subtract masks.
+        # Build the union shape from Layer-1 members only → raw ring → subtract masks.
         union = QPainterPath()
-        for comp in member_comps:
+        for comp in layer1_comps:
             shape = _shape_path_for_comp(comp)
             if not shape.isEmpty():
                 union = union.united(shape)
