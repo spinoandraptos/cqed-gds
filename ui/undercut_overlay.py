@@ -287,6 +287,11 @@ class UndercutOverlay:
         # explicitly included → do not touch _excluded_ids".
         self._known_ids: Set[str] = set()
 
+        # obj_id → list of QPainterPath masks.  Each mask is subtracted from
+        # the ring geometry before display, allowing arbitrary "eraser" regions
+        # to be cut out of a ring without touching the model.
+        self._masks: Dict[str, list] = {}
+
         # scene_changed covers all model mutations (add/remove/move/resize).
         # selectionChanged is intentionally NOT connected — rings are persistent.
         scene_ref.scene_changed.connect(self._on_scene_changed)
@@ -319,6 +324,89 @@ class UndercutOverlay:
     @property
     def offset_um(self) -> float:
         return dbu_to_um(self._offset_dbu)
+
+    # ── Mask API ──────────────────────────────────────────────────────────────
+
+    def add_mask(self, obj_id: str, mask_path: "QPainterPath") -> None:
+        """
+        Subtract *mask_path* (in scene / world DBU coordinates) from the ring
+        for *obj_id* (a component id or group id).  Stacks with any existing
+        masks — each call appends one more erasure region.
+
+        The ring is immediately redrawn if the overlay is currently enabled.
+        """
+        self._masks.setdefault(obj_id, []).append(mask_path)
+        if self._enabled:
+            self._rebuild_one(obj_id)
+
+    def clear_masks(self, obj_id: str) -> None:
+        """Remove all mask regions for *obj_id* and redraw the ring."""
+        if obj_id in self._masks:
+            del self._masks[obj_id]
+        if self._enabled:
+            self._rebuild_one(obj_id)
+
+    def has_masks(self, obj_id: str) -> bool:
+        """Return True if *obj_id* has at least one mask applied."""
+        return bool(self._masks.get(obj_id))
+
+    def get_masks_um(self, obj_id: str) -> list:
+        """
+        Return the eraser masks for *obj_id* as a list of
+        ``(x_min, y_min, x_max, y_max)`` tuples in µm, using the GDS
+        Y-negation convention (Y is flipped relative to scene/DBU coords).
+
+        Each QPainterPath mask is reduced to its axis-aligned bounding
+        rectangle — the same region the visual eraser painted — which is
+        then converted from DBU (nm) to µm and Y-flipped so it lines up
+        with the gdstk geometry written by the exporter.
+
+        Returns an empty list when no masks exist for this object.
+        """
+        masks = self._masks.get(obj_id)
+        if not masks:
+            return []
+
+        result = []
+        for path in masks:
+            br = path.boundingRect()       # QRectF in scene (DBU) coordinates
+            x0_um =  br.left()   / 1000.0
+            x1_um =  br.right()  / 1000.0
+            # Negate Y to match GDS convention used throughout exporter.py
+            y0_um = -br.top()    / 1000.0
+            y1_um = -br.bottom() / 1000.0
+            # Normalise so x_min < x_max and y_min < y_max after the flip
+            result.append((
+                min(x0_um, x1_um),
+                min(y0_um, y1_um),
+                max(x0_um, x1_um),
+                max(y0_um, y1_um),
+            ))
+        return result
+
+    def _apply_masks(self, obj_id: str, ring_path: "QPainterPath") -> "QPainterPath":
+        """Subtract all stored mask paths from *ring_path* and return the result."""
+        masks = self._masks.get(obj_id)
+        if not masks:
+            return ring_path
+        result = ring_path
+        for mask in masks:
+            result = result.subtracted(mask)
+        return result
+
+    def _rebuild_one(self, obj_id: str) -> None:
+        """Rebuild the ring for a single comp or group id (used after mask changes)."""
+        design = self._scene._design
+        # Try as a group first, then as a component.
+        group = design.get_group(obj_id)
+        if group is not None:
+            self._ensure_group_ring(group)
+            return
+        comp = design.get(obj_id)
+        if comp is not None:
+            parent_item = self._scene._items.get(obj_id)
+            if parent_item is not None:
+                self._ensure_comp_ring(comp, parent_item)
 
     # ── Per-object exclusion API ──────────────────────────────────────────────
 
@@ -406,7 +494,10 @@ class UndercutOverlay:
         elif ring.parentItem() is not parent_item:
             # Parent changed (e.g. after undo/redo recreated the item).
             ring.setParentItem(parent_item)
-        ring.rebuild(comp, self._offset_dbu)
+        base   = _shape_path_for_comp(comp)
+        raw    = _build_ring_path(base, self._offset_dbu)
+        masked = self._apply_masks(comp.id, raw)
+        ring.setPath(masked)
         ring.setVisible(self._enabled and comp.id not in self._excluded_ids)
 
     def _ensure_group_ring(self, group) -> None:
@@ -420,7 +511,16 @@ class UndercutOverlay:
             ring = _GroupRingItem()
             self._scene.addItem(ring)
             self._group_rings[group.id] = ring
-        ring.rebuild(member_comps, self._offset_dbu)
+
+        # Build the union shape → raw ring → subtract masks.
+        union = QPainterPath()
+        for comp in member_comps:
+            shape = _shape_path_for_comp(comp)
+            if not shape.isEmpty():
+                union = union.united(shape)
+        raw    = _build_ring_path(union, self._offset_dbu)
+        masked = self._apply_masks(group.id, raw)
+        ring.setPath(masked)
         ring.setVisible(self._enabled and group.id not in self._excluded_ids)
 
     def _resolve_group_members(self, group) -> list:

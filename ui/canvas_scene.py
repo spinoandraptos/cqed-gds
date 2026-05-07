@@ -92,6 +92,7 @@ class PlacementMode(Enum):
     PLACE_POLYGON = auto()
     PLACE_PATH    = auto()
     RULER         = auto()
+    MASK_UNDERCUT = auto()
 
     @property
     def status_label(self) -> str:
@@ -101,6 +102,7 @@ class PlacementMode(Enum):
             PlacementMode.PLACE_POLYGON: "PLACE POLYGON  —  click vertices  |  dbl-click or Enter to close  |  ESC cancel",
             PlacementMode.PLACE_PATH:    "PLACE PATH  —  click vertices  |  Enter to commit  |  ESC cancel",
             PlacementMode.RULER:         "RULER  —  click-drag to measure  |  ESC to clear",
+            PlacementMode.MASK_UNDERCUT: "ERASE UNDERCUT  —  click-drag rectangle to erase  |  ESC cancel",
         }[self]
 
 
@@ -739,6 +741,12 @@ class CanvasScene(QGraphicsScene):
         # self._undercut.toggle() or self._undercut.enable(True).
         self._undercut = UndercutOverlay(self)
 
+        # The obj_id (comp or group) whose ring is being masked in
+        # MASK_UNDERCUT mode.  Empty string when not in mask mode.
+        self._mask_target_id:  str            = ""
+        self._erase_drag_start: Optional[QPointF] = None
+        self._erase_ghost:      Optional[object]  = None
+
         # Ruler state
         self._ruler_item:  Optional[RulerItem] = None
         self._ruler_dragging: bool             = False
@@ -755,9 +763,27 @@ class CanvasScene(QGraphicsScene):
         self._pl.layer = layer
         self.mode_changed.emit(mode.status_label)
 
+    def enter_mask_undercut_mode(self, target_id: str) -> None:
+        """
+        Activate the undercut-mask eraser for *target_id* (a comp or group id).
+        The user click-drags a rectangle; on release the rect is subtracted from
+        that object's ring via UndercutOverlay.add_mask().  Purely visual.
+        """
+        self._mask_target_id  = target_id
+        self._erase_drag_start: Optional[QPointF] = None
+        self._erase_ghost:      Optional[object]  = None
+        self._clear_ghosts()
+        self._pl.mode = PlacementMode.MASK_UNDERCUT
+        self.mode_changed.emit(PlacementMode.MASK_UNDERCUT.status_label)
+
     def cancel_placement(self) -> None:
         self._clear_ghosts()
         self.clear_ruler()
+        self._mask_target_id = ""
+        self._erase_drag_start = None
+        if self._erase_ghost is not None:
+            self.removeItem(self._erase_ghost)
+            self._erase_ghost = None
         self._pl.mode = PlacementMode.SELECT
         self.mode_changed.emit(PlacementMode.SELECT.status_label)
 
@@ -1040,6 +1066,11 @@ class CanvasScene(QGraphicsScene):
                 self._commit_poly_or_path()
             return
 
+        if self._pl.mode == PlacementMode.MASK_UNDERCUT:
+            if event.button() == Qt.MouseButton.LeftButton:
+                self._erase_drag_start = event.scenePos()
+            return
+
         if self._pl.mode == PlacementMode.RULER:
             if event.button() == Qt.MouseButton.LeftButton:
                 # Replace any existing ruler with a fresh one starting here.
@@ -1082,6 +1113,8 @@ class CanvasScene(QGraphicsScene):
             self._update_ghost_rect(snapped)
         elif self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             self._update_ghost_edge(snapped)
+        elif self._pl.mode == PlacementMode.MASK_UNDERCUT and self._erase_drag_start is not None:
+            self._update_erase_ghost(event.scenePos())
         elif self._pl.mode == PlacementMode.RULER and self._ruler_dragging and self._ruler_item:
             self._ruler_item.update_end(snapped)
 
@@ -1091,6 +1124,11 @@ class CanvasScene(QGraphicsScene):
         super().mouseMoveEvent(event)
 
     def mouseReleaseEvent(self, event) -> None:
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._pl.mode == PlacementMode.MASK_UNDERCUT
+                and self._erase_drag_start is not None):
+            self._commit_erase_rect(event.scenePos())
+            return
         if (event.button() == Qt.MouseButton.LeftButton
                 and self._unified_drag_active
                 and (self._orig_comp_positions or self._orig_group_positions)):
@@ -1545,6 +1583,49 @@ class CanvasScene(QGraphicsScene):
             )
         self.cmd_stack.execute(AddComponent(comp))
         self._clear_ghosts()
+
+    def _update_erase_ghost(self, current: QPointF) -> None:
+        """Draw/update a dashed orange rectangle showing the erase area."""
+        if self._erase_drag_start is None:
+            return
+        rect = QRectF(self._erase_drag_start, current).normalized()
+        if self._erase_ghost is None:
+            ghost = QGraphicsRectItem(rect)
+            c = QColor("#fb923c")   # orange — matches ring colour
+            c.setAlpha(40)
+            ghost.setPen(_cosmetic("#fb923c", 1.5, Qt.PenStyle.DashLine))
+            ghost.setBrush(QBrush(c))
+            ghost.setZValue(20)
+            self.addItem(ghost)
+            self._erase_ghost = ghost
+        else:
+            self._erase_ghost.setRect(rect)
+
+    def _commit_erase_rect(self, end: QPointF) -> None:
+        """
+        On mouse release: subtract the dragged rectangle from the target ring
+        and return to SELECT mode.  If the drag was too small (< 2 px), ignore.
+        """
+        start = self._erase_drag_start
+        # Clean up ghost first.
+        if self._erase_ghost is not None:
+            self.removeItem(self._erase_ghost)
+            self._erase_ghost = None
+        self._erase_drag_start = None
+
+        if start is None:
+            return
+        rect = QRectF(start, end).normalized()
+        if rect.width() < 2.0 or rect.height() < 2.0:
+            # Accidental click — stay in erase mode for next drag.
+            return
+
+        if self._mask_target_id:
+            mask_path = QPainterPath()
+            mask_path.addRect(rect)
+            self._undercut.add_mask(self._mask_target_id, mask_path)
+        # Stay in MASK_UNDERCUT mode so multiple rectangles can be drawn
+        # without re-pressing X each time.  ESC returns to SELECT.
 
     def _clear_ghosts(self) -> None:
         for item in (self._pl.ghost_rect, self._pl.ghost_poly, self._pl.ghost_edge):

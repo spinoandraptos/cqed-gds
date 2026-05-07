@@ -148,11 +148,23 @@ class MainWindow(QMainWindow):
         self._act_undercut.setCheckable(True)
         self._act_undercut.setChecked(False)
 
+        self._act_mask_undercut = self._action(
+            "Erase Undercut Region…", "X",
+            self._enter_mask_undercut_mode,
+        )
+
+        self._act_clear_masks = self._action(
+            "Clear Undercut Masks", "",
+            self._clear_undercut_masks,
+        )
+
         self._populate_menu(menu, [
             self._act_fit, None,
             self._act_zin, self._act_zout, None,
             self._act_ruler, None,
             self._act_undercut,
+            self._act_mask_undercut,
+            self._act_clear_masks,
         ])
 
     def _build_help_menu(self, mb) -> None:
@@ -215,6 +227,12 @@ class MainWindow(QMainWindow):
             self._toggle_ruler, color=Colors.ACCENT,
         )
         self._tb_ruler.setCheckable(True)
+        self._toolbar.addSeparator()
+
+        self._tb_mask_undercut = self._tb_button(
+            "fa5s.eraser", "Erase Undercut Region  (X)",
+            self._enter_mask_undercut_mode, color="#fb923c",
+        )
         self._toolbar.addSeparator()
 
         self._tb_button("fa5s.trash-alt",  "Delete Selected  (Del)",    self._delete_selected, color=Colors.ERROR)
@@ -381,6 +399,74 @@ class MainWindow(QMainWindow):
         self._flash_status(
             f"Undercut ring {'ON' if on else 'OFF'} — {overlay.offset_um:.2f} µm"
         )
+
+    def _enter_mask_undercut_mode(self) -> None:
+        """
+        Activate the undercut-mask eraser for the currently selected group
+        or component.
+
+        Requirements:
+          - Exactly one group or component must be selected.
+          - The undercut overlay must be globally enabled, and the selected
+            object's ring must not be excluded.
+
+        On success the scene enters MASK_UNDERCUT mode: the user draws a closed
+        polygon (same gestures as PLACE_POLYGON) which is then subtracted from
+        the ring geometry.  No model change is made — the mask is purely visual.
+        To remove all masks from an object use View → "Clear Undercut Masks".
+        """
+        overlay = self._scene._undercut
+        if not overlay.is_enabled:
+            self._flash_status("Enable the undercut ring first (U) before erasing.")
+            return
+
+        # Resolve selected object ID — prefer a selected group, else a component.
+        sel = self._scene.selectedItems()
+        target_id = ""
+        from ui.canvas_scene import GroupItem, ComponentItem
+        for item in sel:
+            if isinstance(item, GroupItem):
+                target_id = item.group.id
+                break
+        if not target_id:
+            for item in sel:
+                if isinstance(item, ComponentItem):
+                    target_id = item.component.id
+                    break
+
+        if not target_id:
+            self._flash_status("Select a group or component with an active undercut ring first.")
+            return
+        if overlay.is_excluded(target_id):
+            self._flash_status("The selected object's undercut ring is hidden — enable it first.")
+            return
+
+        self._scene.enter_mask_undercut_mode(target_id)
+        self._view.setCursor(Qt.CursorShape.CrossCursor)
+        self._flash_status(
+            "Erase undercut — click-drag rectangles over ring areas to remove them  |  ESC to finish"
+        )
+
+    def _clear_undercut_masks(self) -> None:
+        """
+        Remove all mask regions from the currently selected group / component.
+        Accessible via View menu or programmatically.
+        """
+        overlay = self._scene._undercut
+        sel = self._scene.selectedItems()
+        from ui.canvas_scene import GroupItem, ComponentItem
+        cleared = 0
+        for item in sel:
+            if isinstance(item, GroupItem):
+                overlay.clear_masks(item.group.id)
+                cleared += 1
+            elif isinstance(item, ComponentItem):
+                overlay.clear_masks(item.component.id)
+                cleared += 1
+        if cleared:
+            self._flash_status(f"Cleared undercut masks on {cleared} object(s).")
+        else:
+            self._flash_status("No objects selected.")
 
     @pyqtSlot(str, object)
     def _on_undercut_exclusion_changed(self, obj_id: str, value) -> None:
@@ -1287,6 +1373,7 @@ class MainWindow(QMainWindow):
     def _escape(self) -> None:
         self._scene.cancel_placement()
         self._tb_select.setChecked(True)
+        self._view.setCursor(Qt.CursorShape.ArrowCursor)
         # If we were in ruler mode, un-check the ruler button too.
         self._act_ruler.setChecked(False)
         self._tb_ruler.setChecked(False)

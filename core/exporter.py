@@ -318,7 +318,9 @@ def export_undercut_rings(
             # Use layer/datatype=0 here — only geometry matters for the ring.
             base_polys.extend(_comp_to_gdstk_polys(comp, 0, 0))
 
-        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype)
+        masks_um = overlay.get_masks_um(group.id)
+        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype,
+                                       masks_um=masks_um)
         if ring_polys:
             cell.add(*ring_polys)
             added += len(ring_polys)
@@ -331,7 +333,9 @@ def export_undercut_rings(
             continue
 
         base_polys = _comp_to_gdstk_polys(comp, 0, 0)
-        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype)
+        masks_um = overlay.get_masks_um(comp.id)
+        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype,
+                                       masks_um=masks_um)
         if ring_polys:
             cell.add(*ring_polys)
             added += len(ring_polys)
@@ -344,10 +348,16 @@ def _build_gdstk_ring(
     offset_um: float,
     gds_layer: int,
     datatype: int,
+    masks_um: list | None = None,
 ) -> list:
     """
     Given a list of gdstk.Polygon objects representing the filled base shape,
     return the ring = expanded_outline − base_shape as a list of Polygons.
+
+    *masks_um* is an optional list of (x_min, y_min, x_max, y_max) tuples
+    in µm (GDS Y convention, already negated) from UndercutOverlay.get_masks_um().
+    Each rectangle is subtracted from the ring after it is built, exactly
+    matching what the visual eraser removed on screen.
     """
     if not base_polys:
         return []
@@ -368,6 +378,19 @@ def _build_gdstk_ring(
 
     # Step 3: subtract original → hollow ring.
     ring = gdstk.boolean(expanded, unioned, "not", layer=gds_layer, datatype=datatype)
+    if not ring:
+        return []
+
+    # Step 4: subtract each user-drawn mask rectangle.
+    if masks_um:
+        mask_polys = []
+        for (x0, y0, x1, y1) in masks_um:
+            mask_polys.append(gdstk.rectangle(
+                (x0, y0), (x1, y1), layer=0, datatype=0
+            ))
+        ring = gdstk.boolean(ring, mask_polys, "not",
+                             layer=gds_layer, datatype=datatype)
+
     return ring if ring else []
 
 
