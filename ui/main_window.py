@@ -26,8 +26,8 @@ from core.cell_library import CELL_BY_ID, Point, place_cell
 from core.clipboard import Clipboard
 from core.commands import (
     BatchCommand, EditComponent, GroupComponents, MergeGroups,
-    RemoveComponent, RemoveGroup, ReplaceCellCmd, ReplaceSubgroupCellCmd,
-    UngroupComponents,
+    MoveComponent, MoveGroup, RemoveComponent, RemoveGroup, ReplaceCellCmd,
+    ReplaceSubgroupCellCmd, UngroupComponents,
 )
 from core.model import ComponentKind, DesignScene
 from core.serialiser import SerialisationError, load, save
@@ -307,7 +307,6 @@ class MainWindow(QMainWindow):
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
         self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
         self._props.undercut_exclusion_changed.connect(self._on_undercut_exclusion_changed)
-        self._props.component_hover_requested.connect(self._scene.highlight_component)
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -400,6 +399,9 @@ class MainWindow(QMainWindow):
            Only the components belonging to that sub-group are replaced.
            All other sub-groups' components are left untouched.
            Uses ReplaceSubgroupCellCmd so the operation is fully undo-able.
+
+        After either replace command executes, connected neighbours are nudged
+        to stay aligned with the new port positions on the rebuilt anchor.
         """
         group = self._design.get_group(group_id)
         if group is None:
@@ -486,6 +488,10 @@ class MainWindow(QMainWindow):
             import copy as _copy
             old_sg_comps_snapshot = [_copy.deepcopy(c) for c in old_sg_comps]
 
+            # Snapshot connections on the old anchor BEFORE removal destroys them
+            old_anchor_sg = old_sg_comps[0] if old_sg_comps else None
+            conn_snap = self._snapshot_anchor_connections(old_anchor_sg)
+
             cmd = ReplaceSubgroupCellCmd(
                 group_id            = group_id,
                 sg_index            = sg_index,
@@ -500,6 +506,27 @@ class MainWindow(QMainWindow):
                 new_value           = new_value,
             )
             self._scene.cmd_stack.execute(cmd)
+
+            # Nudge connected neighbours to match new port positions and
+            # re-establish connections on the new anchor component.
+            new_anchor_sg = next(
+                (self._design.get(cid)
+                 for cid in (updated_sg_entry.get("member_ids") or [])
+                 if self._design.get(cid) and self._design.get(cid).ports),
+                None,
+            )
+            move_cmds = self._restore_connections_and_nudge(
+                conn_snap, new_anchor_sg,
+                excluded_ids=set(group.member_ids),
+            )
+            if move_cmds:
+                # Record the moves as an additional undo entry
+                # (the replace cmd itself is already on the stack)
+                batch = BatchCommand(
+                    move_cmds,
+                    f"Nudge {len(move_cmds)} neighbour(s) after cell param edit",
+                )
+                self._scene.cmd_stack.push(batch)
 
             # Re-select the same GroupItem so the panel stays visible.
             gi = self._scene._group_items.get(group_id)
@@ -561,6 +588,15 @@ class MainWindow(QMainWindow):
         old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
         old_group_name = group.name
 
+        # Snapshot connections on the old anchor BEFORE removal destroys them.
+        # The anchor is always the first component in the group that has ports.
+        old_anchor = next(
+            (self._design.get(cid) for cid in old_comp_ids
+             if self._design.get(cid) and self._design.get(cid).ports),
+            None,
+        )
+        conn_snap = self._snapshot_anchor_connections(old_anchor)
+
         rotation_steps = getattr(group, "_cell_rotation_steps", 0)
         cmd = ReplaceCellCmd(
             self._design, self._scene, new_result, cdef,
@@ -581,7 +617,178 @@ class MainWindow(QMainWindow):
                 new_gi.setSelected(True)
                 self._scene.group_selected.emit(new_group.id)
 
+        # Nudge connected neighbours to match the new port positions and
+        # re-establish the connections on the new anchor component.
+        new_anchor = next(
+            (self._design.get(cid)
+             for cid in (new_group.member_ids if new_group else [])
+             if self._design.get(cid) and self._design.get(cid).ports),
+            None,
+        )
+        new_group_member_ids = set(new_group.member_ids) if new_group else set()
+        move_cmds = self._restore_connections_and_nudge(
+            conn_snap, new_anchor,
+            excluded_ids=new_group_member_ids,
+        )
+        if move_cmds:
+            batch = BatchCommand(
+                move_cmds,
+                f"Nudge {len(move_cmds)} neighbour(s) after cell param edit",
+            )
+            self._scene.cmd_stack.push(batch)
+
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
+
+    def _snapshot_anchor_connections(self, anchor) -> list:
+        """
+        Before a cell is replaced (which destroys all connections to old IDs),
+        snapshot every connection on *anchor* as a plain dict:
+
+            {
+              "port_name":      str,          # port name on the anchor ("entry", "exit", …)
+              "old_abs_x":      int,          # absolute scene X of the port before rebuild
+              "old_abs_y":      int,          # absolute scene Y of the port before rebuild
+              "nbr_comp_id":    str,          # the other component's ID
+              "nbr_port_id":    str,          # the other component's port ID
+            }
+
+        Returns an empty list if anchor is None or has no connections.
+        The snapshots survive the replace operation because they are plain dicts
+        keyed by neighbour IDs and port names — not live object references.
+        """
+        if anchor is None:
+            return []
+        port_by_id = {p.id: p for p in anchor.ports}
+        snaps = []
+        for cn in self._design.connections_for(anchor.id):
+            our_port_id = cn.port_a if cn.comp_a == anchor.id else cn.port_b
+            nbr_comp_id = cn.comp_b if cn.comp_a == anchor.id else cn.comp_a
+            nbr_port_id = cn.port_b if cn.comp_a == anchor.id else cn.port_a
+            port = port_by_id.get(our_port_id)
+            if port is None:
+                continue
+            abs_p = port.abs_pos(anchor.origin)
+            snaps.append({
+                "port_name":   port.name,
+                "old_abs_x":   abs_p.x,
+                "old_abs_y":   abs_p.y,
+                "nbr_comp_id": nbr_comp_id,
+                "nbr_port_id": nbr_port_id,
+            })
+        return snaps
+
+    def _restore_connections_and_nudge(
+        self,
+        conn_snap: list,
+        new_anchor,
+        excluded_ids: set,
+    ) -> list:
+        """
+        After a cell replace:
+          1. For each snapshotted connection, find the matching port on *new_anchor*
+             by port name.  Compute how far that port moved (new_abs − old_abs).
+          2. Re-establish the Connection record between the new anchor's port and
+             the neighbour's port (so the indicator dots reappear).
+          3. BFS-propagate the displacement to all transitively connected neighbours
+             that are not inside *excluded_ids* (the rebuilt cell's own members).
+
+        Returns a list of MoveComponent commands that were already executed
+        (for the caller to record on the undo stack).
+        """
+        if not conn_snap or new_anchor is None:
+            return []
+
+        new_port_by_name = {p.name: p for p in new_anchor.ports}
+        move_cmds = []
+
+        from collections import deque
+
+        for snap in conn_snap:
+            new_port = new_port_by_name.get(snap["port_name"])
+            if new_port is None:
+                continue
+
+            new_abs = new_port.abs_pos(new_anchor.origin)
+            dx = new_abs.x - snap["old_abs_x"]
+            dy = new_abs.y - snap["old_abs_y"]
+
+            # Re-establish the connection on the new anchor component
+            nbr_comp_id = snap["nbr_comp_id"]
+            nbr_port_id = snap["nbr_port_id"]
+            nbr = self._design.get(nbr_comp_id)
+            if nbr is not None:
+                self._design.connect(
+                    new_anchor.id, new_port.id,
+                    nbr_comp_id,   nbr_port_id,
+                )
+
+            if dx == 0 and dy == 0:
+                continue  # port didn't move — no nudge needed
+
+            # BFS: push every transitively connected neighbour by (dx, dy),
+            # skipping the rebuilt cell's own members.
+            visited: set[str] = set(excluded_ids) | {new_anchor.id}
+            queue: deque[str] = deque()
+            if nbr_comp_id not in visited:
+                queue.append(nbr_comp_id)
+
+            while queue:
+                cid = queue.popleft()
+                if cid in visited:
+                    continue
+                visited.add(cid)
+
+                comp = self._design.get(cid)
+                if comp is None:
+                    continue
+
+                grp = self._design.group_of(cid)
+                if grp is not None:
+                    # Move all group members together
+                    member_ids_set = set(grp.member_ids)
+                    if member_ids_set & excluded_ids:
+                        continue  # group contains rebuilt cell — skip
+                    for mid in grp.member_ids:
+                        m = self._design.get(mid)
+                        if m is None:
+                            continue
+                        old_orig = m.origin
+                        new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                        mc = MoveComponent(mid, old_orig, new_orig)
+                        mc.execute(self._design)
+                        move_cmds.append(mc)
+                        m_item = self._scene.item_for(mid)
+                        if m_item:
+                            m_item.sync_from_model()
+                    if hasattr(grp, "_cell_origin") and grp._cell_origin is not None:
+                        o = grp._cell_origin
+                        grp._cell_origin = Point(o.x + dx, o.y + dy)
+                    visited.update(member_ids_set)
+                    for mid in grp.member_ids:
+                        for cn in self._design.connections_for(mid):
+                            nxt = cn.comp_b if cn.comp_a == mid else cn.comp_a
+                            if nxt not in visited:
+                                queue.append(nxt)
+                else:
+                    old_orig = comp.origin
+                    new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                    mc = MoveComponent(cid, old_orig, new_orig)
+                    mc.execute(self._design)
+                    move_cmds.append(mc)
+                    comp_item = self._scene.item_for(cid)
+                    if comp_item:
+                        comp_item.sync_from_model()
+                    for cn in self._design.connections_for(cid):
+                        nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
+                        if nxt not in visited:
+                            queue.append(nxt)
+
+        # Sync the new anchor's canvas item so port indicators refresh
+        anchor_item = self._scene.item_for(new_anchor.id)
+        if anchor_item:
+            anchor_item.sync_from_model()
+
+        return move_cmds
 
     @pyqtSlot(str)
     def _on_item_hovered(self, comp_id: str) -> None:
@@ -609,14 +816,170 @@ class MainWindow(QMainWindow):
             return
         if getattr(comp, field, None) == value_dbu:
             return
-        self._scene.cmd_stack.execute(EditComponent(comp, **{field: value_dbu}))
+
+        # ── Snapshot absolute port positions BEFORE the edit ─────────────────
+        # For every connection on the edited component, record the current
+        # absolute scene position of OUR port so we can compute how far it
+        # moved after the resize.
+        #
+        # pre_ports[our_port_id] = (old_abs_x, old_abs_y)
+        port_map_before = {p.id: p for p in comp.ports}
+        pre_ports: dict[str, tuple[int, int]] = {
+            pid: (p.abs_pos(comp.origin).x, p.abs_pos(comp.origin).y)
+            for pid, p in port_map_before.items()
+        }
+
+        # ── Execute the geometry edit ─────────────────────────────────────────
+        edit_cmd = EditComponent(comp, **{field: value_dbu})
+        edit_cmd.execute(self._design)
+
+        # Sync the edited component's canvas item — this calls rebuild_ports()
+        # which recomputes port offsets to match the new bbox.
         item = self._scene.item_for(comp_id)
         if item:
             item.sync_from_model()
-        # Do NOT call show_component here — it would setValue() on spinboxes
-        # that didn't fire, causing Qt to shift focus away from the active
-        # spinbox and ultimately deselect the canvas item.
-        self._flash_status(f"{field.replace('_', ' ').title()} -> {value_dbu / 1000:.3f} µm")
+
+        # ── BFS wave propagation: push every transitively connected neighbour ──
+        #
+        # Wave entries: (src_comp_id, dx, dy)
+        #   src_comp_id — the component whose ports we just moved / will move
+        #   dx, dy      — the displacement already applied to src_comp
+        #
+        # visited tracks component IDs that have already been assigned a
+        # displacement so we never move anything twice and never loop back to
+        # the edited component.
+        #
+        # For each wave entry we inspect every connection on src_comp.  If the
+        # port on src_comp's side moved by (dx, dy), the neighbour must be
+        # translated by the same (dx, dy) to keep the ports touching.
+        #
+        # When the neighbour belongs to a group, ALL group members are shifted
+        # together — otherwise the group becomes internally inconsistent and the
+        # group bounding box jumps on the next repaint.
+
+        move_cmds: list = []          # Command objects for the undo batch
+        visited: set[str] = {comp_id}  # don't move the edited comp
+
+        # Seed: collect (neighbour_comp_id, dx, dy) from the edited comp's ports
+        from collections import deque
+        queue: deque[tuple[str, int, int]] = deque()
+
+        port_map_after = {p.id: p for p in comp.ports}
+        for cn in self._design.connections_for(comp_id):
+            our_port_id = cn.port_a if cn.comp_a == comp_id else cn.port_b
+            nbr_comp_id = cn.comp_b if cn.comp_a == comp_id else cn.comp_a
+
+            port_after = port_map_after.get(our_port_id)
+            if port_after is None:
+                continue
+            old_x, old_y = pre_ports.get(our_port_id, (0, 0))
+            new_abs = port_after.abs_pos(comp.origin)
+            dx = new_abs.x - old_x
+            dy = new_abs.y - old_y
+            if dx == 0 and dy == 0:
+                continue  # this port didn't move — no push needed
+
+            if nbr_comp_id not in visited:
+                queue.append((nbr_comp_id, dx, dy))
+
+        while queue:
+            nbr_comp_id, dx, dy = queue.popleft()
+            if nbr_comp_id in visited:
+                continue
+            visited.add(nbr_comp_id)
+
+            nbr = self._design.get(nbr_comp_id)
+            if nbr is None:
+                continue
+
+            # Determine whether this component is part of a group.
+            # If so, move ALL group members together so the group stays intact.
+            group = self._design.group_of(nbr_comp_id)
+
+            if group is not None:
+                # Collect all live group members (the group may contain stale IDs)
+                members = [
+                    self._design.get(cid)
+                    for cid in group.member_ids
+                    if self._design.get(cid) is not None
+                ]
+                # Don't move a group that contains the edited component itself.
+                member_ids_set = {m.id for m in members}
+                if comp_id in member_ids_set:
+                    continue
+
+                # Apply the move to each member
+                per_member_cmds = []
+                for m in members:
+                    old_orig = m.origin
+                    new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                    mc = MoveComponent(m.id, old_orig, new_orig)
+                    mc.execute(self._design)
+                    per_member_cmds.append(mc)
+
+                    m_item = self._scene.item_for(m.id)
+                    if m_item:
+                        m_item.sync_from_model()
+
+                # Keep _cell_origin in sync (MoveGroup does this; replicate it)
+                if hasattr(group, "_cell_origin") and group._cell_origin is not None:
+                    o = group._cell_origin
+                    group._cell_origin = Point(o.x + dx, o.y + dy)
+
+                move_cmds.extend(per_member_cmds)
+
+                # Mark ALL group members visited so they aren't moved again.
+                visited.update(member_ids_set)
+
+                # Propagate further: for every connection on every group member,
+                # check whether the connected component (outside this group)
+                # needs to be pushed by the same (dx, dy).
+                for m in members:
+                    for cn in self._design.connections_for(m.id):
+                        next_comp_id = cn.comp_b if cn.comp_a == m.id else cn.comp_a
+                        if next_comp_id not in visited:
+                            queue.append((next_comp_id, dx, dy))
+
+            else:
+                # Standalone component — move only it
+                old_orig = nbr.origin
+                new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                mc = MoveComponent(nbr_comp_id, old_orig, new_orig)
+                mc.execute(self._design)
+                move_cmds.append(mc)
+
+                nbr_item = self._scene.item_for(nbr_comp_id)
+                if nbr_item:
+                    nbr_item.sync_from_model()
+
+                # Propagate further: push components connected to this neighbour
+                # by the same delta (rigid chain — the whole chain shifts together).
+                for cn in self._design.connections_for(nbr_comp_id):
+                    next_comp_id = cn.comp_b if cn.comp_a == nbr_comp_id else cn.comp_a
+                    if next_comp_id not in visited:
+                        queue.append((next_comp_id, dx, dy))
+
+        # ── Push a single undoable batch onto the command stack ───────────────
+        # All moves were applied directly above to avoid double-execution.
+        # cmd_stack.push() records commands for undo without re-running them.
+        all_cmds = [edit_cmd] + move_cmds
+        if len(all_cmds) == 1:
+            self._scene.cmd_stack.push(edit_cmd)
+        else:
+            n_shapes = len({
+                mc._comp_id if isinstance(mc, MoveComponent) else "?"
+                for mc in move_cmds
+            })
+            batch = BatchCommand(
+                all_cmds,
+                f"Resize {field} + nudge {n_shapes} connected shape(s)",
+            )
+            self._scene.cmd_stack.push(batch)
+
+        self._flash_status(
+            f"{field.replace('_', ' ').title()} → {value_dbu / 1000:.3f} µm"
+            + (f"  · nudged {len(move_cmds)} connected shape(s)" if move_cmds else "")
+        )
 
     @pyqtSlot(float)
     def _on_zoom_changed(self, zoom: float) -> None:

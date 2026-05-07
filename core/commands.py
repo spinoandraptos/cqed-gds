@@ -838,6 +838,18 @@ class CommandStack:
         self._redo_stack.clear()
         self._notify()
 
+    def push(self, cmd: Command) -> None:
+        """
+        Record *cmd* on the undo stack WITHOUT executing it.
+
+        Use this when the caller has already applied the command's effects
+        directly (to avoid double-execution) but still wants undo support.
+        Clears the redo stack and notifies listeners, exactly like execute().
+        """
+        self._undo_stack.append(cmd)
+        self._redo_stack.clear()
+        self._notify()
+
     def undo(self) -> Optional[str]:
         if not self._undo_stack:
             return None
