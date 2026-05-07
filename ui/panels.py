@@ -996,6 +996,8 @@ class ComponentPalette(QWidget):
         seen: list[str] = []
         by_cat: dict[str, list] = {}
         for cdef in CELL_CATALOGUE:
+            if cdef.cell_id == "undercut_ring":
+                continue
             if cdef.category not in by_cat:
                 seen.append(cdef.category)
                 by_cat[cdef.category] = []
@@ -1384,7 +1386,7 @@ class PropertiesPanel(QWidget):
         row = QWidget()
         vl  = QVBoxLayout(row)
         vl.setContentsMargins(0, 6, 0, 6)
-        vl.setSpacing(6)
+        vl.setSpacing(20)
 
         btn = QPushButton("Generate Undercut")
         btn.setCheckable(True)
@@ -1554,6 +1556,7 @@ class PropertiesPanel(QWidget):
         hl.addWidget(self._grp_name_lbl)
         hl.addWidget(self._grp_meta_lbl)
         hl.addWidget(self._grp_bbox_lbl)
+        hl.addSpacing(10)
         self._grp_undercut_row = self._make_undercut_row(shared=False)
         hl.addWidget(self._grp_undercut_row)
         root.addWidget(self._grp_header)
