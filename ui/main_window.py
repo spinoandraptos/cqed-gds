@@ -61,6 +61,9 @@ class MainWindow(QMainWindow):
         # by group_selected after a param edit) from firing cell_param_change_requested
         # a second time for the same action and corrupting the canvas.
         self._param_edit_in_progress: bool = False
+        # Keep a live reference to any open sweep dialog (WA_DeleteOnClose +
+        # destroyed signal clears this automatically when the dialog closes).
+        self._open_sweep_dlg = None
 
         self._scene = CanvasScene(self._design)
         self._view  = CanvasView(self._scene)
@@ -1474,25 +1477,37 @@ class MainWindow(QMainWindow):
           1. A parametric cell group  → CellSweepDialog
           2. A user-drawn group       → GroupSweepDialog
           3. A single loose component → SweepDialog
+
+        Shown as a non-modal Tool window so it floats freely without blocking
+        or minimising the main window.
         """
+        # Raise existing dialog instead of stacking a second one.
+        if self._open_sweep_dlg is not None:
+            self._open_sweep_dlg.raise_()
+            self._open_sweep_dlg.activateWindow()
+            return
+
         group = self._resolve_sweep_group()
 
         if group is not None:
             if getattr(group, "cell_id", None):
-                CellSweepDialog(group, self._design, self._scene, self).exec()
+                dlg = CellSweepDialog(group, self._design, self._scene, self)
             else:
-                GroupSweepDialog(group, self._design, self._scene, self).exec()
-            return
+                dlg = GroupSweepDialog(group, self._design, self._scene, self)
+        else:
+            selected = [
+                item.component
+                for item in self._scene.selectedItems()
+                if hasattr(item, "component")
+            ]
+            if len(selected) != 1:
+                QMessageBox.information(self, "Sweep", "Select exactly one component or group to sweep.")
+                return
+            dlg = SweepDialog(selected[0], self._design, self._scene.cmd_stack, self)
 
-        selected = [
-            item.component
-            for item in self._scene.selectedItems()
-            if hasattr(item, "component")
-        ]
-        if len(selected) != 1:
-            QMessageBox.information(self, "Sweep", "Select exactly one component or group to sweep.")
-            return
-        SweepDialog(selected[0], self._design, self._scene.cmd_stack, self).exec()
+        self._open_sweep_dlg = dlg
+        dlg.destroyed.connect(lambda: setattr(self, "_open_sweep_dlg", None))
+        dlg.show()
 
     def _resolve_sweep_group(self):
         """

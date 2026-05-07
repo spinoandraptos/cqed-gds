@@ -160,6 +160,8 @@ class SweepDialog(QDialog):
         self._cmd_stack = cmd_stack
 
         self.setWindowTitle("Array / Parameter Sweep")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowCloseButtonHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setMinimumWidth(420)
         self.setStyleSheet(f"background: {_BG}; color: {_TEXT};")
         self._build_ui()
@@ -437,6 +439,8 @@ class GroupSweepDialog(QDialog):
         self._is_cell_mode: bool   = any(sg.get("cell_id") for sg in self._cell_subgroups)
 
         self.setWindowTitle("Group Array / Parameter Sweep")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowCloseButtonHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setMinimumWidth(480)
         self.setStyleSheet(f"background: {_BG}; color: {_TEXT};")
         self._build_ui()
@@ -496,7 +500,7 @@ class GroupSweepDialog(QDialog):
 
         # Target picker — cells in cell mode, raw members otherwise
         self._target_combo = QComboBox()
-        self._target_combo.setFixedWidth(240)
+        self._target_combo.setFixedWidth(360)
         self._target_combo.setStyleSheet(_combo_style())
 
         if self._is_cell_mode:
@@ -509,8 +513,18 @@ class GroupSweepDialog(QDialog):
                 self._target_combo.addItem(label, i)   # data = subgroup index
             row(5, "Target cell", self._target_combo)
         else:
-            for comp in self._members:
-                label = f"{comp.kind.name.capitalize()}  ·  {comp.id}  (layer {comp.layer})"
+            for i, comp in enumerate(self._members):
+                bb    = comp.bbox
+                cx_um = dbu_to_um((bb.x_min + bb.x_max) // 2)
+                cy_um = dbu_to_um((bb.y_min + bb.y_max) // 2)
+                w_um  = dbu_to_um(bb.width)
+                h_um  = dbu_to_um(bb.height)
+                label = (
+                    f"#{i+1}  {comp.kind.name.capitalize()}"
+                    f"  L{comp.layer}"
+                    f"  @({cx_um:.2f}, {cy_um:.2f})µm"
+                    f"  {w_um:.2f}×{h_um:.2f}µm"
+                )
                 self._target_combo.addItem(label, comp.id)
             row(5, "Target member", self._target_combo)
 
@@ -568,41 +582,36 @@ class GroupSweepDialog(QDialog):
 
     def _highlight_target(self) -> None:
         """
-        Beacon-highlight the currently selected target on the canvas.
+        Beacon-highlight the selected target on the canvas and scroll to it.
 
-        Raw mode  — highlight the single selected GDSComponent via the scene's
-                    public highlight_component() API (handles scroll too).
-        Cell mode — highlight every component in the selected subgroup by
-                    calling set_panel_highlight() directly on each scene item,
-                    then scroll to the first live member.
-
-        Calling with nothing selected clears all highlights.
+        Raw mode  — single component: use scene.highlight_component() which
+                    handles the amber beacon + ensureVisible in one call.
+        Cell mode — multiple components per subgroup: call set_panel_highlight()
+                    directly on each scene item, then use highlight_component()
+                    for the scroll side-effect only, then re-apply the beacon to
+                    all remaining members (highlight_component clears others).
         """
-        # Always clear any previously multi-highlighted items first.
         self._clear_highlight()
 
         if self._is_cell_mode:
             sg = self._current_subgroup()
             if not sg:
                 return
-            member_ids = [cid for cid in sg.get("member_ids", [])
-                          if self._design.get(cid)]
-            if not member_ids:
+            live_ids = [cid for cid in sg.get("member_ids", [])
+                        if self._design.get(cid)]
+            if not live_ids:
                 return
-            # Highlight every member item directly (scene only exposes single-ID API)
             items_map = getattr(self._scene, "_items", {})
-            for cid in member_ids:
+            # Use the public API for scroll-to-view (fires on first member)
+            self._scene.highlight_component(live_ids[0])
+            # Re-highlight every member including the first (highlight_component
+            # leaves only the tracked one lit; we want all of them)
+            for cid in live_ids:
                 item = items_map.get(cid)
                 if item is not None:
                     item.set_panel_highlight(True)
-            # Scroll the first member into view
-            self._scene.highlight_component(member_ids[0])
-            # highlight_component clears others — re-apply the rest
-            for cid in member_ids[1:]:
-                item = items_map.get(cid)
-                if item is not None:
-                    item.set_panel_highlight(True)
-            self._scene._highlighted_comp_id = member_ids[0]
+            # Keep the scene's internal tracker consistent
+            self._scene._highlighted_comp_id = live_ids[0]
         else:
             comp = self._target_comp()
             if comp:
@@ -610,10 +619,9 @@ class GroupSweepDialog(QDialog):
 
     def _clear_highlight(self) -> None:
         """Remove all sweep-dialog highlights from the canvas."""
-        # Clear any single-tracked highlight
-        if hasattr(self._scene, "highlight_component"):
-            self._scene.highlight_component("")
-        # Also sweep all items in case we set multi-member highlights directly
+        # Clear the scene's tracked single highlight
+        self._scene.highlight_component("")
+        # Also clear any directly-set multi-member highlights
         items_map = getattr(self._scene, "_items", {})
         for item in items_map.values():
             if getattr(item, "_panel_highlighted", False):
@@ -1116,6 +1124,8 @@ class CellSweepDialog(QDialog):
         self._current_params.update(stored)
 
         self.setWindowTitle(f"Cell Array Sweep — {self._cdef.name}")
+        self.setWindowFlags(Qt.WindowType.Tool | Qt.WindowType.WindowCloseButtonHint)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
         self.setMinimumWidth(420)
         self.setStyleSheet(f"background: {self._BG}; color: {self._TEXT};")
         self._build_ui()
