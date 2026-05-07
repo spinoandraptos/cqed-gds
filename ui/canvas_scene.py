@@ -363,7 +363,9 @@ class GroupItem(QGraphicsItem):
             if multi:
                 self.setSelected(not self.isSelected())
             elif not self.isSelected():
+                self._scene_ref.blockSignals(True)
                 self._scene_ref.clearSelection()
+                self._scene_ref.blockSignals(False)
                 self.setSelected(True)
             self._scene_ref._on_group_press(self, event)
             event.accept()
@@ -390,10 +392,6 @@ class GroupItem(QGraphicsItem):
             return
         event.accept()
 
-    def mouseDoubleClickEvent(self, event) -> None:
-        self.enter_edit_mode()
-        self._scene_ref.group_edit_entered.emit(self._group.id)
-        event.accept()
 
 
 # ── Component graphics item ───────────────────────────────────────────────────
@@ -979,7 +977,6 @@ class CanvasScene(QGraphicsScene):
         comp_item = self._hit_component_item(event.scenePos())
         if comp_item is not None:
             self._on_item_press(comp_item, event)
-            super().mousePressEvent(event)
             return
 
         group_item = self._hit_group_item(event.scenePos())
@@ -1051,25 +1048,18 @@ class CanvasScene(QGraphicsScene):
         multi = bool(event.modifiers() & (
             Qt.KeyboardModifier.ControlModifier | Qt.KeyboardModifier.ShiftModifier
         ))
-        self.blockSignals(True)
-        try:
-            if multi:
-                item.setSelected(not item.isSelected())
-            elif not item.isSelected():
-                self.clearSelection()
-                item.setSelected(True)
-        finally:
+        if multi:
+            item.setSelected(not item.isSelected())
+        elif not item.isSelected():
+            # Block signals during clearSelection so the intermediate
+            # "0 items selected" state never fires selectionChanged and
+            # clears the properties panel before setSelected re-fills it.
+            self.blockSignals(True)
+            self.clearSelection()
             self.blockSignals(False)
+            item.setSelected(True)   # fires selectionChanged once, with final state
 
         self._arm_unified_drag(event)
-
-        comp_items = [i for i in self.selectedItems() if isinstance(i, ComponentItem)]
-        if not comp_items:
-            self.item_selected.emit("")
-        elif len(comp_items) == 1:
-            self.item_selected.emit(comp_items[0].component.id)
-        else:
-            self.multi_selection_changed.emit([i.component.id for i in comp_items])
 
     def _on_group_press(self, gi: GroupItem, event) -> None:
         """Called by GroupItem.mousePressEvent — arms unified drag from a group press."""
