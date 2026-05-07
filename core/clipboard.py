@@ -128,8 +128,15 @@ class Clipboard:
             new_group.id         = uuid.uuid4().hex[:8]
             new_group.member_ids = [id_map.get(oid, oid)
                                     for oid in new_group.member_ids]
-            # Preserve cell metadata if present (set by PlaceCellCommand)
-            # deepcopy carries dynamic attrs automatically, so nothing extra needed.
+            # Preserve cell metadata if present (set by PlaceCellCommand).
+            # deepcopy carries dynamic attrs automatically, BUT _cell_subgroups
+            # contains its own "member_ids" lists that must also be remapped —
+            # otherwise param edits on pasted cells look up stale (pre-paste)
+            # component IDs, find nothing, and place a duplicate at the origin.
+            for sg in getattr(new_group, "_cell_subgroups", []):
+                if "member_ids" in sg:
+                    sg["member_ids"] = [id_map.get(oid, oid)
+                                        for oid in sg["member_ids"]]
 
         return pasted, new_group
 

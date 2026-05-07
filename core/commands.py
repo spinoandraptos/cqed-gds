@@ -13,6 +13,7 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
+import copy as _copy
 
 from core.model import DesignScene, GDSComponent, Point, Connection, ComponentGroup
 from core.cell_library import CellResult, PortSide
@@ -981,7 +982,7 @@ class ReplaceCellCmd:
         self._old_group_id = old_group_id
         self._old_group_name = old_group_name
         self._old_comp_ids = old_comp_ids
-        self._old_comps = old_comps
+        self._old_comps = [_copy.deepcopy(c) for c in old_comps]
         self._cell_origin = cell_origin
         self._rotation_steps = rotation_steps % 4
         self._old_bbox_centre = old_bbox_centre  # (cx, cy) DBU, snapshotted before removal

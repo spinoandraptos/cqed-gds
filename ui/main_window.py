@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Optional
+import copy as _copy
 
 import qtawesome as qta
 from PyQt6.QtCore import Qt, QSize, QTimer, pyqtSlot
@@ -56,6 +57,10 @@ class MainWindow(QMainWindow):
         self._design            = DesignScene(name="layout")
         self._current_file:     Optional[Path] = None
         self._selected_group_id: Optional[str] = None
+        # Re-entrancy guard: prevents the panel's spinbox repopulation (triggered
+        # by group_selected after a param edit) from firing cell_param_change_requested
+        # a second time for the same action and corrupting the canvas.
+        self._param_edit_in_progress: bool = False
 
         self._scene = CanvasScene(self._design)
         self._view  = CanvasView(self._scene)
@@ -403,6 +408,22 @@ class MainWindow(QMainWindow):
         After either replace command executes, connected neighbours are nudged
         to stay aligned with the new port positions on the rebuilt anchor.
         """
+        # Guard against re-entrant calls: when we re-select the new GroupItem after
+        # replacing a cell, show_group() repopulates spinboxes via setValue(), which
+        # fires valueChanged → cell_param_change_requested again with the current
+        # (already-committed) value.  That second invocation would run another
+        # ReplaceCellCmd on the already-updated model, duplicating components.
+        if self._param_edit_in_progress:
+            return
+        self._param_edit_in_progress = True
+        try:
+            self._do_cell_param_change(group_id, cell_id_encoded, param_key, new_value)
+        finally:
+            self._param_edit_in_progress = False
+
+    def _do_cell_param_change(self, group_id: str, cell_id_encoded: str,
+                               param_key: str, new_value) -> None:
+        """Inner body of _on_cell_param_change_requested — never re-entered."""
         group = self._design.get_group(group_id)
         if group is None:
             return
@@ -648,7 +669,10 @@ class MainWindow(QMainWindow):
         origin = getattr(group, "_cell_origin", None)
 
         old_comp_ids   = list(group.member_ids)
-        old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
+        # ✅ Deep-copy here so ReplaceCellCmd.undo() restores clean snapshots,
+        # and live objects aren't re-observed by the scene after removal.
+        old_comps      = [_copy.deepcopy(c) for c in
+                        (self._design.get(cid) for cid in old_comp_ids) if c]
         old_group_name = group.name
 
         # Snapshot connections on the old anchor BEFORE removal destroys them.
@@ -825,13 +849,39 @@ class MainWindow(QMainWindow):
             return None, None
 
         move_cmds = []
-        # Single shared visited set — prevents double-moving any neighbour
-        # when multiple snapshotted ports happen to push it by the same delta.
+        # visited tracks every component ID that has already been moved (or
+        # deliberately skipped) so no component is moved more than once.
+        # Seeded with the rebuilt cell's own members so we never move them.
         visited: set[str] = set(excluded_ids)
 
-        # Collect all (nbr, dx, dy, src_member, new_port) tuples first so we
-        # can re-establish connections even for zero-displacement ports.
-        pending: list[tuple] = []
+        from collections import deque
+
+        # BFS queue entries: (comp_id, dx, dy)
+        #
+        # CRITICAL — dx/dy are recomputed at each hop from live port geometry,
+        # NOT inherited blindly from the parent entry.
+        #
+        # Naive inheritance causes the following bug:
+        #   - Port A on the rebuilt cell moved by (dx, dy).
+        #   - Neighbour N is directly wired to port A → correctly nudged by (dx, dy).
+        #   - N also has port B wired to unrelated cell U.
+        #   - BFS enqueues U with the same (dx, dy) even though port B never moved.
+        #   - U gets dragged along, appearing to "join" the rebuilt cell's group.
+        #
+        # Instead: when we enqueue a downstream neighbour, compute dx/dy from the
+        # displacement of the SPECIFIC port on the just-moved component that connects
+        # to that downstream neighbour.  If that port didn't move (displacement = 0),
+        # we do NOT enqueue the downstream neighbour for a physical move — though we
+        # still re-establish the connection record so indicator dots stay accurate.
+        #
+        # "old_abs" for intermediate hops is the pre-nudge position of that port,
+        # which is its current position BEFORE the move is applied (we read it just
+        # before calling move_by).
+
+        # Pass 1 — handle the rebuilt cell's direct connections.
+        # These are the only entries where we know old_abs from the snapshot.
+        queue: deque[tuple[str, int, int]] = deque()
+
         for snap in conn_snap:
             src_member, new_port = _find_port_by_name(snap["port_name"])
             if new_port is None:
@@ -854,11 +904,9 @@ class MainWindow(QMainWindow):
             if dx == 0 and dy == 0:
                 continue  # port didn't move — connection restored, no nudge
 
-            pending.append((nbr_comp_id, dx, dy))
+            queue.append((nbr_comp_id, dx, dy))
 
-        # BFS over all pending nudges using the shared visited set.
-        queue: deque[tuple[str, int, int]] = deque(pending)
-
+        # Pass 2 — BFS, propagating only through ports that actually moved.
         while queue:
             cid, dx, dy = queue.popleft()
             if cid in visited:
@@ -871,10 +919,21 @@ class MainWindow(QMainWindow):
 
             grp = self._design.group_of(cid)
             if grp is not None:
-                # Move all group members together
                 member_ids_set = set(grp.member_ids)
                 if member_ids_set & excluded_ids:
                     continue  # group contains rebuilt cell — skip
+
+                # Snapshot all member port positions BEFORE the move so we can
+                # compute per-port displacements for downstream propagation.
+                pre_abs: dict[tuple[str, str], tuple[int, int]] = {}
+                for mid in grp.member_ids:
+                    m = self._design.get(mid)
+                    if m is None:
+                        continue
+                    for p in m.ports:
+                        abs_p = p.abs_pos(m.origin)
+                        pre_abs[(mid, p.id)] = (abs_p.x, abs_p.y)
+
                 for mid in grp.member_ids:
                     m = self._design.get(mid)
                     if m is None:
@@ -887,16 +946,45 @@ class MainWindow(QMainWindow):
                     m_item = self._scene.item_for(mid)
                     if m_item:
                         m_item.sync_from_model()
+
                 if hasattr(grp, "_cell_origin") and grp._cell_origin is not None:
                     o = grp._cell_origin
                     grp._cell_origin = Point(o.x + dx, o.y + dy)
                 visited.update(member_ids_set)
+
+                # Propagate downstream: for each connection on each group member,
+                # compute the displacement of THAT specific port after the move.
+                # Only enqueue if that port actually moved (prevents dragging
+                # components wired to ports that were stationary).
                 for mid in grp.member_ids:
+                    m = self._design.get(mid)
+                    if m is None:
+                        continue
+                    port_map = {p.id: p for p in m.ports}
                     for cn in self._design.connections_for(mid):
                         nxt = cn.comp_b if cn.comp_a == mid else cn.comp_a
-                        if nxt not in visited:
-                            queue.append((nxt, dx, dy))
+                        if nxt in visited:
+                            continue
+                        our_port_id = cn.port_a if cn.comp_a == mid else cn.port_b
+                        port = port_map.get(our_port_id)
+                        if port is None:
+                            continue
+                        old_x, old_y = pre_abs.get((mid, our_port_id), (None, None))
+                        if old_x is None:
+                            continue
+                        new_abs_p = port.abs_pos(m.origin)
+                        ndx = new_abs_p.x - old_x
+                        ndy = new_abs_p.y - old_y
+                        if ndx != 0 or ndy != 0:
+                            queue.append((nxt, ndx, ndy))
+
             else:
+                # Snapshot port positions BEFORE the move.
+                pre_abs_comp: dict[str, tuple[int, int]] = {}
+                for p in comp.ports:
+                    abs_p = p.abs_pos(comp.origin)
+                    pre_abs_comp[p.id] = (abs_p.x, abs_p.y)
+
                 old_orig = comp.origin
                 new_orig = Point(old_orig.x + dx, old_orig.y + dy)
                 mc = MoveComponent(cid, old_orig, new_orig)
@@ -905,10 +993,25 @@ class MainWindow(QMainWindow):
                 comp_item = self._scene.item_for(cid)
                 if comp_item:
                     comp_item.sync_from_model()
+
+                # Propagate downstream using per-port displacement.
+                port_map = {p.id: p for p in comp.ports}
                 for cn in self._design.connections_for(cid):
                     nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
-                    if nxt not in visited:
-                        queue.append((nxt, dx, dy))
+                    if nxt in visited:
+                        continue
+                    our_port_id = cn.port_a if cn.comp_a == cid else cn.port_b
+                    port = port_map.get(our_port_id)
+                    if port is None:
+                        continue
+                    old_x, old_y = pre_abs_comp.get(our_port_id, (None, None))
+                    if old_x is None:
+                        continue
+                    new_abs_p = port.abs_pos(comp.origin)
+                    ndx = new_abs_p.x - old_x
+                    ndy = new_abs_p.y - old_y
+                    if ndx != 0 or ndy != 0:
+                        queue.append((nxt, ndx, ndy))
 
         # Sync all new member canvas items so port indicators refresh
         for member in all_new_members:
