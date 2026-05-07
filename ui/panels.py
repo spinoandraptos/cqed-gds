@@ -1250,15 +1250,33 @@ class PropertiesPanel(QWidget):
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Stack: page 0 = single component, page 1 = group, page 2 = multi ─
+        # ── Stack: page 0 = single component, page 1 = group, page 2 = multi,
+        #           page 3 = empty (nothing selected) ─────────────────────────
         from PyQt6.QtWidgets import QStackedWidget
         self._stack = QStackedWidget()
         self._stack.addWidget(self._build_single_page())
         self._stack.addWidget(self._build_group_page())
         self._stack.addWidget(self._build_multi_page())
+        self._stack.addWidget(self._build_empty_page())
         root.addWidget(self._stack)
 
         self.clear()
+
+    # ── Empty page (nothing selected) ────────────────────────────────────────
+
+    def _build_empty_page(self) -> QWidget:
+        page = QWidget()
+        page.setStyleSheet(f"background: {Colors.BG_SURFACE};")
+        lay = QVBoxLayout(page)
+        lay.setAlignment(Qt.AlignmentFlag.AlignCenter)
+
+        lbl = QLabel("No selection")
+        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_SM}px;"
+        )
+        lay.addWidget(lbl)
+        return page
 
     # ── Single-component page (identical to original) ─────────────────────────
 
@@ -1583,7 +1601,7 @@ class PropertiesPanel(QWidget):
     # ── Public API ────────────────────────────────────────────────────────────
 
     def clear(self) -> None:
-        self._stack.setCurrentIndex(0)
+        self._stack.setCurrentIndex(3)
         self._current_comp_id  = None
         self._current_group_id = None
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:

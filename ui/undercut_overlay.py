@@ -282,6 +282,11 @@ class UndercutOverlay:
         # When the global overlay is ON, items in this set stay hidden.
         self._excluded_ids: Set[str] = set()
 
+        # All comp/group IDs ever registered.  Used to distinguish "brand new,
+        # never seen → default to excluded" from "seen before, user may have
+        # explicitly included → do not touch _excluded_ids".
+        self._known_ids: Set[str] = set()
+
         # scene_changed covers all model mutations (add/remove/move/resize).
         # selectionChanged is intentionally NOT connected — rings are persistent.
         scene_ref.scene_changed.connect(self._on_scene_changed)
@@ -356,6 +361,20 @@ class UndercutOverlay:
         grouped_ids: Set[str] = set()
         for group in design.groups:
             grouped_ids.update(group.member_ids)
+
+        # Pre-register any brand-new component or group IDs as excluded BEFORE
+        # creating ring items, so is_excluded() always returns the correct
+        # "off by default" state.  _known_ids tracks every id ever seen, so we
+        # only default-exclude ids that are genuinely new — never re-excluding
+        # an id the user has explicitly enabled.
+        for comp in design.components:
+            if comp.id not in grouped_ids and comp.id not in self._known_ids:
+                self._known_ids.add(comp.id)
+                self._excluded_ids.add(comp.id)
+        for group in design.groups:
+            if group.id not in self._known_ids:
+                self._known_ids.add(group.id)
+                self._excluded_ids.add(group.id)
 
         # ── Per-component rings (ungrouped components only) ───────────────────
         live_comp_ids: Set[str] = set()
@@ -453,6 +472,23 @@ class UndercutOverlay:
         after moves, parameter edits, undo/redo, and component deletion.
         selectionChanged is intentionally NOT handled — rings are persistent.
         """
+        # Always pre-register any new component/group ids as excluded so that
+        # the Properties panel's is_excluded() call always returns the correct
+        # "off by default" state even when the overlay is globally disabled.
+        # _known_ids ensures we never re-exclude an id the user has enabled.
+        design = self._scene._design
+        grouped_ids: Set[str] = set()
+        for group in design.groups:
+            grouped_ids.update(group.member_ids)
+        for comp in design.components:
+            if comp.id not in grouped_ids and comp.id not in self._known_ids:
+                self._known_ids.add(comp.id)
+                self._excluded_ids.add(comp.id)
+        for group in design.groups:
+            if group.id not in self._known_ids:
+                self._known_ids.add(group.id)
+                self._excluded_ids.add(group.id)
+
         if not self._enabled:
             return
         self._rebuild_all()
