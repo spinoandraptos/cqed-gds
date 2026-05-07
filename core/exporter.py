@@ -119,6 +119,7 @@ def export_gds(
     design: DesignScene,
     path: str | Path,
     layer_map: LayerMap,
+    overlay=None,
     precision: float = 1e-9,   # 1 nm
     unit: float = 1e-6,        # µm
 ) -> dict:
@@ -165,6 +166,10 @@ def export_gds(
             if comp.id not in grouped_ids:
                 gds_layer, datatype = _resolve(comp.layer, layer_map)
                 _add_component(cell, comp, gds_layer, datatype)
+
+        # ── Emit undercut rings if overlay is active ──────────────────────────
+        if overlay is not None:
+            export_undercut_rings(cell, design, overlay, layer_map)
 
         lib.write_gds(str(path))
 
@@ -256,6 +261,114 @@ def _add_component(cell, comp: GDSComponent, gds_layer: int, datatype: int) -> N
         for pt in pts[1:]:
             fp.segment(pt)
         cell.add(fp)
+
+
+# ── Undercut ring export ──────────────────────────────────────────────────────
+
+# GDS layer written for undercut rings (matches the visual L2 convention).
+UNDERCUT_RING_LAYER = 2
+UNDERCUT_RING_DATATYPE = 0
+
+
+def export_undercut_rings(
+    cell,
+    design: DesignScene,
+    overlay,
+    layer_map: LayerMap,
+    gds_layer: int = UNDERCUT_RING_LAYER,
+    datatype: int = UNDERCUT_RING_DATATYPE,
+) -> int:
+    """
+    Compute and emit undercut ring polygons for all non-excluded objects.
+
+    The ring is built the same way as the visual overlay:
+      1. Collect the filled shape polygon(s) for the object (or union of group members).
+      2. Offset outward by overlay.offset_um using gdstk.offset().
+      3. Boolean-subtract the original shape → hollow ring.
+
+    Ungrouped components and groups are handled separately so that group
+    members are unioned first (matching the visual overlay behaviour).
+
+    Returns the number of ring shapes added to the cell.
+    """
+    if not overlay.is_enabled:
+        return 0
+
+    offset_um = overlay.offset_um
+    added = 0
+
+    grouped_ids: Set[str] = set()
+    for group in design.groups:
+        grouped_ids.update(group.member_ids)
+
+    comp_map = {c.id: c for c in design.components}
+
+    # ── Groups ────────────────────────────────────────────────────────────────
+    for group in design.groups:
+        if overlay.is_excluded(group.id):
+            continue
+
+        members = [comp_map[cid] for cid in group.member_ids if cid in comp_map]
+        if not members:
+            continue
+
+        # Union all member shapes (any layer) into one base polygon set.
+        base_polys: list[gdstk.Polygon] = []
+        for comp in members:
+            # Use layer/datatype=0 here — only geometry matters for the ring.
+            base_polys.extend(_comp_to_gdstk_polys(comp, 0, 0))
+
+        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype)
+        if ring_polys:
+            cell.add(*ring_polys)
+            added += len(ring_polys)
+
+    # ── Ungrouped components ──────────────────────────────────────────────────
+    for comp in design.components:
+        if comp.id in grouped_ids:
+            continue
+        if overlay.is_excluded(comp.id):
+            continue
+
+        base_polys = _comp_to_gdstk_polys(comp, 0, 0)
+        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype)
+        if ring_polys:
+            cell.add(*ring_polys)
+            added += len(ring_polys)
+
+    return added
+
+
+def _build_gdstk_ring(
+    base_polys: list,
+    offset_um: float,
+    gds_layer: int,
+    datatype: int,
+) -> list:
+    """
+    Given a list of gdstk.Polygon objects representing the filled base shape,
+    return the ring = expanded_outline − base_shape as a list of Polygons.
+    """
+    if not base_polys:
+        return []
+
+    # Step 1: union the base shapes so overlapping members don't double-expand.
+    if len(base_polys) > 1:
+        unioned = gdstk.boolean(base_polys, [], "or", layer=0, datatype=0)
+    else:
+        unioned = list(base_polys)
+
+    if not unioned:
+        return []
+
+    # Step 2: offset outward by offset_um.
+    expanded = gdstk.offset(unioned, offset_um, join="miter", tolerance=0.01)
+    if not expanded:
+        return []
+
+    # Step 3: subtract original → hollow ring.
+    ring = gdstk.boolean(expanded, unioned, "not", layer=gds_layer, datatype=datatype)
+    return ring if ring else []
 
 
 # ── Verification ──────────────────────────────────────────────────────────────

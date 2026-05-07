@@ -1232,6 +1232,9 @@ class PropertiesPanel(QWidget):
     # Emitted when a cell-group parameter spinbox changes:
     # (group_id, cell_id, param_key, new_value_as_float_or_str)
     cell_param_change_requested = pyqtSignal(str, str, str, object)
+    # Emitted when the per-object undercut toggle changes: (obj_id, excluded: bool)
+    # (obj_id, value) — value is bool (excluded) for objects, float (µm) for "__offset__"
+    undercut_exclusion_changed = pyqtSignal(str, object)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1311,6 +1314,11 @@ class PropertiesPanel(QWidget):
         self._row_connections = ValueRow("Connected")
         cl.addWidget(self._row_connections)
 
+        cl.addWidget(Separator())
+        cl.addWidget(SectionLabel("Undercut Ring"))
+        self._undercut_row = self._make_undercut_row()
+        cl.addWidget(self._undercut_row)
+
         cl.addStretch()
 
         scroll = QScrollArea()
@@ -1363,6 +1371,155 @@ class PropertiesPanel(QWidget):
         layout.addWidget(row)
         return row, sb
 
+    def _make_undercut_row(self, shared: bool = True) -> QWidget:
+        """
+        Build the undercut ring toggle + offset spinbox widget.
+
+        shared=True  → stores widgets as self._uc_btn / self._uc_spin
+                        (used by the single-component page).
+        shared=False → stores widgets as self._grp_uc_btn / self._grp_uc_spin
+                        (used by the group page header).
+        Returns the outer QWidget.
+        """
+        row = QWidget()
+        vl  = QVBoxLayout(row)
+        vl.setContentsMargins(0, 6, 0, 6)
+        vl.setSpacing(6)
+
+        btn = QPushButton("Generate Undercut")
+        btn.setCheckable(True)
+        btn.setChecked(False)
+        btn.setFixedHeight(24)
+        btn.setEnabled(False)
+        btn.setStyleSheet(self._uc_btn_style(False))
+
+        # Offset row: label + spinbox side by side
+        offset_row = QWidget()
+        hl = QHBoxLayout(offset_row)
+        hl.setContentsMargins(0, 0, 0, 0)
+        hl.setSpacing(8)
+        hl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+
+        uc_lbl = QLabel("offset")
+        uc_lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
+
+        spin = QDoubleSpinBox()
+        spin.setRange(0.05, 5.0)
+        spin.setSingleStep(0.1)
+        spin.setDecimals(2)
+        spin.setSuffix(" µm")
+        spin.setValue(0.8)
+        spin.setFixedWidth(88)
+        spin.setEnabled(False)
+        spin.setStyleSheet(f"""
+            QDoubleSpinBox {{
+                background: {Colors.BG_BASE};
+                border: 1px solid {Colors.BG_BORDER};
+                border-radius: 4px;
+                color: {Colors.TEXT_PRIMARY};
+                font-size: {Fonts.SIZE_XS}px;
+                padding: 2px 4px;
+            }}
+            QDoubleSpinBox:enabled:hover {{ border-color: {Colors.ACCENT_DIM}; }}
+            QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 14px; }}
+        """)
+
+        if shared:
+            self._uc_btn  = btn
+            self._uc_spin = spin
+            btn.clicked.connect(self._on_uc_btn_clicked)
+            spin.valueChanged.connect(self._on_uc_spin_changed)
+        else:
+            self._grp_uc_btn  = btn
+            self._grp_uc_spin = spin
+            btn.clicked.connect(self._on_grp_uc_btn_clicked)
+            spin.valueChanged.connect(self._on_grp_uc_spin_changed)
+
+        hl.addWidget(uc_lbl)
+        hl.addWidget(spin)
+        hl.addStretch()
+
+        vl.addWidget(btn)
+        vl.addWidget(offset_row)
+        return row
+
+    @staticmethod
+    def _uc_btn_style(checked: bool) -> str:
+        if checked:
+            return (
+                f"QPushButton {{ background: {Colors.ACCENT}; color: #fff; "
+                f"border: 1px solid {Colors.ACCENT}; border-radius: 4px; "
+                f"font-size: {Fonts.SIZE_XS}px; padding: 2px 6px; }}"
+                f"QPushButton:hover {{ background: {Colors.ACCENT_DIM}; }}"
+            )
+        return (
+            f"QPushButton {{ background: {Colors.BG_BASE}; color: {Colors.TEXT_MUTED}; "
+            f"border: 1px solid {Colors.BG_BORDER}; border-radius: 4px; "
+            f"font-size: {Fonts.SIZE_XS}px; padding: 2px 6px; }}"
+            f"QPushButton:hover {{ background: {Colors.BG_OVERLAY}; "
+            f"border-color: {Colors.ACCENT_DIM}; }}"
+            f"QPushButton:disabled {{ color: {Colors.TEXT_MUTED}; "
+            f"background: {Colors.BG_BASE}; }}"
+        )
+
+    def _on_uc_btn_clicked(self, checked: bool) -> None:
+        """Component-page undercut toggle — checked = ring is showing."""
+        self._uc_btn.setStyleSheet(self._uc_btn_style(checked))
+        self._uc_btn.setText("Remove Undercut" if checked else "Generate Undercut")
+        if self._current_comp_id:
+            self.undercut_exclusion_changed.emit(self._current_comp_id, not checked)
+
+    def _on_uc_spin_changed(self, value: float) -> None:
+        """Forward offset changes from the component page."""
+        self.undercut_exclusion_changed.emit("__offset__", value)
+
+    def _on_grp_uc_btn_clicked(self, checked: bool) -> None:
+        """Group-page undercut toggle — checked = ring is showing."""
+        self._grp_uc_btn.setStyleSheet(self._uc_btn_style(checked))
+        self._grp_uc_btn.setText("Remove Undercut" if checked else "Generate Undercut")
+        if self._current_group_id:
+            self.undercut_exclusion_changed.emit(self._current_group_id, not checked)
+
+    def _on_grp_uc_spin_changed(self, value: float) -> None:
+        """Forward offset changes from the group page."""
+        self.undercut_exclusion_changed.emit("__offset__", value)
+
+    def _update_undercut_ui(self, obj_id: str, overlay) -> None:
+        """
+        Sync the correct toggle button + spinbox pair to the overlay's current
+        state for the given component/group ID.
+        Called from show_component (uses _uc_btn/_uc_spin) and
+        show_group (uses _grp_uc_btn/_grp_uc_spin).
+        """
+        # Determine which widget pair is active based on which page is shown.
+        on_group_page = (self._stack.currentIndex() == 1)
+        btn  = self._grp_uc_btn  if on_group_page else self._uc_btn
+        spin = self._grp_uc_spin if on_group_page else self._uc_spin
+
+        if overlay is None:
+            btn.setEnabled(False)
+            spin.setEnabled(False)
+            return
+
+        global_on   = overlay.is_enabled
+        is_excluded = overlay.is_excluded(obj_id)
+        # The button reflects whether THIS object has its ring enabled (not
+        # excluded). The global toggle is a separate concern — turning the ring
+        # on per-object will auto-enable the global overlay in MainWindow.
+        ring_on = not is_excluded
+
+        btn.blockSignals(True)
+        btn.setChecked(ring_on)
+        btn.setText("Remove Undercut" if ring_on else "Generate Undercut")
+        btn.setStyleSheet(self._uc_btn_style(ring_on))
+        btn.setEnabled(True)
+        btn.blockSignals(False)
+
+        spin.blockSignals(True)
+        spin.setValue(overlay.offset_um)
+        spin.setEnabled(True)
+        spin.blockSignals(False)
+
     # ── Group page ────────────────────────────────────────────────────────────
 
     def _build_group_page(self) -> QWidget:
@@ -1397,6 +1554,8 @@ class PropertiesPanel(QWidget):
         hl.addWidget(self._grp_name_lbl)
         hl.addWidget(self._grp_meta_lbl)
         hl.addWidget(self._grp_bbox_lbl)
+        self._grp_undercut_row = self._make_undercut_row(shared=False)
+        hl.addWidget(self._grp_undercut_row)
         root.addWidget(self._grp_header)
 
         # Scrollable member cards
@@ -1437,7 +1596,7 @@ class PropertiesPanel(QWidget):
                   self._row_verts, self._row_bbox, self._row_connections]:
             r.set_value("—")
 
-    def show_component(self, comp: GDSComponent, design=None) -> None:
+    def show_component(self, comp: GDSComponent, design=None, overlay=None) -> None:
         self._stack.setCurrentIndex(0)
         self._current_comp_id = comp.id
         bb = comp.bbox
@@ -1499,7 +1658,9 @@ class PropertiesPanel(QWidget):
         else:
             self._row_connections.set_value("—")
 
-    def show_group(self, group, design) -> None:
+        self._update_undercut_ui(comp.id, overlay)
+
+    def show_group(self, group, design, overlay=None) -> None:
         """Switch to group view and populate member cards + optional cell params."""
         self._stack.setCurrentIndex(1)
         self._current_comp_id = None
@@ -1536,6 +1697,8 @@ class PropertiesPanel(QWidget):
             self._cards_layout.insertWidget(
                 self._cards_layout.count() - 1, card
             )
+
+        self._update_undercut_ui(group.id, overlay)
 
     def _rebuild_cell_params(self, group) -> None:
         """

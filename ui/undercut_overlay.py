@@ -5,8 +5,8 @@ Public surface
 --------------
 UndercutOverlay(scene_ref)
     Attach one instance to a CanvasScene.  It listens to
-    scene.selectionChanged and scene.scene_changed, then adds/removes
-    UndercutRingItem children on the fly.
+    scene.scene_changed, then adds/removes UndercutRingItem children on
+    the fly.
 
     Public methods
     ~~~~~~~~~~~~~~
@@ -32,6 +32,9 @@ And in MainWindow._build_view_menu (or toolbar), wire a toggle:
 Design notes
 ------------
 • Zero modifications to existing files.
+• Rings are persistent — they are shown for ALL components on the canvas
+  while the overlay is enabled, regardless of selection state.
+  Deselecting a component does NOT remove its ring.
 • UndercutRingItem is a non-interactive QGraphicsPathItem child of a
   ComponentItem (or of the scene root for groups — see _GroupRingItem).
 • The ring is built with QPainterPath arithmetic:
@@ -248,10 +251,16 @@ class UndercutOverlay:
     Lifecycle
     ---------
     1. Constructed once in CanvasScene.__init__; receives scene_ref.
-    2. Connects to selectionChanged and scene_changed.
-    3. On each relevant signal, rebuilds only the rings affected by the
-       current selection, minimising recomputation cost.
+    2. Connects to scene_changed only (selection is irrelevant).
+    3. On each scene_changed, syncs rings for ALL components and groups in
+       the design — adding new ones, updating moved ones, removing deleted ones.
     4. enable(False) hides all rings without destroying them (fast toggle).
+
+    Persistence
+    -----------
+    Rings are shown for every component on the canvas while the overlay is
+    enabled.  Selecting or deselecting objects has NO effect on ring visibility.
+    Only adding/removing components from the scene changes which rings exist.
 
     Threading
     ---------
@@ -269,8 +278,12 @@ class UndercutOverlay:
         # group_id → _GroupRingItem
         self._group_rings: Dict[str, _GroupRingItem]      = {}
 
-        # Connect to scene signals — both live on the scene object.
-        scene_ref.selectionChanged.connect(self._on_selection_changed)
+        # IDs (comp or group) for which the ring is individually suppressed.
+        # When the global overlay is ON, items in this set stay hidden.
+        self._excluded_ids: Set[str] = set()
+
+        # scene_changed covers all model mutations (add/remove/move/resize).
+        # selectionChanged is intentionally NOT connected — rings are persistent.
         scene_ref.scene_changed.connect(self._on_scene_changed)
 
     # ── Public API ────────────────────────────────────────────────────────────
@@ -281,7 +294,7 @@ class UndercutOverlay:
             return
         self._enabled = on
         if on:
-            self._rebuild_all_selected()
+            self._rebuild_all()
         else:
             self._remove_all()
 
@@ -293,53 +306,77 @@ class UndercutOverlay:
         return self._enabled
 
     def set_offset_um(self, um: float) -> None:
-        """Change the undercut expansion distance and redraw live rings."""
+        """Change the undercut expansion distance and redraw all live rings."""
         self._offset_dbu = um_to_dbu(max(0.0, um))
         if self._enabled:
-            self._rebuild_all_selected()
+            self._rebuild_all()
 
     @property
     def offset_um(self) -> float:
         return dbu_to_um(self._offset_dbu)
 
+    # ── Per-object exclusion API ──────────────────────────────────────────────
+
+    def set_excluded(self, obj_id: str, excluded: bool) -> None:
+        """
+        Show or hide the ring for a single component or group ID, independently
+        of the global enable flag.  The global toggle must still be ON for any
+        ring to be visible; this method only provides a per-object override.
+        """
+        if excluded:
+            self._excluded_ids.add(obj_id)
+        else:
+            self._excluded_ids.discard(obj_id)
+
+        # Apply immediately to any live ring items.
+        if ring := self._comp_rings.get(obj_id):
+            ring.setVisible(self._enabled and not excluded)
+        if ring := self._group_rings.get(obj_id):
+            ring.setVisible(self._enabled and not excluded)
+
+    def is_excluded(self, obj_id: str) -> bool:
+        """Return True if the ring for this object is individually suppressed."""
+        return obj_id in self._excluded_ids
+
     # ── Internal rebuild helpers ──────────────────────────────────────────────
 
-    def _rebuild_all_selected(self) -> None:
-        """Rebuild rings for every currently selected item."""
-        # First remove stale rings for items no longer selected.
-        self._remove_all()
+    def _rebuild_all(self) -> None:
+        """
+        Sync rings with the current design state:
+        - Create/update a ring for every component not inside a group.
+        - Create/update a group ring for every group (union of members).
+        - Remove rings for components/groups no longer in the design.
 
-        sel = self._scene.selectedItems()
-        seen_group_ids: Set[str] = set()
+        Components that belong to a group are covered by the group ring and
+        do not get individual rings, avoiding double-drawing.
+        """
+        design = self._scene._design
 
-        for item in sel:
-            comp = getattr(item, "component", None)
-            if comp is not None:
-                # Check whether this component belongs to a group that is also
-                # represented by a GroupItem in the selection — if so, the
-                # group ring covers it; skip the per-component ring to avoid
-                # double-drawing.
-                if self._comp_is_covered_by_group_ring(comp, sel):
-                    continue
-                self._ensure_comp_ring(comp, item)
+        # Collect all group member IDs so we can skip them for per-comp rings.
+        grouped_ids: Set[str] = set()
+        for group in design.groups:
+            grouped_ids.update(group.member_ids)
+
+        # ── Per-component rings (ungrouped components only) ───────────────────
+        live_comp_ids: Set[str] = set()
+        for comp in design.components:
+            if comp.id in grouped_ids:
+                continue  # covered by the group ring below
+            live_comp_ids.add(comp.id)
+            parent_item = self._scene._items.get(comp.id)
+            if parent_item is None:
                 continue
+            self._ensure_comp_ring(comp, parent_item)
 
-            group = getattr(item, "group", None)
-            if group is not None and group.id not in seen_group_ids:
-                seen_group_ids.add(group.id)
-                self._ensure_group_ring(group)
+        # ── Group rings ───────────────────────────────────────────────────────
+        live_group_ids: Set[str] = set()
+        for group in design.groups:
+            live_group_ids.add(group.id)
+            self._ensure_group_ring(group)
 
-    def _comp_is_covered_by_group_ring(self, comp, sel_items) -> bool:
-        """
-        Return True if a GroupItem in sel_items owns this component, meaning
-        the group-level ring will cover it and a per-component ring is redundant.
-        """
-        from ui.canvas_scene import GroupItem  # local import to avoid circular
-        for item in sel_items:
-            if isinstance(item, GroupItem):
-                if comp.id in item.group.member_ids:
-                    return True
-        return False
+        # ── Prune stale rings ─────────────────────────────────────────────────
+        self._remove_stale_comp_rings(live_comp_ids)
+        self._remove_stale_group_rings(live_group_ids)
 
     def _ensure_comp_ring(self, comp, parent_item: QGraphicsItem) -> None:
         """Create or update the ring for a single ComponentItem."""
@@ -347,8 +384,11 @@ class UndercutOverlay:
         if ring is None:
             ring = _ComponentRingItem(parent_item, self._offset_dbu)
             self._comp_rings[comp.id] = ring
+        elif ring.parentItem() is not parent_item:
+            # Parent changed (e.g. after undo/redo recreated the item).
+            ring.setParentItem(parent_item)
         ring.rebuild(comp, self._offset_dbu)
-        ring.setVisible(self._enabled)
+        ring.setVisible(self._enabled and comp.id not in self._excluded_ids)
 
     def _ensure_group_ring(self, group) -> None:
         """Create or update the ring for a group (union of all members)."""
@@ -362,7 +402,7 @@ class UndercutOverlay:
             self._scene.addItem(ring)
             self._group_rings[group.id] = ring
         ring.rebuild(member_comps, self._offset_dbu)
-        ring.setVisible(self._enabled)
+        ring.setVisible(self._enabled and group.id not in self._excluded_ids)
 
     def _resolve_group_members(self, group) -> list:
         """Fetch live GDSComponent objects for every member of *group*."""
@@ -404,39 +444,15 @@ class UndercutOverlay:
             if ring.scene():
                 ring.scene().removeItem(ring)
 
-    # ── Signal handlers ───────────────────────────────────────────────────────
-
-    def _on_selection_changed(self) -> None:
-        if not self._enabled:
-            return
-        self._rebuild_all_selected()
+    # ── Signal handler ────────────────────────────────────────────────────────
 
     def _on_scene_changed(self) -> None:
         """
         Called after every model mutation (add/remove/move/resize).
-        Rebuilds rings for items that are still selected so geometry stays
-        in sync after moves, rotations, and parameter edits.
+        Syncs all rings to the current design state so geometry stays in sync
+        after moves, parameter edits, undo/redo, and component deletion.
+        selectionChanged is intentionally NOT handled — rings are persistent.
         """
         if not self._enabled:
             return
-        # Determine which rings are still alive; rebuild them in place.
-        sel = self._scene.selectedItems()
-        live_comp_ids:  Set[str] = set()
-        live_group_ids: Set[str] = set()
-
-        for item in sel:
-            comp = getattr(item, "component", None)
-            if comp is not None and comp.id in self._comp_rings:
-                live_comp_ids.add(comp.id)
-                ring = self._comp_rings[comp.id]
-                ring.rebuild(comp, self._offset_dbu)
-
-            group = getattr(item, "group", None)
-            if group is not None and group.id in self._group_rings:
-                live_group_ids.add(group.id)
-                members = self._resolve_group_members(group)
-                if members:
-                    self._group_rings[group.id].rebuild(members, self._offset_dbu)
-
-        self._remove_stale_comp_rings(live_comp_ids)
-        self._remove_stale_group_rings(live_group_ids)
+        self._rebuild_all()

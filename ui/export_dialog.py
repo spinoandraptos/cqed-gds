@@ -75,9 +75,10 @@ class ExportDialog(QDialog):
     On Accept → opens QFileDialog → calls exporter → shows result.
     """
 
-    def __init__(self, design: DesignScene, parent=None) -> None:
+    def __init__(self, design: DesignScene, parent=None, overlay=None) -> None:
         super().__init__(parent)
-        self._design = design
+        self._design  = design
+        self._overlay = overlay
         self._rows: Dict[int, Tuple[QSpinBox, QSpinBox]] = {}   # app_layer → (layer_sb, dt_sb)
 
         self.setWindowTitle("Export GDS")
@@ -119,6 +120,16 @@ class ExportDialog(QDialog):
             grid.addWidget(layer_sb, row_i, 1)
             grid.addWidget(dt_sb,    row_i, 2)
             self._rows[app_layer] = (layer_sb, dt_sb)
+
+        # Show the undercut ring layer as a fixed info row when overlay is active
+        if self._overlay is not None and self._overlay.is_enabled:
+            from core.exporter import UNDERCUT_RING_LAYER, UNDERCUT_RING_DATATYPE
+            uc_row = len(app_layers) + 1
+            uc_lbl = _label("Undercut Ring", muted=True)
+            uc_lbl.setStyleSheet(uc_lbl.styleSheet() + " font-style: italic;")
+            grid.addWidget(uc_lbl, uc_row, 0)
+            grid.addWidget(_label(f"{UNDERCUT_RING_LAYER}  (fixed)", muted=True), uc_row, 1)
+            grid.addWidget(_label(f"{UNDERCUT_RING_DATATYPE}  (fixed)", muted=True), uc_row, 2)
 
         scroll = QScrollArea()
         scroll.setWidget(grid_w)
@@ -172,7 +183,8 @@ class ExportDialog(QDialog):
 
         layer_map = self._build_layer_map()
         try:
-            summary = export_gds(self._design, path, layer_map)
+            summary = export_gds(self._design, path, layer_map,
+                                  overlay=self._overlay)
         except ExportError as exc:
             QMessageBox.critical(self, "Export Failed", str(exc))
             return

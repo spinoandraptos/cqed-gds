@@ -28,12 +28,11 @@ from core.commands import (
     BatchCommand, EditComponent, GroupComponents, MergeGroups,
     RemoveComponent, RemoveGroup, ReplaceCellCmd, UngroupComponents,
 )
-from core.exporter import ExportError, export_gds
 from core.model import ComponentKind, DesignScene
 from core.serialiser import SerialisationError, load, save
 from ui.canvas_scene import CanvasScene, GroupItem, PlacementMode
 from ui.canvas_view import CanvasView
-from ui.export_dialog import ExportResultDialog
+from ui.export_dialog import ExportDialog
 from ui.panels import ComponentPalette, PropertiesPanel
 from ui.sweep_dialog import CellSweepDialog, GroupSweepDialog, SweepDialog
 from ui.theme import Colors, Fonts, Geometry, apply_theme
@@ -204,33 +203,6 @@ class MainWindow(QMainWindow):
         self._tb_button("fa5s.sliders-h",  "Sweep Parameter  (Ctrl+W)", self._sweep,           color=Colors.ACCENT)
         self._toolbar.addSeparator()
         self._tb_button("fa5s.file-export","Export GDS  (Ctrl+E)",       self._export_gds,      color=Colors.ACCENT)
-        self._toolbar.addSeparator()
-
-        # Undercut ring toggle — checkable so its state is visually obvious.
-        icon_uc = qta.icon("fa5s.ring", color=Colors.TEXT_SECONDARY,
-                           color_active=Colors.ACCENT)
-        self._tb_undercut = QAction(icon_uc, "", self)
-        self._tb_undercut.setToolTip("Toggle Undercut Ring  (U)")
-        self._tb_undercut.setCheckable(True)
-        self._tb_undercut.setChecked(False)
-        self._tb_undercut.triggered.connect(self._toggle_undercut)
-        self._toolbar.addAction(self._tb_undercut)
-
-        # Undercut offset spinbox — only meaningful when the ring is on.
-        from PyQt6.QtWidgets import QDoubleSpinBox
-        self._tb_uc_spin = QDoubleSpinBox()
-        self._tb_uc_spin.setRange(0.05, 5.0)
-        self._tb_uc_spin.setSingleStep(0.1)
-        self._tb_uc_spin.setDecimals(2)
-        self._tb_uc_spin.setSuffix(" µm")
-        self._tb_uc_spin.setValue(0.8)
-        self._tb_uc_spin.setFixedWidth(88)
-        self._tb_uc_spin.setToolTip("Undercut ring expansion distance")
-        self._tb_uc_spin.setStyleSheet(
-            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px;"
-        )
-        self._tb_uc_spin.valueChanged.connect(self._on_undercut_offset_changed)
-        self._toolbar.addWidget(self._tb_uc_spin)
 
         spacer = QWidget()
         spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
@@ -333,6 +305,7 @@ class MainWindow(QMainWindow):
         self._props.cell_param_change_requested.connect(self._on_cell_param_change_requested)
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
         self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
+        self._props.undercut_exclusion_changed.connect(self._on_undercut_exclusion_changed)
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -347,7 +320,8 @@ class MainWindow(QMainWindow):
         if comp_id:
             comp = self._design.get(comp_id)
             if comp:
-                self._props.show_component(comp, self._design)
+                self._props.show_component(comp, self._design,
+                                           overlay=self._scene._undercut)
                 self._sb_layer.setText(f"LAYER  {comp.layer}")
                 return
         self._props.clear()
@@ -361,13 +335,10 @@ class MainWindow(QMainWindow):
     # ── Undercut ring ─────────────────────────────────────────────────────────
 
     def _toggle_undercut(self) -> None:
-        """Toggle the undercut ring overlay and keep toolbar + menu in sync."""
+        """Toggle the undercut ring overlay and keep the menu item in sync."""
         overlay = self._scene._undercut
         overlay.toggle()
         on = overlay.is_enabled
-        # Keep toolbar button and menu item in visual sync regardless of which
-        # one triggered the toggle.
-        self._tb_undercut.setChecked(on)
         self._act_undercut.setChecked(on)
         label = f"Show Undercut Ring  ({overlay.offset_um:.2f} µm)"
         self._act_undercut.setText(label)
@@ -375,11 +346,32 @@ class MainWindow(QMainWindow):
             f"Undercut ring {'ON' if on else 'OFF'} — {overlay.offset_um:.2f} µm"
         )
 
-    def _on_undercut_offset_changed(self, value: float) -> None:
-        """Live-update the ring expansion distance from the toolbar spinbox."""
-        self._scene._undercut.set_offset_um(value)
-        label = f"Show Undercut Ring  ({value:.2f} µm)"
-        self._act_undercut.setText(label)
+    @pyqtSlot(str, object)
+    def _on_undercut_exclusion_changed(self, obj_id: str, value) -> None:
+        """
+        Handle per-object undercut ring toggle or offset change from the
+        properties panel.
+
+        obj_id="__offset__" means the offset spinbox changed; value is the
+        new offset in µm (float).  Otherwise value is a bool (excluded flag).
+        """
+        overlay = self._scene._undercut
+        if obj_id == "__offset__":
+            overlay.set_offset_um(float(value))
+            label = f"Show Undercut Ring  ({overlay.offset_um:.2f} µm)"
+            self._act_undercut.setText(label)
+        else:
+            excluded = bool(value)
+            overlay.set_excluded(obj_id, excluded)
+            # If the user is turning the ring ON for this object, make sure the
+            # global overlay is also enabled — otherwise set_excluded alone has
+            # no visible effect.
+            if not excluded and not overlay.is_enabled:
+                overlay.enable(True)
+                self._act_undercut.setChecked(True)
+                self._act_undercut.setText(
+                    f"Show Undercut Ring  ({overlay.offset_um:.2f} µm)"
+                )
 
 
     @pyqtSlot(str)
@@ -520,14 +512,16 @@ class MainWindow(QMainWindow):
     def _refresh_props_for_selection(self) -> None:
         selected = self._scene.selectedItems()
         if len(selected) == 1 and hasattr(selected[0], "component"):
-            self._props.show_component(selected[0].component, self._design)
+            self._props.show_component(selected[0].component, self._design,
+                                       overlay=self._scene._undercut)
 
     @pyqtSlot(str)
     def _on_group_selected(self, group_id: str) -> None:
         self._selected_group_id = group_id
         group = self._design.get_group(group_id)
         if group:
-            self._props.show_group(group, self._design)
+            self._props.show_group(group, self._design,
+                                   overlay=self._scene._undercut)
 
     # ── Mode helpers ──────────────────────────────────────────────────────────
 
@@ -864,21 +858,7 @@ class MainWindow(QMainWindow):
         if not self._design.components:
             QMessageBox.warning(self, "Export GDS", "Nothing to export — add some shapes first.")
             return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "Export GDS", f"{self._design.name}.gds",
-            "GDS Files (*.gds);;All Files (*)",
-        )
-        if not path:
-            return
-        layers    = {c.layer for c in self._design.components}
-        layer_map = {layer: (layer, 0) for layer in layers}
-        try:
-            summary = export_gds(self._design, path, layer_map)
-        except ExportError as exc:
-            QMessageBox.critical(self, "Export Failed", str(exc))
-            return
-        self._flash_status(f"Exported {summary['shapes']} shapes to {path}")
-        ExportResultDialog(summary, self).exec()
+        ExportDialog(self._design, self, overlay=self._scene._undercut).exec()
 
     # ── Help dialogs ──────────────────────────────────────────────────────────
 
