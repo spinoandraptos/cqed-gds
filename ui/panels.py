@@ -829,8 +829,6 @@ class ComponentPalette(QWidget):
 
         body_lay.addWidget(self._build_layer_section())
         body_lay.addWidget(Separator())
-        body_lay.addWidget(self._build_shapes_section())
-        body_lay.addWidget(Separator())
         body_lay.addWidget(self._build_cells_section())
         body_lay.addStretch()
 
@@ -1674,10 +1672,12 @@ class PropertiesPanel(QWidget):
         self._current_comp_id  = None
         self._current_group_id = None
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
-            self._cell_params_widget.hide()
-            self._cell_params_widget.setParent(None)
-            self._cell_params_widget.deleteLater()
-            self._cell_params_widget = None
+            _w = self._cell_params_widget
+            self._cell_params_widget = None   # clear ref FIRST, before any Qt call
+            try:
+                _w.setParent(None)
+            except RuntimeError:
+                pass   # C++ object already deleted — nothing to do
         for sb in (self._layer_spin, self._row_w_spin,
                    self._row_h_spin, self._row_pw_spin):
             sb.blockSignals(True); sb.setValue(0)
@@ -1772,6 +1772,16 @@ class PropertiesPanel(QWidget):
         )
 
         # ── Cell params section (shown when group matches a catalogue cell) ───
+        # Must be called BEFORE rebuilding cards since it inserts into _cards_layout.
+        # Also remove any stale cell_params_widget from the layout first (it is now
+        # inside _cards_layout at index 0, not above the scroll area).
+        if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
+            _w = self._cell_params_widget
+            self._cell_params_widget = None   # clear ref FIRST, before any Qt call
+            try:
+                _w.setParent(None)
+            except RuntimeError:
+                pass   # C++ object already deleted — nothing to do
         self._rebuild_cell_params(group)
 
         # Rebuild member cards
@@ -1806,16 +1816,21 @@ class PropertiesPanel(QWidget):
         _cell_subgroups list is constructed from the legacy attrs so the same
         rendering loop works unchanged.
 
-        All widgets are placed in a single container that is inserted above the
-        scrollable member-cards area.
+        All widgets are inserted at index 0 of _cards_layout (inside the
+        QScrollArea) so that params + member cards scroll together.
         """
+        # The caller (show_group) clears any existing _cell_params_widget before
+        # calling here, so we assert it is already None.  The guard below is kept
+        # as a safety net for direct calls (e.g. from undo paths).
         # IMPORTANT: hide() before setParent(None) to avoid a Qt flash where
         # the widget briefly becomes a top-level window during reparenting.
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
-            self._cell_params_widget.hide()
-            self._cell_params_widget.setParent(None)
-            self._cell_params_widget.deleteLater()
-            self._cell_params_widget = None
+            _w = self._cell_params_widget
+            self._cell_params_widget = None   # clear ref FIRST, before any Qt call
+            try:
+                _w.setParent(None)
+            except RuntimeError:
+                pass   # C++ object already deleted — nothing to do
 
         # ── Resolve sub-groups list ───────────────────────────────────────────
         # Prefer the explicit _cell_subgroups (set by all modern commands).
@@ -1982,10 +1997,11 @@ class PropertiesPanel(QWidget):
                 outer_lay.addLayout(row)
 
         self._cell_params_widget = w
-        # Insert above the scrollable cards area (index 1 = after the fixed header).
-        # The group page root layout is: [0]=grp_header  [1]=cards_scroll
-        grp_page = self._stack.widget(1)
-        grp_page.layout().insertWidget(1, w)
+        # Insert at the TOP of the scrollable cards area (index 0) so that
+        # both cell params and member cards scroll together.  Previously this
+        # was inserted above the QScrollArea (outside it), which meant the
+        # panel could overflow without scrolling when there are many members.
+        self._cards_layout.insertWidget(0, w)
 
     # ── Multi-selection page ──────────────────────────────────────────────────
 

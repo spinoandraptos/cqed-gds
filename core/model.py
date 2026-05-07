@@ -369,6 +369,13 @@ class DesignScene:
         return [cn for cn in self._connections
                 if cn.comp_a == comp_id or cn.comp_b == comp_id]
 
+    def connections_touching(self, comp_ids: set) -> List[Connection]:
+        """Return all connections where at least one end is in comp_ids."""
+        return [
+            cn for cn in self._connections
+            if cn.comp_a in comp_ids or cn.comp_b in comp_ids
+        ]
+
     def connected_sides(self, comp_id: str) -> List[PortSide]:
         """Return which PortSides on comp_id currently have a connection."""
         comp = self.get(comp_id)

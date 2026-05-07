@@ -324,6 +324,7 @@ class MainWindow(QMainWindow):
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
         self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
         self._props.undercut_exclusion_changed.connect(self._on_undercut_exclusion_changed)
+        self._props.component_hover_requested.connect(self._scene.highlight_component)
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────
@@ -981,9 +982,10 @@ class MainWindow(QMainWindow):
                 visited.update(member_ids_set)
 
                 # Propagate downstream: for each connection on each group member,
-                # compute the displacement of THAT specific port after the move.
-                # Only enqueue if that port actually moved (prevents dragging
-                # components wired to ports that were stationary).
+                # only enqueue a neighbour if its connecting port is NOT already
+                # co-located with our port after the move (i.e., there is still
+                # a physical gap to close).  This naturally stops BFS propagation
+                # in loops once the chain has been nudged enough.
                 for mid in grp.member_ids:
                     m = self._design.get(mid)
                     if m is None:
@@ -994,17 +996,21 @@ class MainWindow(QMainWindow):
                         if nxt in visited:
                             continue
                         our_port_id = cn.port_a if cn.comp_a == mid else cn.port_b
+                        their_port_id = cn.port_b if cn.comp_a == mid else cn.port_a
                         port = port_map.get(our_port_id)
                         if port is None:
                             continue
-                        old_x, old_y = pre_abs.get((mid, our_port_id), (None, None))
-                        if old_x is None:
-                            continue
-                        new_abs_p = port.abs_pos(m.origin)
-                        ndx = new_abs_p.x - old_x
-                        ndy = new_abs_p.y - old_y
-                        if ndx != 0 or ndy != 0:
-                            queue.append((nxt, ndx, ndy))
+                        our_abs = port.abs_pos(m.origin)
+                        # Check if the neighbour's port is already at our port's position
+                        nxt_comp = self._design.get(nxt)
+                        if nxt_comp is not None:
+                            nxt_port = next((p for p in nxt_comp.ports if p.id == their_port_id), None)
+                            if nxt_port is not None:
+                                their_abs = nxt_port.abs_pos(nxt_comp.origin)
+                                ndx = our_abs.x - their_abs.x
+                                ndy = our_abs.y - their_abs.y
+                                if ndx != 0 or ndy != 0:
+                                    queue.append((nxt, ndx, ndy))
 
             else:
                 # Snapshot port positions BEFORE the move.
@@ -1022,24 +1028,29 @@ class MainWindow(QMainWindow):
                 if comp_item:
                     comp_item.sync_from_model()
 
-                # Propagate downstream using per-port displacement.
+                # Propagate downstream: only enqueue a neighbour if its
+                # connecting port is not already co-located with ours after the
+                # move.  This stops BFS naturally in loops.
                 port_map = {p.id: p for p in comp.ports}
                 for cn in self._design.connections_for(cid):
                     nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
                     if nxt in visited:
                         continue
-                    our_port_id = cn.port_a if cn.comp_a == cid else cn.port_b
+                    our_port_id  = cn.port_a if cn.comp_a == cid else cn.port_b
+                    their_port_id = cn.port_b if cn.comp_a == cid else cn.port_a
                     port = port_map.get(our_port_id)
                     if port is None:
                         continue
-                    old_x, old_y = pre_abs_comp.get(our_port_id, (None, None))
-                    if old_x is None:
-                        continue
-                    new_abs_p = port.abs_pos(comp.origin)
-                    ndx = new_abs_p.x - old_x
-                    ndy = new_abs_p.y - old_y
-                    if ndx != 0 or ndy != 0:
-                        queue.append((nxt, ndx, ndy))
+                    our_abs = port.abs_pos(comp.origin)
+                    nxt_comp = self._design.get(nxt)
+                    if nxt_comp is not None:
+                        nxt_port = next((p for p in nxt_comp.ports if p.id == their_port_id), None)
+                        if nxt_port is not None:
+                            their_abs = nxt_port.abs_pos(nxt_comp.origin)
+                            ndx = our_abs.x - their_abs.x
+                            ndy = our_abs.y - their_abs.y
+                            if ndx != 0 or ndy != 0:
+                                queue.append((nxt, ndx, ndy))
 
         # Sync all new member canvas items so port indicators refresh
         for member in all_new_members:

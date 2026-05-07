@@ -281,10 +281,15 @@ class GroupItem(QGraphicsItem):
         self._group     = group
         self._scene_ref = scene_ref
         self._editing   = False
+        self._cached_bbox: Optional[QRectF] = None   # invalidated by invalidate_bbox()
 
         self.setZValue(1)
         self.setFlags(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable)
         self.setAcceptHoverEvents(True)
+
+    def invalidate_bbox(self) -> None:
+        """Clear the cached bounding rect so it is recomputed on next access."""
+        self._cached_bbox = None
 
     @property
     def group(self) -> ComponentGroup:
@@ -307,8 +312,11 @@ class GroupItem(QGraphicsItem):
         self.update()
 
     def _current_bbox(self) -> QRectF:
-        bb = self._group.bbox_from(self._scene_ref._design.components)
-        return QRectF(bb.x_min, bb.y_min, bb.x_max - bb.x_min, bb.y_max - bb.y_min)
+        if self._cached_bbox is None:
+            bb = self._group.bbox_from(self._scene_ref._design.components)
+            self._cached_bbox = QRectF(bb.x_min, bb.y_min,
+                                       bb.x_max - bb.x_min, bb.y_max - bb.y_min)
+        return self._cached_bbox
 
     def boundingRect(self) -> QRectF:
         return self._current_bbox().adjusted(-4, -4, 4, 4)
@@ -1226,6 +1234,7 @@ class CanvasScene(QGraphicsScene):
                             item.refresh_connection_state(self._design)
             gi = self._group_items.get(group_id)
             if gi:
+                gi.invalidate_bbox()
                 gi.prepareGeometryChange()
 
         self.clear_all_port_highlights()
@@ -1270,6 +1279,7 @@ class CanvasScene(QGraphicsScene):
                                     snap_item_vis.sync_from_model()
                         gi = self._group_items.get(group_id)
                         if gi:
+                            gi.invalidate_bbox()
                             gi.prepareGeometryChange()
 
                     my_item = self.item_for(my_comp_id)
@@ -1761,6 +1771,7 @@ class CanvasScene(QGraphicsScene):
                     item.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, False)
 
         for gi in self._group_items.values():
+            gi.invalidate_bbox()
             gi.prepareGeometryChange()
 
         self.refresh_all_indicators()

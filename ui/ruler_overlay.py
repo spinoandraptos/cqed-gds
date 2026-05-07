@@ -62,34 +62,42 @@ class RulerItem(QGraphicsItem):
     Both endpoints are in DBU (scene coordinates).  The item recomputes its
     bounding rect dynamically so Qt clips and repaints it correctly.
 
-    Call update_end(pt) while the user is dragging to preview, then
-    commit(pt) once they release.
+    Call update_end(pt, port_label) while the user is dragging to preview,
+    then commit(pt, port_label) once they release.
+
+    port_label_start / port_label_end are optional strings shown next to the
+    endpoint dot when the ruler snapped to a port (e.g. "out  [BranchSeg]").
     """
 
-    def __init__(self, start: QPointF, scene: QGraphicsScene) -> None:
+    def __init__(self, start: QPointF, scene: QGraphicsScene,
+                 port_label_start: Optional[str] = None) -> None:
         super().__init__()
         self._start = start
         self._end   = start
-        self._scene = scene   # keep a ref so we can read the view transform
+        self._scene = scene
+
+        self._port_label_start: Optional[str] = port_label_start
+        self._port_label_end:   Optional[str] = None
 
         self.setZValue(20)    # above everything else
-        # Do NOT set ItemIgnoresTransformations — we want the line to live in
-        # scene space.  Text is drawn with cosmetic pens / fixed pixel sizes
-        # using painter.save/restore tricks.
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsSelectable, False)
         self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable,    False)
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
-    def update_end(self, end: QPointF) -> None:
+    def update_end(self, end: QPointF,
+                   port_label: Optional[str] = None) -> None:
         self.prepareGeometryChange()
-        self._end = end
+        self._end            = end
+        self._port_label_end = port_label
         self.update()
 
-    def commit(self, end: QPointF) -> None:
+    def commit(self, end: QPointF,
+               port_label: Optional[str] = None) -> None:
         self.prepareGeometryChange()
-        self._end = end
+        self._end            = end
+        self._port_label_end = port_label
         self.update()
 
     # ── QGraphicsItem interface ───────────────────────────────────────────────

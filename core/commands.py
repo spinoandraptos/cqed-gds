@@ -1025,7 +1025,39 @@ class ReplaceCellCmd:
             Point(old_anchor.origin.x, old_anchor.origin.y) if old_anchor else None
         )
 
-        # Remove old group + members
+        # Snapshot cross-boundary connections before removal so they can be
+        # re-stitched onto the new components after placement.  Port IDs are
+        # regenerated on every place_cell() call, but port *names* ("N", "S",
+        # "E", "W", or cell-defined names) are structurally stable across a
+        # param edit and serve as the mapping key.
+        old_id_set = set(self._old_comp_ids)
+        old_port_names: dict[str, dict[str, str]] = {}  # comp_id → {port_id: port_name}
+        for cid in self._old_comp_ids:
+            comp = design.get(cid)
+            if comp:
+                old_port_names[cid] = {p.id: p.name for p in comp.ports}
+
+        # Only retain connections that cross the boundary (one end inside the
+        # cell being replaced, one end outside).  Internal connections are
+        # rebuilt from scratch by place_cell() and don't need restoring.
+        saved_cross: list[dict] = []
+        for cn in design.connections_touching(old_id_set):
+            if cn.comp_a in old_id_set and cn.comp_b in old_id_set:
+                continue  # internal — skip
+            if cn.comp_a in old_id_set:
+                int_port_name = old_port_names.get(cn.comp_a, {}).get(cn.port_a)
+                saved_cross.append({
+                    "ext_comp": cn.comp_b, "ext_port": cn.port_b,
+                    "int_port_name": int_port_name,
+                })
+            else:
+                int_port_name = old_port_names.get(cn.comp_b, {}).get(cn.port_b)
+                saved_cross.append({
+                    "ext_comp": cn.comp_a, "ext_port": cn.port_a,
+                    "int_port_name": int_port_name,
+                })
+
+        # Remove old group + members (this purges their connections)
         design.remove_group(self._old_group_id)
         for cid in self._old_comp_ids:
             design.remove(cid)
@@ -1108,6 +1140,29 @@ class ReplaceCellCmd:
                     new_group._cell_rotation_cx = final_cx
                     new_group._cell_rotation_cy = final_cy
 
+        # Restore cross-boundary connections onto the new components.
+        # Build a port-name → (comp_id, port_id) map from the new members so
+        # we can re-stitch each saved connection by matching on port name.
+        if saved_cross and new_group is not None:
+            new_members = [design.get(cid) for cid in new_group.member_ids
+                           if design.get(cid)]
+            new_port_by_name: dict[str, tuple[str, str]] = {}
+            for comp in new_members:
+                for port in comp.ports:
+                    new_port_by_name[port.name] = (comp.id, port.id)
+
+            for entry in saved_cross:
+                new_end = new_port_by_name.get(entry["int_port_name"])
+                if new_end is None:
+                    # Port name no longer exists on the rebuilt geometry; the
+                    # connection cannot be restored and is silently dropped.
+                    continue
+                new_int_comp, new_int_port = new_end
+                design.connect(
+                    entry["ext_comp"], entry["ext_port"],
+                    new_int_comp,      new_int_port,
+                )
+
     def undo(self, design):
         # Undo new placement
         self._new_cmd.undo(design)
@@ -1177,7 +1232,33 @@ class ReplaceSubgroupCellCmd:
         if group is None:
             return
 
-        # 1. Remove old sub-group components
+        # Snapshot cross-boundary connections before removal.  Port names are
+        # stable across a param edit; port IDs are regenerated, so we key on name.
+        old_id_set = set(self._old_sg_comp_ids)
+        old_port_names: dict[str, dict[str, str]] = {}  # comp_id → {port_id: port_name}
+        for cid in self._old_sg_comp_ids:
+            comp = design.get(cid)
+            if comp:
+                old_port_names[cid] = {p.id: p.name for p in comp.ports}
+
+        saved_cross: list[dict] = []
+        for cn in design.connections_touching(old_id_set):
+            if cn.comp_a in old_id_set and cn.comp_b in old_id_set:
+                continue  # internal — rebuilt by place_cell, no need to restore
+            if cn.comp_a in old_id_set:
+                int_port_name = old_port_names.get(cn.comp_a, {}).get(cn.port_a)
+                saved_cross.append({
+                    "ext_comp": cn.comp_b, "ext_port": cn.port_b,
+                    "int_port_name": int_port_name,
+                })
+            else:
+                int_port_name = old_port_names.get(cn.comp_b, {}).get(cn.port_b)
+                saved_cross.append({
+                    "ext_comp": cn.comp_a, "ext_port": cn.port_a,
+                    "int_port_name": int_port_name,
+                })
+
+        # 1. Remove old sub-group components (purges their connections)
         for cid in self._old_sg_comp_ids:
             design.remove(cid)
 
@@ -1189,7 +1270,6 @@ class ReplaceSubgroupCellCmd:
 
         # 3. Patch the merged group's member_ids: replace old IDs with new IDs
         #    in-place, preserving the order of all other sub-groups' members.
-        old_id_set = set(self._old_sg_comp_ids)
         new_members: List[str] = []
         inserted = False
         for cid in self._old_all_member_ids:
@@ -1210,6 +1290,26 @@ class ReplaceSubgroupCellCmd:
         if 0 <= self._sg_index < len(cell_subgroups):
             cell_subgroups[self._sg_index] = self._updated_sg_entry
         group._cell_subgroups = cell_subgroups
+
+        # 5. Restore cross-boundary connections onto the new components.
+        if saved_cross:
+            new_port_by_name: dict[str, tuple[str, str]] = {}
+            for cid in self._new_comp_ids:
+                comp = design.get(cid)
+                if comp:
+                    for port in comp.ports:
+                        new_port_by_name[port.name] = (comp.id, port.id)
+
+            for entry in saved_cross:
+                new_end = new_port_by_name.get(entry["int_port_name"])
+                if new_end is None:
+                    # Port name no longer exists on rebuilt geometry; drop silently.
+                    continue
+                new_int_comp, new_int_port = new_end
+                design.connect(
+                    entry["ext_comp"], entry["ext_port"],
+                    new_int_comp,      new_int_port,
+                )
 
         design.is_dirty = True
 
