@@ -230,11 +230,27 @@ class GroupComponents(Command):
     """
     Collect existing components into a named ComponentGroup.
     Components stay in the scene — only a group record is added.
+
+    _cell_subgroups is always populated so the Properties panel can treat
+    item+item, cell+item, and cell+cell groups uniformly via one code path.
+    Each entry has cell_id=None and empty cell_params for plain items.
     """
 
     def __init__(self, comp_ids: List[str], name: str) -> None:
         from core.model import ComponentGroup
         self._group = ComponentGroup(name=name, member_ids=list(comp_ids))
+        # Each bare component gets its own sub-group entry so the panel can
+        # render per-member controls without special-casing this command.
+        self._group._cell_subgroups = [
+            {
+                "name":                f"comp:{cid}",
+                "cell_id":             None,
+                "cell_params":         {},
+                "cell_rotation_steps": 0,
+                "member_ids":          [cid],
+            }
+            for cid in comp_ids
+        ]
 
     def execute(self, design: DesignScene) -> None:
         design.add_group(self._group)
@@ -300,7 +316,8 @@ class MergeGroups(Command):
         self._source_snapshots: List[ComponentGroup] = []
         for g in source_groups:
             snap = ComponentGroup(name=g.name, member_ids=list(g.member_ids), id=g.id)
-            for attr in ("cell_id", "_cell_params", "_cell_origin", "_cell_rotation_steps"):
+            for attr in ("cell_id", "_cell_params", "_cell_origin",
+                         "_cell_rotation_steps", "_cell_subgroups"):
                 if hasattr(g, attr):
                     setattr(snap, attr, getattr(g, attr))
             self._source_snapshots.append(snap)
@@ -370,9 +387,15 @@ class MergeGroups(Command):
     def undo(self, design: DesignScene) -> None:
         # Remove the merged group
         design.remove_group(self._merged.id)
-        # Recreate each source group with its original id and membership
+        # Recreate each source group with its original id, membership, AND
+        # _cell_subgroups so that parametric cell metadata is fully restored.
         for snap in self._source_snapshots:
-            design.add_group(snap)
+            g = ComponentGroup(name=snap.name, member_ids=list(snap.member_ids), id=snap.id)
+            for attr in ("cell_id", "_cell_params", "_cell_origin",
+                         "_cell_rotation_steps", "_cell_subgroups"):
+                if hasattr(snap, attr):
+                    setattr(g, attr, getattr(snap, attr))
+            design.add_group(g)
 
     @property
     def description(self) -> str:
@@ -716,6 +739,17 @@ class PlaceCellCommand(Command):
         self._group._cell_params = dict(self._cell_params)
         if self._cell_origin is not None:
             self._group._cell_origin = self._cell_origin
+        # _cell_subgroups: single-cell groups get one entry matching the whole
+        # group, so the panel can always use the unified _cell_subgroups path.
+        self._group._cell_subgroups = [
+            {
+                "name":                self._result.group_name,
+                "cell_id":             self._cell_id,
+                "cell_params":         dict(self._cell_params),
+                "cell_rotation_steps": 0,
+                "member_ids":          list(self._comp_ids),
+            }
+        ]
         design.add_group(self._group)
 
     def undo(self, design: DesignScene) -> None:
@@ -755,6 +789,9 @@ class PasteComponents(Command):
                 comp.build_default_ports()
             design.add(comp)
         if self._group is not None:
+            # Deep-copy carries dynamic attrs (cell_id, _cell_params,
+            # _cell_subgroups) automatically from the Clipboard snapshot;
+            # no extra work needed here.
             design.add_group(self._group)
 
     def undo(self, design: DesignScene) -> None:
@@ -960,3 +997,119 @@ class ReplaceCellCmd:
             old_g._cell_origin = self._cell_origin
         old_g._cell_rotation_steps = self._rotation_steps
         design.add_group(old_g)
+
+class ReplaceSubgroupCellCmd:
+    """
+    Replace the components of ONE cell sub-group inside a merged group,
+    leaving all other sub-groups' components untouched.
+
+    This is the undo-able counterpart to ReplaceSubgroupCellCmd used when a
+    parameter spinbox fires inside a merged/cell+item/cell+cell group.
+
+    execute:
+      1. Remove the old sub-group's components from the design.
+      2. Add the new components from new_cell_result.
+      3. Patch the merged group's member_ids (swap old → new comp IDs).
+      4. Patch _cell_subgroups[sg_index] with updated_sg_entry (new IDs + params).
+
+    undo:
+      Reverse exactly: remove new components, restore old ones, restore
+      member_ids and _cell_subgroups entry to the pre-edit state.
+    """
+
+    def __init__(
+        self,
+        group_id: str,
+        sg_index: int,
+        old_sg_comp_ids: List[str],
+        old_sg_comps: List["GDSComponent"],   # deep-copied snapshots
+        new_cell_result: "CellResult",
+        updated_sg_entry: dict,               # member_ids=[] — filled in execute
+        old_sg_entry: dict,
+        old_all_member_ids: List[str],
+        cdef_name: str,
+        param_key: str,
+        new_value,
+    ) -> None:
+        self._group_id           = group_id
+        self._sg_index           = sg_index
+        self._old_sg_comp_ids    = list(old_sg_comp_ids)
+        self._old_sg_comps       = old_sg_comps
+        self._new_result         = new_cell_result
+        self._updated_sg_entry   = updated_sg_entry   # mutated in execute
+        self._old_sg_entry       = old_sg_entry
+        self._old_all_member_ids = list(old_all_member_ids)
+        self._cdef_name          = cdef_name
+        self._param_key          = param_key
+        self._new_value          = new_value
+        # New component IDs are determined at execute time
+        self._new_comp_ids: List[str] = []
+
+    def execute(self, design: DesignScene) -> None:
+        group = design.get_group(self._group_id)
+        if group is None:
+            return
+
+        # 1. Remove old sub-group components
+        for cid in self._old_sg_comp_ids:
+            design.remove(cid)
+
+        # 2. Add new components
+        self._new_comp_ids = []
+        for comp in self._new_result.components:
+            design.add(comp)
+            self._new_comp_ids.append(comp.id)
+
+        # 3. Patch the merged group's member_ids: replace old IDs with new IDs
+        #    in-place, preserving the order of all other sub-groups' members.
+        old_id_set = set(self._old_sg_comp_ids)
+        new_members: List[str] = []
+        inserted = False
+        for cid in self._old_all_member_ids:
+            if cid in old_id_set:
+                if not inserted:
+                    new_members.extend(self._new_comp_ids)
+                    inserted = True
+                # skip old IDs
+            else:
+                new_members.append(cid)
+        if not inserted:
+            new_members.extend(self._new_comp_ids)
+        group.member_ids = new_members
+
+        # 4. Update _cell_subgroups entry with new IDs and params
+        self._updated_sg_entry["member_ids"] = list(self._new_comp_ids)
+        cell_subgroups = getattr(group, "_cell_subgroups", [])
+        if 0 <= self._sg_index < len(cell_subgroups):
+            cell_subgroups[self._sg_index] = self._updated_sg_entry
+        group._cell_subgroups = cell_subgroups
+
+        design.is_dirty = True
+
+    def undo(self, design: DesignScene) -> None:
+        group = design.get_group(self._group_id)
+        if group is None:
+            return
+
+        # Remove new components
+        for cid in self._new_comp_ids:
+            design.remove(cid)
+
+        # Restore old components
+        for comp in self._old_sg_comps:
+            design.add(comp)
+
+        # Restore the original flat member_ids list
+        group.member_ids = list(self._old_all_member_ids)
+
+        # Restore the original _cell_subgroups entry
+        cell_subgroups = getattr(group, "_cell_subgroups", [])
+        if 0 <= self._sg_index < len(cell_subgroups):
+            cell_subgroups[self._sg_index] = self._old_sg_entry
+        group._cell_subgroups = cell_subgroups
+
+        design.is_dirty = True
+
+    @property
+    def description(self) -> str:
+        return f"Edit {self._cdef_name}: {self._param_key} = {self._new_value}"

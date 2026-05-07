@@ -1723,59 +1723,60 @@ class PropertiesPanel(QWidget):
 
     def _rebuild_cell_params(self, group) -> None:
         """
-        If the group was created by a catalogue cell (group.cell_id is set),
-        render an editable parameter section above the member cards.
-        Otherwise hides the section cleanly.
+        Render editable parameter sections for all cell sub-groups contained in
+        *group*, covering every grouping combination:
+
+          item+item   — no cell sub-groups have a cell_id → no param sections shown
+          cell alone  — one sub-group with cell_id → one param section
+          cell+cell   — two sub-groups each with cell_id → two param sections
+          cell+item   — one cell sub-group shows params; item sub-group is silent
+
+        The legacy path (group.cell_id set but no _cell_subgroups) is still
+        handled for files saved before this change: a synthetic single-entry
+        _cell_subgroups list is constructed from the legacy attrs so the same
+        rendering loop works unchanged.
+
+        All widgets are placed in a single container that is inserted above the
+        scrollable member-cards area.
         """
-        # Clear any existing params widget.
-        # IMPORTANT: hide() before setParent(None) — otherwise Qt briefly
-        # promotes the widget to a top-level window between reparenting and
-        # deleteLater(), which causes a visible flash/popup on every selection.
+        # IMPORTANT: hide() before setParent(None) to avoid a Qt flash where
+        # the widget briefly becomes a top-level window during reparenting.
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
             self._cell_params_widget.hide()
             self._cell_params_widget.setParent(None)
             self._cell_params_widget.deleteLater()
             self._cell_params_widget = None
 
-        # Match via the cell_id attribute stamped by PlaceCellCommand
-        cell_id = getattr(group, "cell_id", None)
-        if not cell_id:
-            return
-        matched_cdef = CELL_BY_ID.get(cell_id)
-        if matched_cdef is None:
-            return
+        # ── Resolve sub-groups list ───────────────────────────────────────────
+        # Prefer the explicit _cell_subgroups (set by all modern commands).
+        # Fall back to a synthetic single-entry list for legacy files that only
+        # have group.cell_id / group._cell_params.
+        cell_subgroups = getattr(group, "_cell_subgroups", None)
+        if not cell_subgroups:
+            legacy_cell_id = getattr(group, "cell_id", None)
+            if legacy_cell_id:
+                cell_subgroups = [
+                    {
+                        "name":                group.name,
+                        "cell_id":             legacy_cell_id,
+                        "cell_params":         dict(getattr(group, "_cell_params", {})),
+                        "cell_rotation_steps": 0,
+                        "member_ids":          list(group.member_ids),
+                    }
+                ]
+            else:
+                return   # item+item group — no cell params to show
 
-        # Current param values: start from catalogue defaults, overlay stored overrides
-        current_params = dict(matched_cdef.defaults)
-        stored = getattr(group, "_cell_params", {})
-        current_params.update(stored)
+        # Filter down to only sub-groups that have a real cell_id
+        cell_sgs = [
+            (sg_index, sg)
+            for sg_index, sg in enumerate(cell_subgroups)
+            if sg.get("cell_id") and CELL_BY_ID.get(sg["cell_id"]) is not None
+        ]
+        if not cell_sgs:
+            return   # all sub-groups are plain items — nothing to render
 
-        # ── Build the params widget ───────────────────────────────────────────
-        w = QWidget()
-        w.setStyleSheet(f"""
-            QWidget {{
-                background: {Colors.BG_ELEVATED};
-                border-bottom: 1px solid {Colors.BG_BORDER};
-            }}
-        """)
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(Geometry.PANEL_PADDING, 10,
-                               Geometry.PANEL_PADDING, 10)
-        lay.setSpacing(6)
-
-        header_lbl = QLabel("Cell Parameters")
-        header_lbl.setStyleSheet(
-            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SM}px; "
-            f"font-weight: bold; background: transparent; border: none;"
-        )
-        hint_lbl = QLabel("Edit then re-place to apply")
-        hint_lbl.setStyleSheet(
-            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
-            f"background: transparent; border: none;"
-        )
-        lay.addWidget(header_lbl)
-        lay.addWidget(hint_lbl)
-
+        # ── Shared styles ─────────────────────────────────────────────────────
         spin_style = f"""
             QDoubleSpinBox, QSpinBox, QComboBox {{
                 background: {Colors.BG_BASE};
@@ -1788,75 +1789,130 @@ class PropertiesPanel(QWidget):
             QDoubleSpinBox:hover, QComboBox:hover {{ border-color: {Colors.ACCENT_DIM}; }}
             QDoubleSpinBox::up-button, QDoubleSpinBox::down-button {{ width: 14px; }}
         """
-
         _STRING_OPTIONS: dict[str, list[str]] = {
             "cap_style":      ["top", "side"],
             "undercut_style": ["right", "top"],
         }
 
-        group_id  = group.id
-        cell_id   = matched_cdef.cell_id
+        # ── Outer container ───────────────────────────────────────────────────
+        w = QWidget()
+        w.setStyleSheet(f"""
+            QWidget {{
+                background: {Colors.BG_ELEVATED};
+                border-bottom: 1px solid {Colors.BG_BORDER};
+            }}
+        """)
+        outer_lay = QVBoxLayout(w)
+        outer_lay.setContentsMargins(Geometry.PANEL_PADDING, 8,
+                                     Geometry.PANEL_PADDING, 8)
+        outer_lay.setSpacing(0)
 
-        for key, default in matched_cdef.defaults.items():
-            current_val = current_params.get(key, default)
-            row = QHBoxLayout()
-            lbl = QLabel(key.replace("_", " "))
-            lbl.setStyleSheet(
-                f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
-                f"background: transparent; border: none;"
-            )
-            lbl.setFixedWidth(90)
+        # Section header (always shown once at the top)
+        header_lbl = QLabel("Cell Parameters")
+        header_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SM}px; "
+            f"font-weight: bold; background: transparent; border: none;"
+        )
+        hint_lbl = QLabel("Edit a value to re-place that cell in-place")
+        hint_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+            f"background: transparent; border: none;"
+        )
+        outer_lay.addWidget(header_lbl)
+        outer_lay.addWidget(hint_lbl)
 
-            if isinstance(default, float):
-                sb = _ParamSpinBox()
-                sb.setDecimals(3)
-                sb.setRange(0.001, 1000.0)
-                sb.setSingleStep(0.1)
-                sb.setSuffix(" µm")
-                sb.setValue(current_val)
-                sb.setFixedWidth(110)
-                sb.setStyleSheet(spin_style)
-                sb.editingFinished.connect(
-                    lambda _k=key, _sb=sb, _gid=group_id, _cid=cell_id:
-                        self.cell_param_change_requested.emit(_gid, _cid, _k, _sb.value())
+        group_id   = group.id
+        multi_cell = len(cell_sgs) > 1
+
+        for sg_index, sg in cell_sgs:
+            cdef   = CELL_BY_ID[sg["cell_id"]]
+            # Encode the sub-group index into cell_id so the main-window slot
+            # can route to ReplaceSubgroupCellCmd for merged groups, and to
+            # ReplaceCellCmd for plain single-cell groups.
+            # For single-cell groups (_cell_subgroups has exactly 1 entry and
+            # the index is 0), the receiver checks for the colon suffix and
+            # routes accordingly — so this encoding is always safe.
+            encoded_cell_id = f"{cdef.cell_id}:{sg_index}"
+
+            # Current params: catalogue defaults → stored overrides
+            current_params = dict(cdef.defaults)
+            current_params.update(sg.get("cell_params", {}))
+
+            # Sub-group divider label (only when there are multiple cell sub-groups)
+            if multi_cell:
+                sep = QFrame()
+                sep.setFrameShape(QFrame.Shape.HLine)
+                sep.setStyleSheet(f"color: {Colors.BG_BORDER}; margin: 4px 0;")
+                outer_lay.addWidget(sep)
+
+                sg_lbl = QLabel(f"▸ {sg.get('name', cdef.name)}")
+                sg_lbl.setStyleSheet(
+                    f"color: {Colors.ACCENT}; font-size: {Fonts.SIZE_XS}px; "
+                    f"font-weight: bold; background: transparent; border: none; "
+                    f"padding-top: 4px;"
                 )
-                row.addWidget(lbl)
-                row.addWidget(sb)
-                row.addStretch()
+                outer_lay.addWidget(sg_lbl)
 
-            elif isinstance(default, str):
-                options = _STRING_OPTIONS.get(key)
-                if options:
-                    combo = QComboBox()
-                    combo.addItems(options)
-                    combo.setCurrentText(str(current_val))
-                    combo.setFixedWidth(110)
-                    combo.setStyleSheet(spin_style)
-                    # NoFocus prevents the combo from grabbing focus when the
-                    # panel is rebuilt on selection change, which was causing
-                    # the dropdown to pop open immediately on every cell click.
-                    combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-                    combo.currentTextChanged.connect(
-                        lambda val, _k=key, _gid=group_id, _cid=cell_id:
-                            self.cell_param_change_requested.emit(_gid, _cid, _k, val)
+            # ── One row per parameter ─────────────────────────────────────────
+            for key, default in cdef.defaults.items():
+                current_val = current_params.get(key, default)
+                row = QHBoxLayout()
+                row.setContentsMargins(0, 2, 0, 2)
+
+                lbl = QLabel(key.replace("_", " "))
+                lbl.setStyleSheet(
+                    f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px; "
+                    f"background: transparent; border: none;"
+                )
+                lbl.setFixedWidth(90)
+
+                if isinstance(default, float):
+                    sb = _ParamSpinBox()
+                    sb.setDecimals(3)
+                    sb.setRange(0.001, 1000.0)
+                    sb.setSingleStep(0.1)
+                    sb.setSuffix(" µm")
+                    sb.setValue(current_val)
+                    sb.setFixedWidth(110)
+                    sb.setStyleSheet(spin_style)
+                    sb.editingFinished.connect(
+                        lambda _k=key, _sb=sb, _gid=group_id, _cid=encoded_cell_id:
+                            self.cell_param_change_requested.emit(_gid, _cid, _k, _sb.value())
                     )
                     row.addWidget(lbl)
-                    row.addWidget(combo)
-                    row.addStretch()
-                else:
-                    val_lbl = QLabel(str(default))
-                    val_lbl.setStyleSheet(
-                        f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px; "
-                        f"background: transparent; border: none;"
-                    )
-                    row.addWidget(lbl)
-                    row.addWidget(val_lbl)
+                    row.addWidget(sb)
                     row.addStretch()
 
-            lay.addLayout(row)
+                elif isinstance(default, str):
+                    options = _STRING_OPTIONS.get(key)
+                    if options:
+                        combo = QComboBox()
+                        combo.addItems(options)
+                        combo.setCurrentText(str(current_val))
+                        combo.setFixedWidth(110)
+                        combo.setStyleSheet(spin_style)
+                        combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+                        combo.currentTextChanged.connect(
+                            lambda val, _k=key, _gid=group_id, _cid=encoded_cell_id:
+                                self.cell_param_change_requested.emit(_gid, _cid, _k, val)
+                        )
+                        row.addWidget(lbl)
+                        row.addWidget(combo)
+                        row.addStretch()
+                    else:
+                        val_lbl = QLabel(str(current_val))
+                        val_lbl.setStyleSheet(
+                            f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_XS}px; "
+                            f"background: transparent; border: none;"
+                        )
+                        row.addWidget(lbl)
+                        row.addWidget(val_lbl)
+                        row.addStretch()
+
+                outer_lay.addLayout(row)
 
         self._cell_params_widget = w
-        # Insert above the scrollable cards area (index 1 = after the fixed header)
+        # Insert above the scrollable cards area (index 1 = after the fixed header).
         # The group page root layout is: [0]=grp_header  [1]=cards_scroll
         grp_page = self._stack.widget(1)
         grp_page.layout().insertWidget(1, w)

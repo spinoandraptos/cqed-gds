@@ -26,7 +26,8 @@ from core.cell_library import CELL_BY_ID, Point, place_cell
 from core.clipboard import Clipboard
 from core.commands import (
     BatchCommand, EditComponent, GroupComponents, MergeGroups,
-    RemoveComponent, RemoveGroup, ReplaceCellCmd, UngroupComponents,
+    RemoveComponent, RemoveGroup, ReplaceCellCmd, ReplaceSubgroupCellCmd,
+    UngroupComponents,
 )
 from core.model import ComponentKind, DesignScene
 from core.serialiser import SerialisationError, load, save
@@ -383,19 +384,133 @@ class MainWindow(QMainWindow):
         self._enter_mode(self._KIND_TO_MODE[kind], layer)
 
     @pyqtSlot(str, str, str, object)
-    def _on_cell_param_change_requested(self, group_id: str, cell_id: str,
+    def _on_cell_param_change_requested(self, group_id: str, cell_id_encoded: str,
                                         param_key: str, new_value) -> None:
         """
         Re-place a parametric cell in-place with an updated parameter value.
-        Wrapped in a single undo-able ReplaceCellCmd so the change is atomic.
+
+        Handles two cases:
+
+        1. Single-cell group (group.cell_id is set, no _cell_subgroups):
+           Delegates to ReplaceCellCmd — original behaviour unchanged.
+
+        2. Merged group (_cell_subgroups present):
+           cell_id_encoded = "<real_cell_id>:<sg_index>" (set by the panel).
+           Only the components belonging to that sub-group are replaced.
+           All other sub-groups' components are left untouched.
+           Uses ReplaceSubgroupCellCmd so the operation is fully undo-able.
         """
         group = self._design.get_group(group_id)
         if group is None:
             return
+
+        # ── Decode cell_id — may carry a sub-group index suffix ────────────────
+        # Merged-group panels encode cell_id as "<real_cell_id>:<sg_index>".
+        # Single-cell groups emit the plain cell_id (no colon suffix).
+        sg_index: int | None = None
+        cell_id = cell_id_encoded
+        if ":" in cell_id_encoded:
+            parts = cell_id_encoded.rsplit(":", 1)
+            if parts[1].isdigit():
+                cell_id  = parts[0]
+                sg_index = int(parts[1])
+
         cdef = CELL_BY_ID.get(cell_id)
         if cdef is None:
             return
 
+        # ── Case 2: merged group with _cell_subgroups ──────────────────────────
+        cell_subgroups = getattr(group, "_cell_subgroups", [])
+        if sg_index is not None and 0 <= sg_index < len(cell_subgroups):
+            sg = cell_subgroups[sg_index]
+
+            # Build updated params for this sub-group only.
+            params = dict(cdef.defaults)
+            params.update(sg.get("cell_params", {}))
+            params[param_key] = new_value
+
+            # Recover the sub-group's cell origin from its first live member
+            # using the same dry-run strategy as the single-cell legacy path.
+            sg_comp_ids  = list(sg.get("member_ids", []))
+            old_sg_comps = [c for cid in sg_comp_ids
+                            if (c := self._design.get(cid)) is not None]
+            first_comp   = old_sg_comps[0] if old_sg_comps else None
+
+            origin = None
+            if first_comp is not None:
+                zero = Point(0, 0)
+                original_params = dict(cdef.defaults)
+                original_params.update(sg.get("cell_params", {}))
+                try:
+                    dry_result = place_cell(cell_id, zero, params=original_params)
+                    dry_anchor = dry_result.components[0]
+                    origin     = Point(
+                        first_comp.origin.x - dry_anchor.origin.x,
+                        first_comp.origin.y - dry_anchor.origin.y,
+                    )
+                except Exception:
+                    pass
+            if origin is None:
+                if old_sg_comps:
+                    origin = Point(
+                        min(c.bbox.x_min for c in old_sg_comps),
+                        min(c.bbox.y_min for c in old_sg_comps),
+                    )
+                else:
+                    origin = Point(0, 0)
+
+            try:
+                new_result = place_cell(cell_id, origin, params=params)
+            except (KeyError, ValueError) as exc:
+                QMessageBox.warning(self, "Cell Parameter", str(exc))
+                return
+
+            # Re-apply any baked-in rotation for this sub-group.
+            rotation_steps = sg.get("cell_rotation_steps", 0)
+            if rotation_steps:
+                from core.commands import _rotate_component_in_place
+                ox, oy = origin.x, origin.y
+                for comp in new_result.components:
+                    _rotate_component_in_place(comp, ox, oy, rotation_steps)
+
+            # Build the updated _cell_subgroups entry (member_ids filled by cmd).
+            updated_sg_entry = {
+                "name":                sg.get("name", cdef.name),
+                "cell_id":             cell_id,
+                "cell_params":         dict(params),
+                "cell_rotation_steps": rotation_steps,
+                "member_ids":          [],   # ReplaceSubgroupCellCmd.execute fills this
+            }
+
+            import copy as _copy
+            old_sg_comps_snapshot = [_copy.deepcopy(c) for c in old_sg_comps]
+
+            cmd = ReplaceSubgroupCellCmd(
+                group_id            = group_id,
+                sg_index            = sg_index,
+                old_sg_comp_ids     = sg_comp_ids,
+                old_sg_comps        = old_sg_comps_snapshot,
+                new_cell_result     = new_result,
+                updated_sg_entry    = updated_sg_entry,
+                old_sg_entry        = dict(sg),
+                old_all_member_ids  = list(group.member_ids),
+                cdef_name           = cdef.name,
+                param_key           = param_key,
+                new_value           = new_value,
+            )
+            self._scene.cmd_stack.execute(cmd)
+
+            # Re-select the same GroupItem so the panel stays visible.
+            gi = self._scene._group_items.get(group_id)
+            if gi is not None:
+                self._scene.clearSelection()
+                gi.setSelected(True)
+                self._scene.group_selected.emit(group_id)
+
+            self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
+            return
+
+        # ── Case 1: single-cell group (original behaviour, fully preserved) ────
         # Build updated params: defaults → any stored overrides → this change.
         params = dict(cdef.defaults)
         if hasattr(group, "_cell_params"):

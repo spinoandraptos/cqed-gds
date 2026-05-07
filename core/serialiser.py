@@ -65,7 +65,15 @@ def _encode(design: DesignScene) -> dict:
     }
 
 def _encode_group(g) -> dict:
-    return {"id": g.id, "name": g.name, "member_ids": list(g.member_ids)}
+    d: dict = {"id": g.id, "name": g.name, "member_ids": list(g.member_ids)}
+    # Persist optional dynamic attrs so merged/cell groups survive save/load.
+    if hasattr(g, "cell_id") and g.cell_id:
+        d["cell_id"] = g.cell_id
+    if hasattr(g, "_cell_params") and g._cell_params:
+        d["cell_params"] = dict(g._cell_params)
+    if hasattr(g, "_cell_subgroups") and g._cell_subgroups:
+        d["cell_subgroups"] = g._cell_subgroups
+    return d
 
 
 def _encode_comp(c: GDSComponent) -> dict:
@@ -126,10 +134,15 @@ def _decode(data: dict) -> DesignScene:
         design._connections.append(_decode_conn(cn))
 
     for gd in data.get("groups", []):
-        design._groups.append(
-            ComponentGroup(id=gd["id"], name=gd["name"],
-                        member_ids=gd["member_ids"])
-        )
+        g = ComponentGroup(id=gd["id"], name=gd["name"],
+                           member_ids=gd["member_ids"])
+        if "cell_id" in gd:
+            g.cell_id = gd["cell_id"]
+        if "cell_params" in gd:
+            g._cell_params = dict(gd["cell_params"])
+        if "cell_subgroups" in gd:
+            g._cell_subgroups = gd["cell_subgroups"]
+        design._groups.append(g)
 
     design.is_dirty = False
     return design
