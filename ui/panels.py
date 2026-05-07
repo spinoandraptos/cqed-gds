@@ -20,7 +20,7 @@ from PyQt6.QtWidgets import (
     QFrame, QPushButton, QSizePolicy, QScrollArea,
     QApplication,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray, QPointF
+from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray, QPointF, QTimer
 from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QPen, QPainterPath, QDrag, QMouseEvent
 
 from ui.theme import Colors, Fonts, Geometry
@@ -1771,10 +1771,10 @@ class PropertiesPanel(QWidget):
             f" → ({dbu_to_um(bb.x_max):.1f}, {dbu_to_um(bb.y_max):.1f}) µm"
         )
 
-        # ── Cell params section (shown when group matches a catalogue cell) ───
-        # Must be called BEFORE rebuilding cards since it inserts into _cards_layout.
-        # Also remove any stale cell_params_widget from the layout first (it is now
-        # inside _cards_layout at index 0, not above the scroll area).
+        # ── Clear stale cell params widget (now lives inside _cards_layout) ────
+        # Must be removed BEFORE the member-card cleanup loop below, because
+        # _rebuild_cell_params inserts the new widget at index 0 and the loop
+        # would immediately delete it (takeAt(0) hits the new widget first).
         if hasattr(self, "_cell_params_widget") and self._cell_params_widget is not None:
             _w = self._cell_params_widget
             self._cell_params_widget = None   # clear ref FIRST, before any Qt call
@@ -1782,13 +1782,19 @@ class PropertiesPanel(QWidget):
                 _w.setParent(None)
             except RuntimeError:
                 pass   # C++ object already deleted — nothing to do
-        self._rebuild_cell_params(group)
 
-        # Rebuild member cards
+        # ── Clear old member cards ────────────────────────────────────────────
+        # Do this BEFORE _rebuild_cell_params so the cell params widget it
+        # inserts at index 0 is not immediately removed by this loop.
         while self._cards_layout.count() > 1:
             item = self._cards_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+
+        # ── Cell params section (shown when group matches a catalogue cell) ───
+        # Inserts a widget at index 0 of _cards_layout so params + member cards
+        # scroll together inside the QScrollArea.
+        self._rebuild_cell_params(group)
 
         for comp in members:
             card = MemberCard(comp, design)
@@ -1877,6 +1883,9 @@ class PropertiesPanel(QWidget):
         _STRING_OPTIONS: dict[str, list[str]] = {
             "cap_style":      ["top", "side"],
             "undercut_style": ["right", "top"],
+            "direction":      ["+x", "-x", "+y", "-y"],
+            "narrow_end":     ["start", "end"],
+            "stem_dir":       ["+x", "-x", "+y", "-y"],
         }
 
         # ── Outer container ───────────────────────────────────────────────────
@@ -1890,7 +1899,7 @@ class PropertiesPanel(QWidget):
         outer_lay = QVBoxLayout(w)
         outer_lay.setContentsMargins(Geometry.PANEL_PADDING, 8,
                                      Geometry.PANEL_PADDING, 8)
-        outer_lay.setSpacing(0)
+        outer_lay.setSpacing(4)
 
         # Section header (always shown once at the top)
         header_lbl = QLabel("Cell Parameters")
@@ -1951,7 +1960,54 @@ class PropertiesPanel(QWidget):
                 )
                 lbl.setFixedWidth(90)
 
-                if isinstance(default, float):
+                if isinstance(default, bool):
+                    # Bool params render as a small toggle button (ON / OFF).
+                    # Must be checked before float because bool is a subclass of int.
+                    btn = QPushButton("ON" if current_val else "OFF")
+                    btn.setCheckable(True)
+                    btn.setChecked(bool(current_val))
+                    btn.setFixedWidth(110)
+                    btn.setStyleSheet(f"""
+                        QPushButton {{
+                            background: {Colors.ACCENT if current_val else Colors.BG_BASE};
+                            color: {"#fff" if current_val else Colors.TEXT_MUTED};
+                            border: 1px solid {Colors.ACCENT_DIM if current_val else Colors.BG_BORDER};
+                            border-radius: 3px;
+                            font-size: {Fonts.SIZE_XS}px;
+                            padding: 2px 4px;
+                        }}
+                        QPushButton:hover {{
+                            border-color: {Colors.ACCENT_DIM};
+                        }}
+                    """)
+
+                    def _make_toggle_handler(_k, _btn, _gid, _cid):
+                        def _on_toggled(checked: bool) -> None:
+                            _btn.setText("ON" if checked else "OFF")
+                            _btn.setStyleSheet(f"""
+                                QPushButton {{
+                                    background: {Colors.ACCENT if checked else Colors.BG_BASE};
+                                    color: {"#fff" if checked else Colors.TEXT_MUTED};
+                                    border: 1px solid {Colors.ACCENT_DIM if checked else Colors.BG_BORDER};
+                                    border-radius: 3px;
+                                    font-size: {Fonts.SIZE_XS}px;
+                                    padding: 2px 4px;
+                                }}
+                                QPushButton:hover {{
+                                    border-color: {Colors.ACCENT_DIM};
+                                }}
+                            """)
+                            QTimer.singleShot(0, lambda: self.cell_param_change_requested.emit(_gid, _cid, _k, checked))
+                        return _on_toggled
+
+                    btn.toggled.connect(
+                        _make_toggle_handler(key, btn, group_id, encoded_cell_id)
+                    )
+                    row.addWidget(lbl)
+                    row.addWidget(btn)
+                    row.addStretch()
+
+                elif isinstance(default, float):
                     sb = _ParamSpinBox()
                     sb.setDecimals(3)
                     sb.setRange(0.001, 1000.0)
@@ -1960,9 +2016,17 @@ class PropertiesPanel(QWidget):
                     sb.setValue(current_val)
                     sb.setFixedWidth(110)
                     sb.setStyleSheet(spin_style)
+                    def _make_float_handler(_k, _sb, _gid, _cid):
+                        def _on_editing_finished() -> None:
+                            try:
+                                val = _sb.value()
+                            except RuntimeError:
+                                return   # C++ spinbox already deleted — skip
+                            QTimer.singleShot(0, lambda: self.cell_param_change_requested.emit(_gid, _cid, _k, val))
+                        return _on_editing_finished
+
                     sb.editingFinished.connect(
-                        lambda _k=key, _sb=sb, _gid=group_id, _cid=encoded_cell_id:
-                            self.cell_param_change_requested.emit(_gid, _cid, _k, _sb.value())
+                        _make_float_handler(key, sb, group_id, encoded_cell_id)
                     )
                     row.addWidget(lbl)
                     row.addWidget(sb)
@@ -1973,13 +2037,15 @@ class PropertiesPanel(QWidget):
                     if options:
                         combo = QComboBox()
                         combo.addItems(options)
+                        combo.blockSignals(True)
                         combo.setCurrentText(str(current_val))
+                        combo.blockSignals(False)
                         combo.setFixedWidth(110)
                         combo.setStyleSheet(spin_style)
                         combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
                         combo.currentTextChanged.connect(
                             lambda val, _k=key, _gid=group_id, _cid=encoded_cell_id:
-                                self.cell_param_change_requested.emit(_gid, _cid, _k, val)
+                                QTimer.singleShot(0, lambda: self.cell_param_change_requested.emit(_gid, _cid, _k, val))
                         )
                         row.addWidget(lbl)
                         row.addWidget(combo)

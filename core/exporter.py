@@ -130,6 +130,14 @@ def export_gds(
     are boolean-unioned into a single merged shape.  All other components
     are written individually.
 
+    L2 (UNDERCUT_RING_LAYER) merge pass:
+        After all geometry is written to the cell, every polygon on L2 is
+        collected and boolean-ORed into the minimum set of non-overlapping
+        polygons.  This ensures that narrow-end undercut shapes emitted by
+        taper_segment cells (also on L2) merge seamlessly with any adjacent
+        outer undercut rings, producing one smooth unified outline in the GDS
+        regardless of how the individual components were placed.
+
     Returns a verification summary dict:
         {
             "path":       str,
@@ -170,6 +178,13 @@ def export_gds(
         # ── Emit undercut rings if overlay is active ──────────────────────────
         if overlay is not None:
             export_undercut_rings(cell, design, overlay, layer_map)
+
+        # ── L2 merge pass: union all undercut-ring polygons ───────────────────
+        # Narrow-end undercut shapes (from taper_segment cells with
+        # narrow_undercut=True) and outer undercut rings both live on L2.
+        # Boolean-OR the entire L2 layer so coincident or touching shapes
+        # unify into one smooth outline before the file is written.
+        _merge_undercut_layer(cell, layer_map)
 
         lib.write_gds(str(path))
 
@@ -409,6 +424,55 @@ def _build_gdstk_ring(
                              layer=gds_layer, datatype=datatype)
 
     return ring if ring else []
+
+
+# ── L2 merge pass ─────────────────────────────────────────────────────────────
+
+def _merge_undercut_layer(cell, layer_map: LayerMap) -> None:
+    """
+    Boolean-OR all polygons on UNDERCUT_RING_LAYER (app-layer 2) that are
+    already in *cell*, replace them with the unified result.
+
+    This is called as the final step of export_gds(), after both the regular
+    component geometry AND any overlay-derived undercut ring polygons have been
+    added.  It ensures that:
+
+      • Narrow-end undercut polygons emitted by taper_segment cells (L2) merge
+        with outer undercut rings (also L2) that overlap or touch them.
+      • Any other coincident L2 shapes (e.g. from overlapping group rings) are
+        also cleaned up — no duplicate geometry in the final file.
+
+    Only the resolved (gds_layer, datatype) pair that corresponds to app-layer 2
+    is processed.  All other layers are left untouched.
+    """
+    gds_layer, datatype = _resolve(UNDERCUT_RING_LAYER, layer_map)
+
+    # Collect every polygon on the target (gds_layer, datatype) pair.
+    # cell.polygons returns all Polygon objects currently in the cell.
+    l2_polys = [
+        p for p in cell.polygons
+        if p.layer == gds_layer and p.datatype == datatype
+    ]
+
+    if len(l2_polys) < 2:
+        return  # nothing to merge — zero or one polygon, no-op
+
+    # Remove the originals from the cell so we can replace them.
+    for p in l2_polys:
+        cell.remove(p)
+
+    # Boolean OR → unified outline(s)
+    merged = gdstk.boolean(
+        l2_polys, [],
+        operation="or",
+        layer=gds_layer,
+        datatype=datatype,
+    )
+    if merged:
+        cell.add(*merged)
+    else:
+        # Degenerate — put the originals back rather than silently deleting them
+        cell.add(*l2_polys)
 
 
 # ── Verification ──────────────────────────────────────────────────────────────

@@ -24,7 +24,7 @@ Cells implemented
 -----------------
   byisk_jj       — bonding square with caps + L-undercut (from add_byisk_jj)
   manhattan_jj      — Manhattan-style Josephson junction stack (from add_manhattan_junction)
-  taper_segment     — linear taper wedge L1 + L11 narrow-tip slice (from add_taper_segment)
+  taper_lead        — linear taper wedge L1 + L11 narrow-tip slice (from add_taper_segment)
   taper_pad         — linear taper + flat overlap pad, both L1 (from add_taper_pad)
   branch_segment    — straight uniform-width branch rect on L1 (from add_branch_segment)
   turn              — 90° arc turn, configurable direction+handedness, L1 (from add_turn)
@@ -603,26 +603,28 @@ def build_manhattan_jj(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: Taper Segment  (→ add_taper_segment in components_lib.py)
+# Cell: Tapered Lead  (→ add_taper_segment in components_lib.py)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Default geometry (µm) — mirrors taper_segment ComponentType in component_model.py
 _TAPER_SEG_DEFAULTS = dict(
-    direction    = "+x",    # "+x" | "-x" | "+y" | "-y"
-    length       = 6.1,     # taper length (µm)
-    narrow_end   = "start", # "start" — narrow at entry, "end" — narrow at exit
-    narrow_width = 0.3,     # narrow-end width (µm)  → cfg.WIRE_WIDTH
-    taper_width  = 2.0,     # wide-end width  (µm)  → cfg.TAPER_WIDTH
+    direction       = "+x",    # "+x" | "-x" | "+y" | "-y"
+    length          = 6.1,     # taper length (µm)
+    narrow_end      = "start", # "start" — narrow at entry, "end" — narrow at exit
+    narrow_width    = 0.3,     # narrow-end width (µm)  → cfg.WIRE_WIDTH
+    taper_width     = 2.0,     # wide-end width  (µm)  → cfg.TAPER_WIDTH
+    narrow_undercut = False,   # emit tapered-lead undercut ring on L2 at the narrow end
 )
 
 
 def build_taper_segment(
     origin: Point,
-    direction:    str   = _TAPER_SEG_DEFAULTS["direction"],
-    length:       float = _TAPER_SEG_DEFAULTS["length"],
-    narrow_end:   str   = _TAPER_SEG_DEFAULTS["narrow_end"],
-    narrow_width: float = _TAPER_SEG_DEFAULTS["narrow_width"],
-    taper_width:  float = _TAPER_SEG_DEFAULTS["taper_width"],
+    direction:       str   = _TAPER_SEG_DEFAULTS["direction"],
+    length:          float = _TAPER_SEG_DEFAULTS["length"],
+    narrow_end:      str   = _TAPER_SEG_DEFAULTS["narrow_end"],
+    narrow_width:    float = _TAPER_SEG_DEFAULTS["narrow_width"],
+    taper_width:     float = _TAPER_SEG_DEFAULTS["taper_width"],
+    narrow_undercut: bool  = _TAPER_SEG_DEFAULTS["narrow_undercut"],
 ) -> CellResult:
     """
     Linear taper wedge on LAYER_BRANCH (L1) with a 1 µm narrow-tip slice
@@ -733,6 +735,97 @@ def build_taper_segment(
 
     components = [taper_body, narrow_clip]
 
+    # ── Narrow-end undercut ring (L2) — optional ──────────────────────────
+    #
+    # Implements the same formula as the reference component_model.py render
+    # block for narrow_undercut on taper_segment:
+    #
+    #   1. Take the full taper silhouette (L1 trapezoid + L11 clip welded into
+    #      one outline: narrow face at travel=0 to wide face at travel=L).
+    #   2. Shift a copy by UNDERCUT_OFFSET (0.8 µm) toward the narrow tip:
+    #      shift = −travel direction when narrow_end="start",
+    #      shift = +travel direction when narrow_end="end".
+    #   3. Crescent = shifted outline (outer) + original outline reversed (inner).
+    #      This 8-vertex closed polygon covers both tapered flanks + the tip face.
+    #   4. Punch out the open wire-connection face by replacing the four corner
+    #      vertices at the tip with punch-boundary vertices at ±narrow_width/2,
+    #      yielding a final 8-vertex punched crescent that covers only the flanks.
+    #
+    # The result is a single L2 GDSComponent.  Zero gdspy/gdstk required —
+    # all geometry is pure vertex arithmetic from variables already in scope.
+    #
+    # Merging with outer undercut rings (same layer):
+    #   The exporter's L2 merge pass (export_gds in exporter.py) boolean-ORs
+    #   every L2 polygon in the design cell before writing.  When a narrow
+    #   undercut polygon is spatially adjacent to or overlapping an outer
+    #   undercut ring, they automatically unify into one smooth outline.
+    #
+    # Toggle: rebuild the cell with narrow_undercut=True/False to show/hide.
+    if narrow_undercut:
+        _UCUT = 0.8   # µm — matches UNDERCUT_RING_THICKNESS everywhere
+
+        # Shift toward narrow tip (−travel for "start", +travel for "end")
+        _tip_sign = -1.0 if narrow_end == "start" else 1.0
+        sx = tx * _tip_sign * _UCUT
+        sy = ty * _tip_sign * _UCUT
+
+        # Full taper silhouette: 4 corners from narrow entry to wide exit.
+        # (entry_hw / exit_hw depend on narrow_end — set above in the L1 block)
+        full_pts = [
+            _pt(0, entry_hw, +1),   # entry +transverse
+            _pt(L, exit_hw,  +1),   # exit  +transverse
+            _pt(L, exit_hw,  -1),   # exit  −transverse
+            _pt(0, entry_hw, -1),   # entry −transverse
+        ]
+
+        # Shifted copy (outer boundary of crescent)
+        s_pts = [(xp + sx, yp + sy) for xp, yp in full_pts]
+
+        # Tip face position and narrow half-width for the punch
+        tip_travel = 0.0 if narrow_end == "start" else float(L)
+        hw_n = nw / 2   # narrow_width / 2
+
+        # Punch boundary corners (at ±hw_n transverse, depth _UCUT along shift)
+        # These replace the tip-face corners in the crescent, clipping the open
+        # connection face to zero undercut width.
+        p_orig_pos  = (tx * tip_travel + px *  hw_n,        ty * tip_travel + py *  hw_n)
+        p_orig_neg  = (tx * tip_travel - px *  hw_n,        ty * tip_travel - py *  hw_n)
+        p_shift_pos = (tx * tip_travel + sx + px *  hw_n,   ty * tip_travel + sy + py *  hw_n)
+        p_shift_neg = (tx * tip_travel + sx - px *  hw_n,   ty * tip_travel + sy - py *  hw_n)
+
+        # Assemble punched crescent (8 vertices, CCW):
+        # - The tip-face corners of both the shifted and original outlines are
+        #   replaced by the punch-clipped versions (clamped to ±hw_n transverse).
+        # - All other corners (the wide-face side) are unchanged.
+        if narrow_end == "start":
+            # Tip is at entry (index 0/3 in full_pts, index 0/3 in s_pts)
+            punched_pts = [
+                p_shift_pos,   # shifted entry + → clamped
+                s_pts[1],      # shifted exit  +
+                s_pts[2],      # shifted exit  −
+                p_shift_neg,   # shifted entry − → clamped
+                p_orig_neg,    # original entry − → clamped
+                full_pts[2],   # original exit  −
+                full_pts[1],   # original exit  +
+                p_orig_pos,    # original entry + → clamped
+            ]
+        else:
+            # Tip is at exit (index 1/2 in full_pts, index 1/2 in s_pts)
+            punched_pts = [
+                s_pts[0],      # shifted entry +
+                p_shift_pos,   # shifted exit  + → clamped
+                p_shift_neg,   # shifted exit  − → clamped
+                s_pts[3],      # shifted entry −
+                full_pts[3],   # original entry −
+                p_orig_neg,    # original exit  − → clamped
+                p_orig_pos,    # original exit  + → clamped
+                full_pts[0],   # original entry +
+            ]
+
+        narrow_ucut = _poly(origin, punched_pts, LAYER_UNDERCUT_RING)
+        narrow_ucut._no_auto_ports = True
+        components.append(narrow_ucut)
+
     # ── Ports on the anchor (taper_body) ──────────────────────────────────
     # Port offsets are relative to taper_body.origin = _poly's dbu_pts[0]
     # = the first vertex of trap_pts.
@@ -770,13 +863,15 @@ def build_taper_segment(
     ])
 
     dir_label = direction.replace("+", "+").replace("-", "-")
+    ucut_tag = " +ucut" if narrow_undercut else ""
     return CellResult(
         components=components,
-        group_name=f"TaperSeg ({direction} L={length:.1f}µm nw={narrow_width:.2f}µm)",
+        group_name=f"TaperedLead ({direction} L={length:.1f}µm nw={narrow_width:.2f}µm{ucut_tag})",
         description=(
             f"Linear taper  {direction}  L={length}µm  "
             f"narrow={narrow_width}µm → wide={taper_width}µm  "
             f"narrow_end={narrow_end}"
+            + ("  narrow_undercut=L2" if narrow_undercut else "")
         ),
     )
 
@@ -1590,8 +1685,8 @@ CELL_CATALOGUE: List[CellDef] = [
     ),
     CellDef(
         cell_id     = "taper_segment",
-        name        = "Taper Segment",
-        description = "Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with L11 narrow-tip slice",
+        name        = "Tapered Lead",
+        description = "Linear WIRE_WIDTH↔TAPER_WIDTH wedge (L1) with L11 narrow-tip slice; optional narrow-end undercut ring on L2",
         category    = "Routing",
         defaults    = _TAPER_SEG_DEFAULTS,
         builder     = build_taper_segment,
