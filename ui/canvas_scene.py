@@ -47,6 +47,7 @@ from core.model import (
 )
 from ui.theme import Colors
 from ui.undercut_overlay import UndercutOverlay
+from ui.ruler_overlay import RulerItem
 
 
 # ── Scene constants ────────────────────────────────────────────────────────────
@@ -90,6 +91,7 @@ class PlacementMode(Enum):
     PLACE_RECT    = auto()
     PLACE_POLYGON = auto()
     PLACE_PATH    = auto()
+    RULER         = auto()
 
     @property
     def status_label(self) -> str:
@@ -98,6 +100,7 @@ class PlacementMode(Enum):
             PlacementMode.PLACE_RECT:    "PLACE RECT  —  click to stamp  |  ESC cancel",
             PlacementMode.PLACE_POLYGON: "PLACE POLYGON  —  click vertices  |  dbl-click or Enter to close  |  ESC cancel",
             PlacementMode.PLACE_PATH:    "PLACE PATH  —  click vertices  |  Enter to commit  |  ESC cancel",
+            PlacementMode.RULER:         "RULER  —  click-drag to measure  |  ESC to clear",
         }[self]
 
 
@@ -728,6 +731,10 @@ class CanvasScene(QGraphicsScene):
         # self._undercut.toggle() or self._undercut.enable(True).
         self._undercut = UndercutOverlay(self)
 
+        # Ruler state
+        self._ruler_item:  Optional[RulerItem] = None
+        self._ruler_dragging: bool             = False
+
     # ── Public placement API ──────────────────────────────────────────────────
 
     @property
@@ -742,8 +749,16 @@ class CanvasScene(QGraphicsScene):
 
     def cancel_placement(self) -> None:
         self._clear_ghosts()
+        self.clear_ruler()
         self._pl.mode = PlacementMode.SELECT
         self.mode_changed.emit(PlacementMode.SELECT.status_label)
+
+    def clear_ruler(self) -> None:
+        """Remove any active ruler from the scene."""
+        if self._ruler_item is not None:
+            self.removeItem(self._ruler_item)
+            self._ruler_item = None
+        self._ruler_dragging = False
 
     # ── Public scene API ──────────────────────────────────────────────────────
 
@@ -1017,6 +1032,15 @@ class CanvasScene(QGraphicsScene):
                 self._commit_poly_or_path()
             return
 
+        if self._pl.mode == PlacementMode.RULER:
+            if event.button() == Qt.MouseButton.LeftButton:
+                # Replace any existing ruler with a fresh one starting here.
+                self.clear_ruler()
+                self._ruler_item = RulerItem(snapped, self)
+                self.addItem(self._ruler_item)
+                self._ruler_dragging = True
+            return
+
         # Select mode.
         if event.button() != Qt.MouseButton.LeftButton:
             super().mousePressEvent(event)
@@ -1050,6 +1074,8 @@ class CanvasScene(QGraphicsScene):
             self._update_ghost_rect(snapped)
         elif self._pl.mode in (PlacementMode.PLACE_POLYGON, PlacementMode.PLACE_PATH):
             self._update_ghost_edge(snapped)
+        elif self._pl.mode == PlacementMode.RULER and self._ruler_dragging and self._ruler_item:
+            self._ruler_item.update_end(snapped)
 
         if self._unified_drag_active and (self._orig_comp_positions or self._orig_group_positions):
             self._on_unified_move(event)
@@ -1061,6 +1087,14 @@ class CanvasScene(QGraphicsScene):
                 and self._unified_drag_active
                 and (self._orig_comp_positions or self._orig_group_positions)):
             self._on_unified_release(event)
+            return
+        if (event.button() == Qt.MouseButton.LeftButton
+                and self._pl.mode == PlacementMode.RULER
+                and self._ruler_dragging
+                and self._ruler_item is not None):
+            snapped = self.snap_f(event.scenePos().x(), event.scenePos().y())
+            self._ruler_item.commit(snapped)
+            self._ruler_dragging = False
             return
         super().mouseReleaseEvent(event)
 

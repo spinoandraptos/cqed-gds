@@ -136,6 +136,10 @@ class MainWindow(QMainWindow):
         self._act_zin  = self._action("Zoom In",  "Ctrl+=", self._view.zoom_in)
         self._act_zout = self._action("Zoom Out", "Ctrl+-", self._view.zoom_out)
 
+        self._act_ruler = self._action("Ruler / Measure", "M", self._toggle_ruler)
+        self._act_ruler.setCheckable(True)
+        self._act_ruler.setChecked(False)
+
         self._act_undercut = self._action(
             "Show Undercut Ring  (0.8 µm)", "U",
             self._toggle_undercut,
@@ -146,6 +150,7 @@ class MainWindow(QMainWindow):
         self._populate_menu(menu, [
             self._act_fit, None,
             self._act_zin, self._act_zout, None,
+            self._act_ruler, None,
             self._act_undercut,
         ])
 
@@ -202,6 +207,13 @@ class MainWindow(QMainWindow):
 
         self._tb_rot_cw  = self._tb_button("fa5s.redo-alt",  "Rotate 90° CW  (R)",       lambda: self._scene.rotate_selection(ccw=False))
         self._tb_rot_ccw = self._tb_button("fa5s.undo-alt",  "Rotate 90° CCW  (Shift+R)", lambda: self._scene.rotate_selection(ccw=True))
+        self._toolbar.addSeparator()
+
+        self._tb_ruler = self._tb_button(
+            "fa5s.ruler", "Measure / Ruler  (M)",
+            self._toggle_ruler, color=Colors.ACCENT,
+        )
+        self._tb_ruler.setCheckable(True)
         self._toolbar.addSeparator()
 
         self._tb_button("fa5s.trash-alt",  "Delete Selected  (Del)",    self._delete_selected, color=Colors.ERROR)
@@ -339,6 +351,22 @@ class MainWindow(QMainWindow):
         self._update_undo_actions()
 
     # ── Undercut ring ─────────────────────────────────────────────────────────
+
+    def _toggle_ruler(self) -> None:
+        """Toggle ruler/measure mode (shortcut: M)."""
+        from ui.canvas_scene import PlacementMode
+        if self._scene.mode == PlacementMode.RULER:
+            # Already in ruler mode — ESC out and clear.
+            self._scene.cancel_placement()
+            self._act_ruler.setChecked(False)
+            self._tb_ruler.setChecked(False)
+            self._flash_status("Ruler cleared")
+        else:
+            # Enter ruler mode; clear any placement ghost first.
+            self._scene.set_mode(PlacementMode.RULER)
+            self._act_ruler.setChecked(True)
+            self._tb_ruler.setChecked(True)
+            self._flash_status("Ruler: click-drag to measure  |  M or ESC to clear")
 
     def _toggle_undercut(self) -> None:
         """Toggle the undercut ring overlay and keep the menu item in sync."""
@@ -1038,29 +1066,6 @@ class MainWindow(QMainWindow):
         if comp and comp.layer != new_layer:
             self._scene.cmd_stack.execute(EditComponent(comp, layer=new_layer))
             self._scene.refresh_item_style(comp_id)
-            # Keep _cell_params["layer"] in sync so a subsequent param edit
-            # (which rebuilds the cell from cdef.defaults + _cell_params) does
-            # not silently reset the layer back to the catalogue default.
-            # Only applies to cells that expose "layer" as a build param
-            # (currently only the "wire" cell).  For all other cells the cdef
-            # has no "layer" default, so the update is a safe no-op.
-            group = self._design.group_of(comp_id)
-            if group is not None:
-                cell_id = getattr(group, "cell_id", None)
-                if cell_id:
-                    from core.cell_library import CELL_BY_ID
-                    cdef = CELL_BY_ID.get(cell_id)
-                    if cdef is not None and "layer" in cdef.defaults:
-                        cell_params = getattr(group, "_cell_params", None)
-                        if cell_params is None:
-                            group._cell_params = {"layer": new_layer}
-                        else:
-                            cell_params["layer"] = new_layer
-                        # Mirror into _cell_subgroups so merged-group param
-                        # edits also see the updated layer.
-                        for sg in getattr(group, "_cell_subgroups", []):
-                            if sg.get("cell_id") == cell_id:
-                                sg.setdefault("cell_params", {})["layer"] = new_layer
             self._flash_status(f"Layer → {new_layer}")
 
     @pyqtSlot(str, str, int)
@@ -1270,6 +1275,9 @@ class MainWindow(QMainWindow):
     def _escape(self) -> None:
         self._scene.cancel_placement()
         self._tb_select.setChecked(True)
+        # If we were in ruler mode, un-check the ruler button too.
+        self._act_ruler.setChecked(False)
+        self._tb_ruler.setChecked(False)
 
     # ── Edit actions ──────────────────────────────────────────────────────────
 
@@ -1639,6 +1647,7 @@ class MainWindow(QMainWindow):
             "Ctrl+C - Copy | Ctrl+V - Paste | Ctrl+D - Duplicate<br>"
             "Ctrl+A - Select all | Delete - Delete selected<br>"
             "R - Rotate 90° CW | Shift+R - Rotate 90° CCW<br>"
+            "M - Ruler / Measure  (click-drag; M or ESC to clear)<br>"
         )
         lbl.setTextFormat(Qt.TextFormat.RichText)
         lbl.setWordWrap(True)
