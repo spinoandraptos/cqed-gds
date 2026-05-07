@@ -504,13 +504,12 @@ class GroupSweepDialog(QDialog):
         self._target_combo.setStyleSheet(_combo_style())
 
         if self._is_cell_mode:
-            # One entry per cell sub-group descriptor (skip plain/passthrough entries)
             for i, sg in enumerate(self._cell_subgroups):
                 if not sg.get("cell_id"):
-                    continue   # passthrough non-cell entry — not a sweep target
+                    continue
                 cdef = CELL_BY_ID.get(sg["cell_id"])
                 label = sg["name"] if sg["name"] else (cdef.name if cdef else sg["cell_id"])
-                self._target_combo.addItem(label, i)   # data = subgroup index
+                self._target_combo.addItem(label, i)
             row(5, "Target cell", self._target_combo)
         else:
             for i, comp in enumerate(self._members):
@@ -588,8 +587,8 @@ class GroupSweepDialog(QDialog):
                     handles the amber beacon + ensureVisible in one call.
         Cell mode — multiple components per subgroup: call set_panel_highlight()
                     directly on each scene item, then use highlight_component()
-                    for the scroll side-effect only, then re-apply the beacon to
-                    all remaining members (highlight_component clears others).
+                    for the scroll side-effect, then re-apply the beacon to all
+                    remaining members (highlight_component clears others).
         """
         self._clear_highlight()
 
@@ -602,15 +601,13 @@ class GroupSweepDialog(QDialog):
             if not live_ids:
                 return
             items_map = getattr(self._scene, "_items", {})
-            # Use the public API for scroll-to-view (fires on first member)
+            # scroll to first member via public API
             self._scene.highlight_component(live_ids[0])
-            # Re-highlight every member including the first (highlight_component
-            # leaves only the tracked one lit; we want all of them)
+            # re-apply beacon to every member (highlight_component clears others)
             for cid in live_ids:
                 item = items_map.get(cid)
                 if item is not None:
                     item.set_panel_highlight(True)
-            # Keep the scene's internal tracker consistent
             self._scene._highlighted_comp_id = live_ids[0]
         else:
             comp = self._target_comp()
@@ -619,9 +616,7 @@ class GroupSweepDialog(QDialog):
 
     def _clear_highlight(self) -> None:
         """Remove all sweep-dialog highlights from the canvas."""
-        # Clear the scene's tracked single highlight
         self._scene.highlight_component("")
-        # Also clear any directly-set multi-member highlights
         items_map = getattr(self._scene, "_items", {})
         for item in items_map.values():
             if getattr(item, "_panel_highlighted", False):
@@ -838,6 +833,26 @@ class GroupSweepDialog(QDialog):
         grp_ox = grp_bb.x_min
         grp_oy = grp_bb.y_min
 
+        # Compute the target subgroup's own bbox origin (NOT the full group origin).
+        # place_cell() builds geometry starting at the supplied origin point, so we
+        # must pass the cell's actual scene position — not the group's bbox corner.
+        target_sg_comps = [
+            self._design.get(cid) for cid in target_sg["member_ids"]
+            if self._design.get(cid) is not None
+        ]
+        if target_sg_comps:
+            tgt_bb = BBox(
+                min(c.bbox.x_min for c in target_sg_comps),
+                min(c.bbox.y_min for c in target_sg_comps),
+                max(c.bbox.x_max for c in target_sg_comps),
+                max(c.bbox.y_max for c in target_sg_comps),
+            )
+            tgt_ox = tgt_bb.x_min
+            tgt_oy = tgt_bb.y_min
+        else:
+            tgt_ox = grp_ox
+            tgt_oy = grp_oy
+
         # Target cell bbox at each value — precomputed column-0 widths
         ref_params_start = dict(target_sg["cell_params"])
         ref_params_start[key] = start
@@ -919,8 +934,11 @@ class GroupSweepDialog(QDialog):
 
                 for sg_i, sg in enumerate(self._cell_subgroups):
                     if sg_i == sg_idx:
-                        # Rebuild the target cell at the swept value
-                        origin = Point(grp_ox + dx, grp_oy + dy)
+                        # Rebuild the target cell at the swept value.
+                        # Origin = cell's own scene position + slot offset,
+                        # NOT the group bbox corner (which caused the cell to
+                        # snap to the top-left of the group bounding box).
+                        origin = Point(tgt_ox + dx, tgt_oy + dy)
                         try:
                             result = place_cell(sg["cell_id"], origin,
                                                 params=params_for_slot)
@@ -978,6 +996,13 @@ class GroupSweepDialog(QDialog):
             return
 
         target_label = f"{target_sg['name']}.{key}"
+
+        # Snapshot the new group IDs that will be created so we can mirror the
+        # source group's undercut-ring enabled state onto all generated copies.
+        # GroupComponents commands store the new group on ._group after execute().
+        gc_cmds = [cmd for cmd in all_cmds
+                   if isinstance(cmd, GroupComponents)]
+
         self._cmd_stack.execute(
             BatchCommand(
                 all_cmds,
@@ -985,6 +1010,16 @@ class GroupSweepDialog(QDialog):
                 f"[{start:.3g}…{start + (total - 1) * step:.3g}] µm",
             )
         )
+
+        # If the source group had its undercut ring enabled (i.e. not excluded),
+        # un-exclude every newly generated group so their rings follow suit.
+        overlay = getattr(self._scene, "_undercut", None)
+        if overlay is not None and not overlay.is_excluded(self._group.id):
+            for gc in gc_cmds:
+                new_grp = getattr(gc, "_group", None)
+                if new_grp is not None:
+                    overlay.set_excluded(new_grp.id, False)
+
         self.accept()
 
     # ── Raw mode generation (original behaviour, unchanged) ───────────────────
@@ -1066,12 +1101,24 @@ class GroupSweepDialog(QDialog):
             self.accept()
             return
 
+        gc_cmds_raw = [cmd for cmd in all_cmds
+                       if isinstance(cmd, GroupComponents)]
+
         self._cmd_stack.execute(
             BatchCommand(
                 all_cmds,
                 f"Group array {cols}×{rows}  sweep {p.label} on {target_cid}",
             )
         )
+
+        # Mirror source group's undercut-ring enabled state onto generated copies.
+        overlay = getattr(self._scene, "_undercut", None)
+        if overlay is not None and not overlay.is_excluded(self._group.id):
+            for gc in gc_cmds_raw:
+                new_grp = getattr(gc, "_group", None)
+                if new_grp is not None:
+                    overlay.set_excluded(new_grp.id, False)
+
         self.accept()
 
 class CellSweepDialog(QDialog):
@@ -1434,6 +1481,9 @@ class CellSweepDialog(QDialog):
                 ))
 
         if cmds:
+            # Snapshot PlaceCellCommands so we can retrieve their groups after execute.
+            place_cmds = [c for c in cmds if isinstance(c, PlaceCellCommand)]
+
             self._scene.cmd_stack.execute(
                 BatchCommand(
                     cmds,
@@ -1441,4 +1491,13 @@ class CellSweepDialog(QDialog):
                     f"[{start:.3g}…{start + (total-1)*step:.3g}] µm",
                 )
             )
+
+            # Mirror source group's undercut-ring enabled state onto generated copies.
+            overlay = getattr(self._scene, "_undercut", None)
+            if overlay is not None and not overlay.is_excluded(self._group.id):
+                for pc in place_cmds:
+                    new_grp = getattr(pc, "_group", None)
+                    if new_grp is not None:
+                        overlay.set_excluded(new_grp.id, False)
+
         self.accept()

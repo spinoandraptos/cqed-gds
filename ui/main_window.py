@@ -61,8 +61,6 @@ class MainWindow(QMainWindow):
         # by group_selected after a param edit) from firing cell_param_change_requested
         # a second time for the same action and corrupting the canvas.
         self._param_edit_in_progress: bool = False
-        # Keep a live reference to any open sweep dialog (WA_DeleteOnClose +
-        # destroyed signal clears this automatically when the dialog closes).
         self._open_sweep_dlg = None
 
         self._scene = CanvasScene(self._design)
@@ -1481,7 +1479,6 @@ class MainWindow(QMainWindow):
         Shown as a non-modal Tool window so it floats freely without blocking
         or minimising the main window.
         """
-        # Raise existing dialog instead of stacking a second one.
         if self._open_sweep_dlg is not None:
             self._open_sweep_dlg.raise_()
             self._open_sweep_dlg.activateWindow()
