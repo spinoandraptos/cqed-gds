@@ -417,11 +417,12 @@ class GroupSweepDialog(QDialog):
     """
 
     def __init__(self, group: ComponentGroup, design: DesignScene,
-                 cmd_stack, parent=None) -> None:
+                 scene, parent=None) -> None:
         super().__init__(parent)
         self._group     = group
         self._design    = design
-        self._cmd_stack = cmd_stack
+        self._scene     = scene
+        self._cmd_stack = scene.cmd_stack
 
         # Resolve live member components (guard against stale IDs)
         self._members: List[GDSComponent] = [
@@ -563,6 +564,69 @@ class GroupSweepDialog(QDialog):
                   self._start_ispin, self._step_ispin):
             w.valueChanged.connect(self._update_preview)
 
+    # ── Canvas highlight ──────────────────────────────────────────────────────
+
+    def _highlight_target(self) -> None:
+        """
+        Beacon-highlight the currently selected target on the canvas.
+
+        Raw mode  — highlight the single selected GDSComponent via the scene's
+                    public highlight_component() API (handles scroll too).
+        Cell mode — highlight every component in the selected subgroup by
+                    calling set_panel_highlight() directly on each scene item,
+                    then scroll to the first live member.
+
+        Calling with nothing selected clears all highlights.
+        """
+        # Always clear any previously multi-highlighted items first.
+        self._clear_highlight()
+
+        if self._is_cell_mode:
+            sg = self._current_subgroup()
+            if not sg:
+                return
+            member_ids = [cid for cid in sg.get("member_ids", [])
+                          if self._design.get(cid)]
+            if not member_ids:
+                return
+            # Highlight every member item directly (scene only exposes single-ID API)
+            items_map = getattr(self._scene, "_items", {})
+            for cid in member_ids:
+                item = items_map.get(cid)
+                if item is not None:
+                    item.set_panel_highlight(True)
+            # Scroll the first member into view
+            self._scene.highlight_component(member_ids[0])
+            # highlight_component clears others — re-apply the rest
+            for cid in member_ids[1:]:
+                item = items_map.get(cid)
+                if item is not None:
+                    item.set_panel_highlight(True)
+            self._scene._highlighted_comp_id = member_ids[0]
+        else:
+            comp = self._target_comp()
+            if comp:
+                self._scene.highlight_component(comp.id)
+
+    def _clear_highlight(self) -> None:
+        """Remove all sweep-dialog highlights from the canvas."""
+        # Clear any single-tracked highlight
+        if hasattr(self._scene, "highlight_component"):
+            self._scene.highlight_component("")
+        # Also sweep all items in case we set multi-member highlights directly
+        items_map = getattr(self._scene, "_items", {})
+        for item in items_map.values():
+            if getattr(item, "_panel_highlighted", False):
+                item.set_panel_highlight(False)
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._clear_highlight()
+        super().closeEvent(event)
+
+    def reject(self) -> None:
+        self._clear_highlight()
+        super().reject()
+
     # ── Helpers — cell mode ───────────────────────────────────────────────────
 
     def _current_subgroup(self) -> dict | None:
@@ -612,6 +676,7 @@ class GroupSweepDialog(QDialog):
 
         self._param_combo.blockSignals(False)
         self._on_param_changed()
+        self._highlight_target()
 
     def _on_param_changed(self) -> None:
         if self._param_combo.count() == 0:

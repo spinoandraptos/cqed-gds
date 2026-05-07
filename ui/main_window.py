@@ -1481,7 +1481,7 @@ class MainWindow(QMainWindow):
             if getattr(group, "cell_id", None):
                 CellSweepDialog(group, self._design, self._scene, self).exec()
             else:
-                GroupSweepDialog(group, self._design, self._scene.cmd_stack, self).exec()
+                GroupSweepDialog(group, self._design, self._scene, self).exec()
             return
 
         selected = [
