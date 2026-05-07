@@ -14,6 +14,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Callable, List, Optional
 import copy as _copy
+import uuid
 
 from core.model import DesignScene, GDSComponent, Point, Connection, ComponentGroup
 from core.cell_library import CellResult, PortSide
@@ -773,8 +774,17 @@ class PlaceCellCommand(Command):
         fresh_comps = [_copy.deepcopy(c) for c in self._original_components]
         # Restore the canonical IDs so undo (which uses self._comp_ids) and any
         # Connection records keyed on these IDs stay valid across redo.
+        # HOWEVER: if any canonical ID is already live in the design (e.g. a
+        # second pasted copy of the same original cell shares the same IDs), we
+        # must mint fresh IDs for this execution to avoid adding duplicate
+        # components.  Connections on the original IDs are irrelevant here
+        # because ReplaceCellCmd removed the old group before calling us.
+        existing_ids = {c.id for c in design.components}
         for comp, orig_id in zip(fresh_comps, self._original_ids):
-            comp.id = orig_id
+            if orig_id not in existing_ids:
+                comp.id = orig_id
+            else:
+                comp.id = uuid.uuid4().hex[:8]
         self._comp_ids = [c.id for c in fresh_comps]
 
         for comp in fresh_comps:
