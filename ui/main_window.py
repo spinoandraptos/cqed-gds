@@ -307,6 +307,7 @@ class MainWindow(QMainWindow):
         self._props.layer_change_requested.connect(self._on_layer_change_requested)
         self._props.geometry_change_requested.connect(self._on_geometry_change_requested)
         self._props.undercut_exclusion_changed.connect(self._on_undercut_exclusion_changed)
+        self._props.component_hover_requested.connect(self._scene.highlight_component)
         self._view.zoom_changed.connect(self._on_zoom_changed)
 
     # ── Slots ─────────────────────────────────────────────────────────────────

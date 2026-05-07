@@ -1074,47 +1074,114 @@ class DraggableShapeButton(QPushButton):
 
 # ── Properties Panel ──────────────────────────────────────────────────────────
 
+def _comp_short_label(comp: GDSComponent) -> str:
+    """
+    Return a human-readable one-line description of a component, avoiding
+    raw IDs as the primary label.  Examples:
+      "Rectangle  2.0 × 0.4 µm  L1"
+      "Polygon  8 pts  L0"
+      "Path  5 pts · w=0.5 µm  L2"
+    """
+    from core.model import dbu_to_um as _d2u
+    layer = f"L{comp.layer}"
+    if comp.kind == ComponentKind.RECTANGLE:
+        w = _d2u(comp.width);  h = _d2u(comp.height)
+        return f"Rectangle  {w:.2f} × {h:.2f} µm  {layer}"
+    elif comp.kind == ComponentKind.POLYGON:
+        n = len(comp.points) if comp.points else 0
+        return f"Polygon  {n} pts  {layer}"
+    else:  # PATH
+        n = len(comp.points) if comp.points else 0
+        pw = f" · w={_d2u(comp.path_width):.2f} µm" if comp.path_width else ""
+        return f"Path  {n} pts{pw}  {layer}"
+
+
 class MemberCard(QWidget):
     """
     Compact editable card for one group member shown inside the group view.
     Emits the same signals as PropertiesPanel so MainWindow needs no changes.
+
+    Hover-highlight: hovering the card emits component_hover_requested(comp_id)
+    so the canvas can flash a beacon on the corresponding shape.  Leave emits
+    component_hover_requested("") to clear.
     """
     layer_change_requested    = pyqtSignal(str, int)
     geometry_change_requested = pyqtSignal(str, str, int)
+    component_hover_requested = pyqtSignal(str)   # comp_id or "" to clear
 
     def __init__(self, comp: GDSComponent, design, parent=None) -> None:
         super().__init__(parent)
         self._comp   = comp
         self._design = design
-        self.setStyleSheet(f"""
+        self._base_style = f"""
             QWidget {{
                 background: {Colors.BG_ELEVATED};
                 border: 1px solid {Colors.BG_BORDER};
                 border-radius: 4px;
             }}
-        """)
+        """
+        self._hover_style = f"""
+            QWidget {{
+                background: {Colors.BG_OVERLAY};
+                border: 1px solid #facc15;
+                border-radius: 4px;
+            }}
+        """
+        self.setStyleSheet(self._base_style)
+        self.setMouseTracking(True)
         self._build(comp, design)
+
+    def enterEvent(self, event) -> None:
+        self.setStyleSheet(self._hover_style)
+        self.component_hover_requested.emit(self._comp.id)
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        self.setStyleSheet(self._base_style)
+        self.component_hover_requested.emit("")
+        super().leaveEvent(event)
 
     def _build(self, comp: GDSComponent, design) -> None:
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 6, 8, 6)
         lay.setSpacing(3)
 
-        # ── Header: kind + id + layer colour swatch ───────────────────────────
+        # ── Header: kind icon + human-readable label + layer swatch ──────────
         header = QHBoxLayout()
         swatch = QLabel("█")
         color  = Colors.LAYER_COLORS[comp.layer % len(Colors.LAYER_COLORS)]
         swatch.setStyleSheet(
             f"color: {color}; font-size: 14px; background: transparent; border: none;"
         )
-        kind_lbl = QLabel(f"{comp.kind.name.capitalize()}  ·  {comp.id}")
+        # Human-readable label as the primary text; ID in smaller muted text below
+        label_col = QVBoxLayout()
+        label_col.setSpacing(1)
+        label_col.setContentsMargins(0, 0, 0, 0)
+        kind_lbl = QLabel(_comp_short_label(comp))
         kind_lbl.setStyleSheet(
             f"color: {Colors.TEXT_PRIMARY}; font-size: {Fonts.SIZE_SM}px; "
             f"font-weight: bold; background: transparent; border: none;"
         )
+        id_lbl = QLabel(f"id: {comp.id}")
+        id_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS - 1}px; "
+            f"font-family: {Fonts.MONO_FAMILY}; background: transparent; border: none;"
+        )
+        label_col.addWidget(kind_lbl)
+        label_col.addWidget(id_lbl)
+
+        # Hover hint icon (eye symbol) — static, just visually hints the interaction
+        eye_lbl = QLabel("👁")
+        eye_lbl.setStyleSheet(
+            f"color: {Colors.TEXT_MUTED}; font-size: 11px; "
+            f"background: transparent; border: none;"
+        )
+        eye_lbl.setToolTip("Hover to highlight this shape on the canvas")
+
         header.addWidget(swatch)
-        header.addWidget(kind_lbl)
+        header.addLayout(label_col)
         header.addStretch()
+        header.addWidget(eye_lbl)
         lay.addLayout(header)
 
         # ── Inline rows ───────────────────────────────────────────────────────
@@ -1237,6 +1304,8 @@ class PropertiesPanel(QWidget):
     # Emitted when the per-object undercut toggle changes: (obj_id, excluded: bool)
     # (obj_id, value) — value is bool (excluded) for objects, float (µm) for "__offset__"
     undercut_exclusion_changed = pyqtSignal(str, object)
+    # Emitted when a member card is hovered — comp_id, or "" to clear highlight
+    component_hover_requested  = pyqtSignal(str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -1715,6 +1784,7 @@ class PropertiesPanel(QWidget):
             card = MemberCard(comp, design)
             card.layer_change_requested.connect(self.layer_change_requested)
             card.geometry_change_requested.connect(self.geometry_change_requested)
+            card.component_hover_requested.connect(self.component_hover_requested)
             self._cards_layout.insertWidget(
                 self._cards_layout.count() - 1, card
             )
@@ -1988,6 +2058,7 @@ class PropertiesPanel(QWidget):
             card = MemberCard(comp, design)
             card.layer_change_requested.connect(self.layer_change_requested)
             card.geometry_change_requested.connect(self.geometry_change_requested)
+            card.component_hover_requested.connect(self.component_hover_requested)
             self._multi_layout.insertWidget(self._multi_layout.count() - 1, card)
 
     # ── Slots ─────────────────────────────────────────────────────────────────

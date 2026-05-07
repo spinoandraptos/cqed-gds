@@ -428,6 +428,7 @@ class ComponentItem(QGraphicsItem):
         self._delegate:        QGraphicsItem          = self._make_delegate()
         self._port_items:      List[PortItem]         = self._build_port_items()
         self._edge_indicators: List[EdgeIndicatorItem] = []
+        self._panel_highlighted: bool                  = False   # beacon from Properties panel hover
         self._apply_style(selected=False, hovered=False)
 
     # ── Delegate factory ──────────────────────────────────────────────────────
@@ -469,11 +470,27 @@ class ComponentItem(QGraphicsItem):
 
     # ── Style ─────────────────────────────────────────────────────────────────
 
+    def set_panel_highlight(self, active: bool) -> None:
+        """
+        Activate/deactivate the Properties-panel hover beacon.
+        Renders a high-visibility outline + fill independent of selection state
+        so users can instantly identify which canvas shape a card refers to.
+        """
+        if active == self._panel_highlighted:
+            return
+        self._panel_highlighted = active
+        self._apply_style(self.isSelected(), hovered=False)
+        # Float above neighbours while highlighted so the outline is never obscured
+        self.setZValue(20 if active else 0)
+
     def _apply_style(self, selected: bool, hovered: bool) -> None:
         layer_color = Colors.LAYER_COLORS[self._comp.layer % len(Colors.LAYER_COLORS)]
         base        = QColor(layer_color)
 
-        if selected:
+        if self._panel_highlighted:
+            # Beacon style: bright amber border, high-opacity fill
+            fill_a, pen_color, pen_w = 160, "#facc15", 2.5
+        elif selected:
             fill_a, pen_color, pen_w = 90, Colors.ACCENT, 1.5
         elif hovered:
             fill_a, pen_color, pen_w = 65, base.lighter(150).name(), 1.0
@@ -797,6 +814,37 @@ class CanvasScene(QGraphicsScene):
 
     def item_for(self, comp_id: str) -> Optional[ComponentItem]:
         return self._items.get(comp_id)
+
+    # ── Properties-panel hover beacon ─────────────────────────────────────────
+
+    _highlighted_comp_id: str = ""
+
+    def highlight_component(self, comp_id: str) -> None:
+        """
+        Highlight the ComponentItem for *comp_id* with a high-visibility beacon
+        style (amber outline, bright fill) to help users identify which canvas
+        shape corresponds to a row in the Properties panel.
+
+        Pass an empty string (or a non-existent ID) to clear any current highlight.
+        Any previously highlighted item is always cleared first.
+        """
+        # Clear previous highlight
+        if self._highlighted_comp_id:
+            prev = self._items.get(self._highlighted_comp_id)
+            if prev is not None:
+                prev.set_panel_highlight(False)
+
+        self._highlighted_comp_id = comp_id
+
+        if comp_id:
+            item = self._items.get(comp_id)
+            if item is not None:
+                item.set_panel_highlight(True)
+                # Ensure the highlighted item is visible in the viewport —
+                # scroll to it if it is off-screen (non-destructive to zoom).
+                views = self.views()
+                if views:
+                    views[0].ensureVisible(item, 60, 60)
 
     def clear_all_port_highlights(self) -> None:
         for item in self._items.values():
