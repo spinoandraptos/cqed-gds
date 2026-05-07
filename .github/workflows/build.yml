@@ -1,0 +1,34 @@
+name: Build EXE
+
+on:
+  push:
+    branches:
+      - '**' # Triggers on every commit to every branch
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: read # Release permissions no longer strictly required for artifacts
+    steps:
+      - uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pyinstaller -r requirements.txt
+          
+      - name: Build with PyInstaller
+        run: pyinstaller --onefile main.py
+        
+      - name: Upload Compiled EXE
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-executable
+          path: dist/main.exe
+          retention-days: 90 # Optional: how long to keep the file

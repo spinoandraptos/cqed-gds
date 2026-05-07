@@ -622,10 +622,23 @@ class MainWindow(QMainWindow):
             )
             if g is not None
         ]
+        # Collect IDs of components that already belong to a selected group so
+        # we can exclude them below.  Group members can still appear in
+        # selectedItems() if they were selected while in group-edit mode and
+        # exit_group_edit() did not clear their selection — including them would
+        # cause those components to be treated as extra loose items and moved
+        # into the wrong group (or lost from their original group).
+        _selected_group_member_ids: set[str] = {
+            cid
+            for item in selected_items
+            if isinstance(item, GroupItem)
+            for cid in item.group.member_ids
+        }
         selected_comps = [
             item.component
             for item in selected_items
             if hasattr(item, "component")
+            and item.component.id not in _selected_group_member_ids
         ]
 
         if selected_groups:
