@@ -1038,6 +1038,29 @@ class MainWindow(QMainWindow):
         if comp and comp.layer != new_layer:
             self._scene.cmd_stack.execute(EditComponent(comp, layer=new_layer))
             self._scene.refresh_item_style(comp_id)
+            # Keep _cell_params["layer"] in sync so a subsequent param edit
+            # (which rebuilds the cell from cdef.defaults + _cell_params) does
+            # not silently reset the layer back to the catalogue default.
+            # Only applies to cells that expose "layer" as a build param
+            # (currently only the "wire" cell).  For all other cells the cdef
+            # has no "layer" default, so the update is a safe no-op.
+            group = self._design.group_of(comp_id)
+            if group is not None:
+                cell_id = getattr(group, "cell_id", None)
+                if cell_id:
+                    from core.cell_library import CELL_BY_ID
+                    cdef = CELL_BY_ID.get(cell_id)
+                    if cdef is not None and "layer" in cdef.defaults:
+                        cell_params = getattr(group, "_cell_params", None)
+                        if cell_params is None:
+                            group._cell_params = {"layer": new_layer}
+                        else:
+                            cell_params["layer"] = new_layer
+                        # Mirror into _cell_subgroups so merged-group param
+                        # edits also see the updated layer.
+                        for sg in getattr(group, "_cell_subgroups", []):
+                            if sg.get("cell_id") == cell_id:
+                                sg.setdefault("cell_params", {})["layer"] = new_layer
             self._flash_status(f"Layer → {new_layer}")
 
     @pyqtSlot(str, str, int)
