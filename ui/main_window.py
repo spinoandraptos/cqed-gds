@@ -462,19 +462,56 @@ class MainWindow(QMainWindow):
                 else:
                     origin = Point(0, 0)
 
+            # Snapshot old subgroup bbox centre BEFORE building the new cell,
+            # so we can land the rebuilt+rotated cell in the same place.
+            if old_sg_comps:
+                sg_x_min = min(c.bbox.x_min for c in old_sg_comps)
+                sg_y_min = min(c.bbox.y_min for c in old_sg_comps)
+                sg_x_max = max(c.bbox.x_max for c in old_sg_comps)
+                sg_y_max = max(c.bbox.y_max for c in old_sg_comps)
+                old_sg_bbox_cx = (sg_x_min + sg_x_max) // 2
+                old_sg_bbox_cy = (sg_y_min + sg_y_max) // 2
+            else:
+                old_sg_bbox_cx, old_sg_bbox_cy = origin.x, origin.y
+
+            # Always build at (0,0) — rotation and translation applied below.
             try:
-                new_result = place_cell(cell_id, origin, params=params)
+                new_result = place_cell(cell_id, Point(0, 0), params=params)
             except (KeyError, ValueError) as exc:
                 QMessageBox.warning(self, "Cell Parameter", str(exc))
                 return
 
-            # Re-apply any baked-in rotation for this sub-group.
             rotation_steps = sg.get("cell_rotation_steps", 0)
             if rotation_steps:
                 from core.commands import _rotate_component_in_place
-                ox, oy = origin.x, origin.y
+                # Rotate around the new cell's OWN bbox centre (it sits near
+                # the origin since we built it at Point(0,0)).  This is the
+                # only pivot that produces the correct orientation regardless
+                # of how cell dimensions changed — the old world-space pivot
+                # (_cell_rotation_cx/cy) is unrelated to the new geometry.
+                xs_min = min(c.bbox.x_min for c in new_result.components)
+                ys_min = min(c.bbox.y_min for c in new_result.components)
+                xs_max = max(c.bbox.x_max for c in new_result.components)
+                ys_max = max(c.bbox.y_max for c in new_result.components)
+                own_cx = (xs_min + xs_max) // 2
+                own_cy = (ys_min + ys_max) // 2
                 for comp in new_result.components:
-                    _rotate_component_in_place(comp, ox, oy, rotation_steps)
+                    _rotate_component_in_place(comp, own_cx, own_cy, rotation_steps)
+
+            # Translate so the rotated cell's bbox centre lands on the old
+            # subgroup bbox centre.
+            comps = new_result.components
+            xs_min = min(c.bbox.x_min for c in comps)
+            ys_min = min(c.bbox.y_min for c in comps)
+            xs_max = max(c.bbox.x_max for c in comps)
+            ys_max = max(c.bbox.y_max for c in comps)
+            new_cx = (xs_min + xs_max) // 2
+            new_cy = (ys_min + ys_max) // 2
+            dx = old_sg_bbox_cx - new_cx
+            dy = old_sg_bbox_cy - new_cy
+            if dx or dy:
+                for comp in comps:
+                    comp.move_by(dx, dy)
 
             # Build the updated _cell_subgroups entry (member_ids filled by cmd).
             updated_sg_entry = {
@@ -490,7 +527,7 @@ class MainWindow(QMainWindow):
 
             # Snapshot connections on the old anchor BEFORE removal destroys them
             old_anchor_sg = old_sg_comps[0] if old_sg_comps else None
-            conn_snap = self._snapshot_anchor_connections(old_anchor_sg)
+            conn_snap = self._snapshot_anchor_connections(old_anchor_sg, group=group)
 
             cmd = ReplaceSubgroupCellCmd(
                 group_id            = group_id,
@@ -515,9 +552,15 @@ class MainWindow(QMainWindow):
                  if self._design.get(cid) and self._design.get(cid).ports),
                 None,
             )
+            new_sg_members = [
+                self._design.get(cid)
+                for cid in (updated_sg_entry.get("member_ids") or [])
+                if self._design.get(cid)
+            ]
             move_cmds = self._restore_connections_and_nudge(
                 conn_snap, new_anchor_sg,
                 excluded_ids=set(group.member_ids),
+                new_members=new_sg_members,
             )
             if move_cmds:
                 # Record the moves as an additional undo entry
@@ -545,44 +588,64 @@ class MainWindow(QMainWindow):
             params.update(group._cell_params)
         params[param_key] = new_value
 
-        # Use the stored anchor origin the cell was originally placed with.
-        # Recomputing from bbox is wrong when the builder origin convention
-        # differs from bbox min-corner (centre, entry-point, etc.).
-        origin = getattr(group, "_cell_origin", None)
-        if origin is None:
-            # Legacy group placed before _cell_origin was stored.
-            # Recover the true origin by doing a dry-run placement at (0,0)
-            # using the ORIGINAL params (group._cell_params, not the new params)
-            # to find the offset from cell-origin to components[0].origin,
-            # then subtracting that from the live components[0].origin.
-            first_comp = next(
-                (self._design.get(cid) for cid in group.member_ids
-                 if self._design.get(cid)), None
-            )
-            if first_comp is not None:
-                zero = Point(0, 0)
-                original_params = dict(cdef.defaults)
-                original_params.update(getattr(group, "_cell_params", {}))
-                try:
-                    dry_result = place_cell(cell_id, zero, params=original_params)
-                    dry_anchor = dry_result.components[0]
-                    dx = dry_anchor.origin.x
-                    dy = dry_anchor.origin.y
-                    origin = Point(first_comp.origin.x - dx, first_comp.origin.y - dy)
-                    # Cache it so subsequent edits and moves use the stored value
-                    group._cell_origin = origin
-                except Exception:
-                    bb     = group.bbox_from(self._design.components)
-                    origin = Point(bb.x_min, bb.y_min)
-            else:
-                bb     = group.bbox_from(self._design.components)
-                origin = Point(bb.x_min, bb.y_min)
+        # Snapshot the CURRENT live bbox centre of the group BEFORE anything is
+        # removed.  ReplaceCellCmd uses this to position the rebuilt cell:
+        # it places the new cell axis-aligned at (0,0), rotates it around its
+        # OWN bbox centre by rotation_steps, then translates so its bbox centre
+        # lands exactly on old_bbox_centre.  This is robust regardless of what
+        # _cell_origin or rot_cx/rot_cy contain.
+        #
+        # Read rotation_steps from all available sources in priority order:
+        #  1. _cell_subgroups[0]["cell_rotation_steps"] — kept in sync by both
+        #     RotateGroup and ReplaceCellCmd; stored on the group data dict so
+        #     it survives even if the group object is replaced by get_group().
+        #  2. group._cell_rotation_steps — direct attr set by RotateGroup.
+        #  3. Geometry detection fallback — compare live bbox dimensions to a
+        #     freshly built unrotated reference cell to detect 90°/270° rotation
+        #     when both stored counters are unavailable (e.g. after file load).
+        cell_subgroups = getattr(group, "_cell_subgroups", [])
+        if cell_subgroups and cell_subgroups[0].get("cell_rotation_steps", 0):
+            rotation_steps = cell_subgroups[0]["cell_rotation_steps"]
+        elif getattr(group, "_cell_rotation_steps", 0):
+            rotation_steps = group._cell_rotation_steps
+        else:
+            # Fallback: detect rotation from live geometry vs unrotated reference.
+            rotation_steps = 0
+            try:
+                ref_params = dict(cdef.defaults)
+                if hasattr(group, "_cell_params"):
+                    ref_params.update(group._cell_params)
+                ref_result = place_cell(cell_id, Point(0, 0), params=ref_params)
+                ref_comps  = ref_result.components
+                if ref_comps:
+                    ref_w = max(c.bbox.x_max for c in ref_comps) - min(c.bbox.x_min for c in ref_comps)
+                    ref_h = max(c.bbox.y_max for c in ref_comps) - min(c.bbox.y_min for c in ref_comps)
+                    live_comps = [self._design.get(cid) for cid in group.member_ids
+                                  if self._design.get(cid)]
+                    if live_comps and ref_w != ref_h:
+                        live_w = max(c.bbox.x_max for c in live_comps) - min(c.bbox.x_min for c in live_comps)
+                        # If live width ≈ ref height the cell has been rotated 90° or 270°.
+                        # We can't distinguish 90° from 270° from dimensions alone, so use
+                        # _cell_rotation_steps if it's 1 or 3, else default to 1 (90° CCW).
+                        if abs(live_w - ref_h) < abs(live_w - ref_w):
+                            stored = getattr(group, "_cell_rotation_steps", 0)
+                            rotation_steps = stored if stored in (1, 3) else 1
+            except Exception:
+                pass
+        bb_live = group.bbox_from(self._design.components)
+        old_bbox_cx = (bb_live.x_min + bb_live.x_max) // 2
+        old_bbox_cy = (bb_live.y_min + bb_live.y_max) // 2
 
+        # Always build the new cell at origin (0,0) — ReplaceCellCmd will
+        # rotate + translate it into the correct position.
         try:
-            new_result = place_cell(cell_id, origin, params=params)
+            new_result = place_cell(cell_id, Point(0, 0), params=params)
         except (KeyError, ValueError) as exc:
             QMessageBox.warning(self, "Cell Parameter", str(exc))
             return
+
+        # Preserve _cell_origin so MoveGroup keeps working after the replace.
+        origin = getattr(group, "_cell_origin", None)
 
         old_comp_ids   = list(group.member_ids)
         old_comps      = [c for c in (self._design.get(cid) for cid in old_comp_ids) if c]
@@ -595,15 +658,15 @@ class MainWindow(QMainWindow):
              if self._design.get(cid) and self._design.get(cid).ports),
             None,
         )
-        conn_snap = self._snapshot_anchor_connections(old_anchor)
+        conn_snap = self._snapshot_anchor_connections(old_anchor, group=group)
 
-        rotation_steps = getattr(group, "_cell_rotation_steps", 0)
         cmd = ReplaceCellCmd(
             self._design, self._scene, new_result, cdef,
             param_key, cell_id, params,
             group_id, old_group_name, old_comp_ids, old_comps,
             cell_origin=origin,
             rotation_steps=rotation_steps,
+            old_bbox_centre=(old_bbox_cx, old_bbox_cy),
         )
         self._scene.cmd_stack.execute(cmd)
 
@@ -626,9 +689,15 @@ class MainWindow(QMainWindow):
             None,
         )
         new_group_member_ids = set(new_group.member_ids) if new_group else set()
+        new_members = [
+            self._design.get(cid)
+            for cid in (new_group.member_ids if new_group else [])
+            if self._design.get(cid)
+        ]
         move_cmds = self._restore_connections_and_nudge(
             conn_snap, new_anchor,
             excluded_ids=new_group_member_ids,
+            new_members=new_members,
         )
         if move_cmds:
             batch = BatchCommand(
@@ -639,18 +708,24 @@ class MainWindow(QMainWindow):
 
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
 
-    def _snapshot_anchor_connections(self, anchor) -> list:
+    def _snapshot_anchor_connections(self, anchor, group=None) -> list:
         """
         Before a cell is replaced (which destroys all connections to old IDs),
-        snapshot every connection on *anchor* as a plain dict:
+        snapshot every external connection on *anchor* and all other members of
+        *group* (if supplied) as plain dicts:
 
             {
-              "port_name":      str,          # port name on the anchor ("entry", "exit", …)
+              "src_comp_id":    str,          # which cell member owns this port
+              "port_name":      str,          # port name on that member
               "old_abs_x":      int,          # absolute scene X of the port before rebuild
               "old_abs_y":      int,          # absolute scene Y of the port before rebuild
-              "nbr_comp_id":    str,          # the other component's ID
+              "nbr_comp_id":    str,          # the other (external) component's ID
               "nbr_port_id":    str,          # the other component's port ID
             }
+
+        When *group* is supplied all members are walked so connections on
+        non-anchor members are captured too.  Without it only *anchor* is
+        walked (backward-compatible).
 
         Returns an empty list if anchor is None or has no connections.
         The snapshots survive the replace operation because they are plain dicts
@@ -658,23 +733,39 @@ class MainWindow(QMainWindow):
         """
         if anchor is None:
             return []
-        port_by_id = {p.id: p for p in anchor.ports}
+
+        # Collect every component to inspect (anchor + any other group members)
+        member_ids: set[str] = {anchor.id}
+        if group is not None:
+            member_ids.update(group.member_ids)
+
         snaps = []
-        for cn in self._design.connections_for(anchor.id):
-            our_port_id = cn.port_a if cn.comp_a == anchor.id else cn.port_b
-            nbr_comp_id = cn.comp_b if cn.comp_a == anchor.id else cn.comp_a
-            nbr_port_id = cn.port_b if cn.comp_a == anchor.id else cn.port_a
-            port = port_by_id.get(our_port_id)
-            if port is None:
+        for src_id in member_ids:
+            src = self._design.get(src_id)
+            if src is None:
                 continue
-            abs_p = port.abs_pos(anchor.origin)
-            snaps.append({
-                "port_name":   port.name,
-                "old_abs_x":   abs_p.x,
-                "old_abs_y":   abs_p.y,
-                "nbr_comp_id": nbr_comp_id,
-                "nbr_port_id": nbr_port_id,
-            })
+            port_by_id = {p.id: p for p in src.ports}
+            for cn in self._design.connections_for(src_id):
+                our_port_id = cn.port_a if cn.comp_a == src_id else cn.port_b
+                nbr_comp_id = cn.comp_b if cn.comp_a == src_id else cn.comp_a
+                nbr_port_id = cn.port_b if cn.comp_a == src_id else cn.port_a
+
+                # Only snapshot external connections (skip intra-group wiring)
+                if nbr_comp_id in member_ids:
+                    continue
+
+                port = port_by_id.get(our_port_id)
+                if port is None:
+                    continue
+                abs_p = port.abs_pos(src.origin)
+                snaps.append({
+                    "src_comp_id": src_id,
+                    "port_name":   port.name,
+                    "old_abs_x":   abs_p.x,
+                    "old_abs_y":   abs_p.y,
+                    "nbr_comp_id": nbr_comp_id,
+                    "nbr_port_id": nbr_port_id,
+                })
         return snaps
 
     def _restore_connections_and_nudge(
@@ -682,15 +773,32 @@ class MainWindow(QMainWindow):
         conn_snap: list,
         new_anchor,
         excluded_ids: set,
+        new_members: list | None = None,
     ) -> list:
         """
         After a cell replace:
-          1. For each snapshotted connection, find the matching port on *new_anchor*
-             by port name.  Compute how far that port moved (new_abs − old_abs).
-          2. Re-establish the Connection record between the new anchor's port and
-             the neighbour's port (so the indicator dots reappear).
-          3. BFS-propagate the displacement to all transitively connected neighbours
-             that are not inside *excluded_ids* (the rebuilt cell's own members).
+          1. For each snapshotted connection, find the matching port on the
+             corresponding new member by port name.  Port lookup searches
+             *new_anchor* first, then all other *new_members* so connections
+             on any member of the rebuilt cell are re-established (not just
+             the anchor).  Compute how far that port moved (new_abs − old_abs).
+          2. Re-establish the Connection record between the new member's port
+             and the neighbour's port (so the indicator dots reappear).
+          3. BFS-propagate the displacement to all transitively connected
+             neighbours that are not inside *excluded_ids* (the rebuilt cell's
+             own members).
+
+        Bug fixes vs. old version
+        -------------------------
+        * Single shared ``visited`` set across ALL snapshots so no neighbour
+          is moved twice when two snapshotted ports displaced it by the same
+          delta (previously each snap got its own ``visited``, causing
+          double-moves equal to 2×dx/dy).
+        * Port-name lookup now checks every new member, not only new_anchor,
+          so connections that lived on non-anchor cell members survive rebuild.
+        * Connections on non-moving ports (dx=dy=0) are re-established even
+          though no nudge is needed — previously they were skipped entirely,
+          leaving the indicator dot dark.
 
         Returns a list of MoveComponent commands that were already executed
         (for the caller to record on the undo stack).
@@ -698,95 +806,115 @@ class MainWindow(QMainWindow):
         if not conn_snap or new_anchor is None:
             return []
 
-        new_port_by_name = {p.name: p for p in new_anchor.ports}
-        move_cmds = []
-
         from collections import deque
 
+        # Build a port-name → (component, port) lookup across ALL new members
+        # so we can match connections that lived on non-anchor members.
+        all_new_members: list = [new_anchor]
+        if new_members:
+            for m in new_members:
+                if m is not None and m.id != new_anchor.id:
+                    all_new_members.append(m)
+
+        def _find_port_by_name(name: str):
+            """Return (component, port) for the first new member owning *name*."""
+            for member in all_new_members:
+                for p in member.ports:
+                    if p.name == name:
+                        return member, p
+            return None, None
+
+        move_cmds = []
+        # Single shared visited set — prevents double-moving any neighbour
+        # when multiple snapshotted ports happen to push it by the same delta.
+        visited: set[str] = set(excluded_ids)
+
+        # Collect all (nbr, dx, dy, src_member, new_port) tuples first so we
+        # can re-establish connections even for zero-displacement ports.
+        pending: list[tuple] = []
         for snap in conn_snap:
-            new_port = new_port_by_name.get(snap["port_name"])
+            src_member, new_port = _find_port_by_name(snap["port_name"])
             if new_port is None:
                 continue
 
-            new_abs = new_port.abs_pos(new_anchor.origin)
+            new_abs = new_port.abs_pos(src_member.origin)
             dx = new_abs.x - snap["old_abs_x"]
             dy = new_abs.y - snap["old_abs_y"]
 
-            # Re-establish the connection on the new anchor component
+            # Always re-establish the connection (even if port didn't move).
             nbr_comp_id = snap["nbr_comp_id"]
             nbr_port_id = snap["nbr_port_id"]
             nbr = self._design.get(nbr_comp_id)
             if nbr is not None:
                 self._design.connect(
-                    new_anchor.id, new_port.id,
+                    src_member.id, new_port.id,
                     nbr_comp_id,   nbr_port_id,
                 )
 
             if dx == 0 and dy == 0:
-                continue  # port didn't move — no nudge needed
+                continue  # port didn't move — connection restored, no nudge
 
-            # BFS: push every transitively connected neighbour by (dx, dy),
-            # skipping the rebuilt cell's own members.
-            visited: set[str] = set(excluded_ids) | {new_anchor.id}
-            queue: deque[str] = deque()
-            if nbr_comp_id not in visited:
-                queue.append(nbr_comp_id)
+            pending.append((nbr_comp_id, dx, dy))
 
-            while queue:
-                cid = queue.popleft()
-                if cid in visited:
-                    continue
-                visited.add(cid)
+        # BFS over all pending nudges using the shared visited set.
+        queue: deque[tuple[str, int, int]] = deque(pending)
 
-                comp = self._design.get(cid)
-                if comp is None:
-                    continue
+        while queue:
+            cid, dx, dy = queue.popleft()
+            if cid in visited:
+                continue
+            visited.add(cid)
 
-                grp = self._design.group_of(cid)
-                if grp is not None:
-                    # Move all group members together
-                    member_ids_set = set(grp.member_ids)
-                    if member_ids_set & excluded_ids:
-                        continue  # group contains rebuilt cell — skip
-                    for mid in grp.member_ids:
-                        m = self._design.get(mid)
-                        if m is None:
-                            continue
-                        old_orig = m.origin
-                        new_orig = Point(old_orig.x + dx, old_orig.y + dy)
-                        mc = MoveComponent(mid, old_orig, new_orig)
-                        mc.execute(self._design)
-                        move_cmds.append(mc)
-                        m_item = self._scene.item_for(mid)
-                        if m_item:
-                            m_item.sync_from_model()
-                    if hasattr(grp, "_cell_origin") and grp._cell_origin is not None:
-                        o = grp._cell_origin
-                        grp._cell_origin = Point(o.x + dx, o.y + dy)
-                    visited.update(member_ids_set)
-                    for mid in grp.member_ids:
-                        for cn in self._design.connections_for(mid):
-                            nxt = cn.comp_b if cn.comp_a == mid else cn.comp_a
-                            if nxt not in visited:
-                                queue.append(nxt)
-                else:
-                    old_orig = comp.origin
+            comp = self._design.get(cid)
+            if comp is None:
+                continue
+
+            grp = self._design.group_of(cid)
+            if grp is not None:
+                # Move all group members together
+                member_ids_set = set(grp.member_ids)
+                if member_ids_set & excluded_ids:
+                    continue  # group contains rebuilt cell — skip
+                for mid in grp.member_ids:
+                    m = self._design.get(mid)
+                    if m is None:
+                        continue
+                    old_orig = m.origin
                     new_orig = Point(old_orig.x + dx, old_orig.y + dy)
-                    mc = MoveComponent(cid, old_orig, new_orig)
+                    mc = MoveComponent(mid, old_orig, new_orig)
                     mc.execute(self._design)
                     move_cmds.append(mc)
-                    comp_item = self._scene.item_for(cid)
-                    if comp_item:
-                        comp_item.sync_from_model()
-                    for cn in self._design.connections_for(cid):
-                        nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
+                    m_item = self._scene.item_for(mid)
+                    if m_item:
+                        m_item.sync_from_model()
+                if hasattr(grp, "_cell_origin") and grp._cell_origin is not None:
+                    o = grp._cell_origin
+                    grp._cell_origin = Point(o.x + dx, o.y + dy)
+                visited.update(member_ids_set)
+                for mid in grp.member_ids:
+                    for cn in self._design.connections_for(mid):
+                        nxt = cn.comp_b if cn.comp_a == mid else cn.comp_a
                         if nxt not in visited:
-                            queue.append(nxt)
+                            queue.append((nxt, dx, dy))
+            else:
+                old_orig = comp.origin
+                new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                mc = MoveComponent(cid, old_orig, new_orig)
+                mc.execute(self._design)
+                move_cmds.append(mc)
+                comp_item = self._scene.item_for(cid)
+                if comp_item:
+                    comp_item.sync_from_model()
+                for cn in self._design.connections_for(cid):
+                    nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
+                    if nxt not in visited:
+                        queue.append((nxt, dx, dy))
 
-        # Sync the new anchor's canvas item so port indicators refresh
-        anchor_item = self._scene.item_for(new_anchor.id)
-        if anchor_item:
-            anchor_item.sync_from_model()
+        # Sync all new member canvas items so port indicators refresh
+        for member in all_new_members:
+            m_item = self._scene.item_for(member.id)
+            if m_item:
+                m_item.sync_from_model()
 
         return move_cmds
 
@@ -876,10 +1004,10 @@ class MainWindow(QMainWindow):
             new_abs = port_after.abs_pos(comp.origin)
             dx = new_abs.x - old_x
             dy = new_abs.y - old_y
-            if dx == 0 and dy == 0:
-                continue  # this port didn't move — no push needed
 
             if nbr_comp_id not in visited:
+                # Always enqueue so the BFS can refresh the indicator even if
+                # dx==dy==0 (port didn't move but indicator dot needs updating).
                 queue.append((nbr_comp_id, dx, dy))
 
         while queue:
@@ -908,16 +1036,17 @@ class MainWindow(QMainWindow):
                 if comp_id in member_ids_set:
                     continue
 
-                # Apply the move to each member
+                # Apply the move to each member (skip zero-delta — no move needed,
+                # but still sync the canvas item so connection indicators refresh).
                 per_member_cmds = []
                 for m in members:
-                    old_orig = m.origin
-                    new_orig = Point(old_orig.x + dx, old_orig.y + dy)
-                    mc = MoveComponent(m.id, old_orig, new_orig)
-                    mc.execute(self._design)
-                    per_member_cmds.append(mc)
-
                     m_item = self._scene.item_for(m.id)
+                    if dx != 0 or dy != 0:
+                        old_orig = m.origin
+                        new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                        mc = MoveComponent(m.id, old_orig, new_orig)
+                        mc.execute(self._design)
+                        per_member_cmds.append(mc)
                     if m_item:
                         m_item.sync_from_model()
 
@@ -941,14 +1070,15 @@ class MainWindow(QMainWindow):
                             queue.append((next_comp_id, dx, dy))
 
             else:
-                # Standalone component — move only it
-                old_orig = nbr.origin
-                new_orig = Point(old_orig.x + dx, old_orig.y + dy)
-                mc = MoveComponent(nbr_comp_id, old_orig, new_orig)
-                mc.execute(self._design)
-                move_cmds.append(mc)
-
+                # Standalone component — move only it (skip zero-delta, but always
+                # sync so connection indicator dots refresh correctly).
                 nbr_item = self._scene.item_for(nbr_comp_id)
+                if dx != 0 or dy != 0:
+                    old_orig = nbr.origin
+                    new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                    mc = MoveComponent(nbr_comp_id, old_orig, new_orig)
+                    mc.execute(self._design)
+                    move_cmds.append(mc)
                 if nbr_item:
                     nbr_item.sync_from_model()
 

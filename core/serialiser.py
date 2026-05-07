@@ -73,6 +73,14 @@ def _encode_group(g) -> dict:
         d["cell_params"] = dict(g._cell_params)
     if hasattr(g, "_cell_subgroups") and g._cell_subgroups:
         d["cell_subgroups"] = g._cell_subgroups
+    if hasattr(g, "_cell_rotation_steps") and g._cell_rotation_steps:
+        d["cell_rotation_steps"] = g._cell_rotation_steps
+    if (hasattr(g, "_cell_rotation_cx") and g._cell_rotation_cx is not None
+            and hasattr(g, "_cell_rotation_cy") and g._cell_rotation_cy is not None):
+        d["cell_rotation_cx"] = g._cell_rotation_cx
+        d["cell_rotation_cy"] = g._cell_rotation_cy
+    if hasattr(g, "_cell_origin") and g._cell_origin is not None:
+        d["cell_origin"] = [g._cell_origin.x, g._cell_origin.y]
     return d
 
 
@@ -142,6 +150,14 @@ def _decode(data: dict) -> DesignScene:
             g._cell_params = dict(gd["cell_params"])
         if "cell_subgroups" in gd:
             g._cell_subgroups = gd["cell_subgroups"]
+        if "cell_rotation_steps" in gd:
+            g._cell_rotation_steps = gd["cell_rotation_steps"]
+        if "cell_rotation_cx" in gd:
+            g._cell_rotation_cx = gd["cell_rotation_cx"]
+            g._cell_rotation_cy = gd["cell_rotation_cy"]
+        if "cell_origin" in gd:
+            from core.model import Point as _Point
+            g._cell_origin = _Point(gd["cell_origin"][0], gd["cell_origin"][1])
         design._groups.append(g)
 
     design.is_dirty = False
