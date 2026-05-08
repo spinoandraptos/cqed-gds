@@ -358,13 +358,23 @@ class MergeGroups(Command):
         # are not silently dropped during a sweep.
         subgroups: list = []
         for snap in self._source_snapshots:
-            subgroups.append({
-                "name":        snap.name,
-                "cell_id":     getattr(snap, "cell_id", None),
-                "cell_params": dict(getattr(snap, "_cell_params", {})),
-                "cell_rotation_steps": getattr(snap, "_cell_rotation_steps", 0),
-                "member_ids":  list(snap.member_ids),
-            })
+            # Prefer _cell_subgroups (modern path) — it has up-to-date cell_params.
+            # Fall back to legacy flat _cell_params only for old-style single-cell groups.
+            existing_sgs = getattr(snap, "_cell_subgroups", None)
+            if existing_sgs:
+                # Already structured — carry sub-groups over directly, preserving
+                # the up-to-date cell_params that _do_cell_param_change stored there.
+                for sg in existing_sgs:
+                    subgroups.append(dict(sg))   # shallow copy is enough
+            else:
+                # Legacy single-cell group or plain group — build one entry.
+                subgroups.append({
+                    "name":                snap.name,
+                    "cell_id":             getattr(snap, "cell_id", None),
+                    "cell_params":         dict(getattr(snap, "_cell_params", {})),
+                    "cell_rotation_steps": getattr(snap, "_cell_rotation_steps", 0),
+                    "member_ids":          list(snap.member_ids),
+                })
         # Loose components that were not part of any source group
         if extra_comp_ids:
             already_covered = {cid for snap in self._source_snapshots

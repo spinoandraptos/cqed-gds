@@ -1229,6 +1229,12 @@ class MainWindow(QMainWindow):
 
         move_cmds: list = []          # Command objects for the undo batch
         visited: set[str] = {comp_id}  # don't move the edited comp
+        # If the edited component is inside a group, all group-mates are rigidly
+        # attached to it — pre-mark them visited so the BFS never tries to nudge
+        # them as if they were independent neighbours.
+        _edited_group = self._design.group_of(comp_id)
+        if _edited_group is not None:
+            visited.update(_edited_group.member_ids)
 
         # Seed: collect (neighbour_comp_id, dx, dy) from the edited comp's ports
         from collections import deque
@@ -1537,7 +1543,31 @@ class MainWindow(QMainWindow):
         if not ok or not name.strip():
             return
 
-        self._scene.cmd_stack.execute(GroupComponents([c.id for c in selected_comps], name.strip()))
+        cell_subgroups = []
+        for c in selected_comps:
+            existing_group = self._design.group_of(c.id)
+            if existing_group is not None:
+                # Find this component's sub-group entry in the existing group
+                existing_sgs = getattr(existing_group, "_cell_subgroups", [])
+                matching_sg = next(
+                    (sg for sg in existing_sgs if c.id in sg.get("member_ids", [])),
+                    None
+                )
+                if matching_sg:
+                    cell_subgroups.append(dict(matching_sg))  # carry over cell_id, cell_params etc.
+                    continue
+            # Ungrouped component or no matching sub-group entry — plain item entry
+            cell_subgroups.append({
+                "name":                f"comp:{c.id}",
+                "cell_id":             None,
+                "cell_params":         {},
+                "cell_rotation_steps": 0,
+                "member_ids":          [c.id],
+            })
+
+        cmd = GroupComponents([c.id for c in selected_comps], name.strip())
+        cmd._group._cell_subgroups = cell_subgroups  # overwrite with correct metadata
+        self._scene.cmd_stack.execute(cmd)
         self._flash_status(f"Grouped {len(selected_comps)} components as '{name.strip()}'")
 
     @pyqtSlot()
