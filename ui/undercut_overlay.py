@@ -165,14 +165,22 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     """
     Build the undercut ring for a tapered-lead L1 body polygon.
 
-    The ring is the standard stroker expansion of the L1 body with the entire
-    L11 clip polygon subtracted out, so the ring stops exactly at the clip
-    boundary face and never overlaps the narrow-tip clip region.
+    The ring is the standard stroker expansion of the L1 body.  Two cuts are
+    applied so the ring never enters the L11 clip body:
 
-    l11_comp : the L11 sibling GDSComponent (optional). When supplied its
-               shape is subtracted from the ring after expansion.
-               When None, falls back to uniform expansion (caller uses
-               _build_ring_path instead).
+    1. ``tip_half`` — a large rectangle that erases everything on the narrow-tip
+       side of the clip midpoint plane (the existing clip_length/2 constraint).
+    2. ``l11_shape`` — the full L11 polygon itself, subtracted so the ring
+       cannot occupy any area inside the clip.  The ring is therefore limited to
+       the halo *around* the L11 boundary, not inside it.
+
+    Together these ensure the ring:
+      • wraps the outer perimeter of the L1 body (wide end + long sides)
+      • skirts the *outside* edge of the L11 clip up to its midpoint
+      • never enters the L11 clip interior
+
+    l11_comp : the L11 sibling GDSComponent (optional). When None the caller
+               falls back to _build_ring_path (uniform expansion).
 
     Returns a QPainterPath or None (caller falls back to _build_ring_path).
     """
@@ -277,6 +285,19 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     tip_half.closeSubpath()
 
     ring = ring.subtracted(tip_half)
+
+    # ── Subtract the full L11 clip polygon ───────────────────────────────────
+    # Even after the midpoint cap cut, the ring still overlaps the half of L11
+    # between the shared boundary face and the cap plane.  Subtracting the
+    # complete L11 shape removes every pixel of ring that sits *inside* the
+    # clip body, so the ring can only occupy the outward halo around L11's
+    # perimeter — never its interior.
+    l11_shape = QPainterPath(QPointF(unique11[0].x, unique11[0].y))
+    for p in unique11[1:]:
+        l11_shape.lineTo(p.x, p.y)
+    l11_shape.closeSubpath()
+
+    ring = ring.subtracted(l11_shape)
     return ring if not ring.isEmpty() else None
 
 
