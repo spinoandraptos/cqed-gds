@@ -890,132 +890,6 @@ def build_taper_segment(
         ),
     )
 
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Cell: Taper Pad  (→ add_taper_pad in primitives.py / component_model.py)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Default geometry (µm) — mirrors taper_pad ComponentType in component_model.py
-# FINAL_TAPER_LENGTH + FINAL_PAD_LENGTH represent the two stages:
-#   Stage 1: linear taper from narrow_width → pad_width over taper_length
-#   Stage 2: uniform rectangular pad of pad_width × pad_length
-_TAPER_PAD_DEFAULTS = dict(
-    direction    = "+x",   # "+x" | "-x" | "+y" | "-y"
-    narrow_width = 0.3,    # entry (narrow) width  (µm) → cfg.WIRE_WIDTH
-    pad_width    = 5.0,    # exit  (wide)   width  (µm) → cfg.TAPER_WIDTH / PAD_W
-    taper_length = 6.1,    # length of the tapered wedge (µm) → FINAL_TAPER_LENGTH
-    pad_length   = 4.0,    # length of the flat pad       (µm) → FINAL_PAD_LENGTH
-)
-
-
-def build_taper_pad(
-    origin: Point,
-    direction:    str   = _TAPER_PAD_DEFAULTS["direction"],
-    narrow_width: float = _TAPER_PAD_DEFAULTS["narrow_width"],
-    pad_width:    float = _TAPER_PAD_DEFAULTS["pad_width"],
-    taper_length: float = _TAPER_PAD_DEFAULTS["taper_length"],
-    pad_length:   float = _TAPER_PAD_DEFAULTS["pad_length"],
-) -> CellResult:
-    """
-    Two-stage transition: linear taper wedge (L1) followed by a flat
-    overlap pad (L1), both on LAYER_BRANCH.
-
-    Mirrors add_taper_pad() from primitives.py as called by add_top_branch(),
-    add_snake_right_branch(), and the taper_pad ComponentType in
-    component_model.py.
-
-    Stage 1 — Taper (trapezoid):
-      Runs from origin for taper_length in `direction`.
-      Entry width = narrow_width, exit width = pad_width.
-
-    Stage 2 — Pad (rectangle):
-      Runs from end of taper for pad_length in `direction`.
-      Width = pad_width throughout.
-
-    Both stages are on LAYER_BRANCH (L1).  No LAYER_NARROW_END clip is
-    emitted here — taper_pad is the wide termination end, not the narrow tip.
-
-    Origin is the centreline of the entry (narrow) end, matching the
-    (x, y) convention in the reference codebase.
-
-    Ports
-    -----
-      narrow — entry face (wire comes in, opposite to direction)
-      wide   — exit face  (pad terminus, in direction of travel)
-    """
-    nw = narrow_width
-    pw = pad_width
-    tL = taper_length
-    pL = pad_length
-
-    _dir_map = {
-        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
-        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
-        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
-        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
-    }
-    d = _dir_map[direction]
-    tx, ty = d["tx"], d["ty"]
-    px, py = d["px"], d["py"]
-
-    def _pt(travel: float, hw: float, sign: int) -> tuple[float, float]:
-        return (tx * travel + px * sign * hw,
-                ty * travel + py * sign * hw)
-
-    # ── Stage 1: taper trapezoid ───────────────────────────────────────────
-    taper_pts = [
-        _pt(0,  nw / 2, -1),
-        _pt(0,  nw / 2, +1),
-        _pt(tL, pw / 2, +1),
-        _pt(tL, pw / 2, -1),
-    ]
-    taper_body = _poly(origin, taper_pts, LAYER_BRANCH)
-    taper_body._no_auto_ports = False   # anchor
-
-    # ── Stage 2: flat pad rectangle ───────────────────────────────────────
-    pad_pts = [
-        _pt(tL,      pw / 2, -1),
-        _pt(tL,      pw / 2, +1),
-        _pt(tL + pL, pw / 2, +1),
-        _pt(tL + pL, pw / 2, -1),
-    ]
-    pad_body = _poly(origin, pad_pts, LAYER_BRANCH)
-    pad_body._no_auto_ports = True
-
-    components = [taper_body, pad_body]
-
-    # ── Ports on the anchor (taper_body) ──────────────────────────────────
-    _opp = {"+x": PortSide.WEST, "-x": PortSide.EAST,
-            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
-    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
-            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
-
-    # Port offsets must be relative to body.origin = dbu_pts[0] = taper_pts[0]
-    # = _pt(0, nw/2, -1) = (-px*nw/2, -py*nw/2) in cell-frame µm.
-    # Correction = (px*nw/2, py*nw/2) added to all desired world positions.
-    correction_x = px * nw / 2
-    correction_y = py * nw / 2
-    total_L = tL + pL
-    _assign_ports(taper_body, [
-        Port("narrow",
-             Point(um_to_dbu(correction_x), um_to_dbu(correction_y)),
-             _opp[direction]),
-        Port("wide",
-             Point(um_to_dbu(tx * total_L + correction_x),
-                   um_to_dbu(ty * total_L + correction_y)),
-             _fwd[direction]),
-    ])
-
-    return CellResult(
-        components=components,
-        group_name=f"TaperPad ({direction} tL={taper_length:.1f}µm pL={pad_length:.1f}µm)",
-        description=(
-            f"Taper pad  {direction}  taper {taper_length}µm  pad {pad_length}µm  "
-            f"nw={narrow_width}µm → pw={pad_width}µm"
-        ),
-    )
-
-
 # ═════════════════════════════════════════════════════════════════════════════
 # Cell: Smooth Taper Pad  (→ smooth_taper + add_taper_pad in primitives.py)
 # ═════════════════════════════════════════════════════════════════════════════
@@ -1028,9 +902,9 @@ def build_taper_pad(
 _SMOOTH_TAPER_PAD_DEFAULTS = dict(
     direction    = "+x",   # "+x" | "-x" | "+y" | "-y"
     narrow_width = 2.0,    # entry (wire-side) width µm  → cfg.TAPER_WIDTH
-    pad_width    = 5.0,    # exit  (pad-side)  width µm  → cfg.FINAL_TAPER_WIDTH
+    pad_width    = 10.0,   # exit  (pad-side)  width µm  → cfg.FINAL_TAPER_WIDTH
     taper_length = 6.1,    # cosine-taper length µm      → cfg.FINAL_TAPER_LENGTH
-    pad_length   = 4.0,    # flat pad length µm           → cfg.FINAL_PAD_LENGTH
+    pad_length   = 2.1,    # flat pad length µm           → cfg.FINAL_PAD_LENGTH
     n_segments   = 128,    # polygon vertex count for the cosine curve
 )
 
@@ -1163,85 +1037,6 @@ def build_smooth_taper_pad(
             f"Cosine taper pad  {direction}  "
             f"taper {taper_length}µm  pad {pad_length}µm  "
             f"nw={narrow_width}µm → pw={pad_width}µm  L1"
-        ),
-    )
-
-
-# ═════════════════════════════════════════════════════════════════════════════
-# Cell: Branch Segment  (→ add_branch_segment in components_lib.py)
-# ═════════════════════════════════════════════════════════════════════════════
-
-# Default geometry (µm) — mirrors branch_segment ComponentType in component_model.py
-_BRANCH_SEG_DEFAULTS = dict(
-    direction  = "+x",    # "+x" | "-x" | "+y" | "-y"
-    length     = 10.0,    # segment length (µm)
-    taper_width = 2.0,    # uniform width (µm) → cfg.TAPER_WIDTH
-)
-
-
-def build_branch_segment(
-    origin: Point,
-    direction:   str   = _BRANCH_SEG_DEFAULTS["direction"],
-    length:      float = _BRANCH_SEG_DEFAULTS["length"],
-    taper_width: float = _BRANCH_SEG_DEFAULTS["taper_width"],
-) -> CellResult:
-    """
-    Straight uniform-width branch segment on LAYER_BRANCH (L1).
-
-    Mirrors add_branch_segment() from components_lib.py — a plain rectangular
-    path of width taper_width travelling in `direction` for `length` µm.
-
-    Origin is the centreline of the entry end, matching the (x, y) convention
-    used throughout components_lib.py.
-
-    Ports
-    -----
-      entry — centreline of the entry face (opposite to direction of travel)
-      exit  — centreline of the exit  face (in direction of travel)
-    """
-    tw = taper_width
-    L  = length
-
-    _dir_map = {
-        "+x": dict(tx=1,  ty=0,  px=0,  py=1),
-        "-x": dict(tx=-1, ty=0,  px=0,  py=1),
-        "+y": dict(tx=0,  ty=1,  px=1,  py=0),
-        "-y": dict(tx=0,  ty=-1, px=1,  py=0),
-    }
-    d  = _dir_map[direction]
-    tx, ty = d["tx"], d["ty"]   # travel axis unit vector
-    px, py = d["px"], d["py"]   # transverse axis unit vector
-
-    # Rectangle: entry at travel=0, exit at travel=L, half-width tw/2 transverse
-    rect_pts = [
-        (tx * 0 + px * (-tw / 2), ty * 0 + py * (-tw / 2)),
-        (tx * 0 + px * ( tw / 2), ty * 0 + py * ( tw / 2)),
-        (tx * L + px * ( tw / 2), ty * L + py * ( tw / 2)),
-        (tx * L + px * (-tw / 2), ty * L + py * (-tw / 2)),
-    ]
-    body = _poly(origin, rect_pts, LAYER_BRANCH)
-    body._no_auto_ports = False   # anchor
-
-    # ── Ports ──────────────────────────────────────────────────────────────
-    _opp = {"+x": PortSide.WEST,  "-x": PortSide.EAST,
-            "+y": PortSide.NORTH, "-y": PortSide.SOUTH}
-    _fwd = {"+x": PortSide.EAST,  "-x": PortSide.WEST,
-            "+y": PortSide.SOUTH, "-y": PortSide.NORTH}
-
-    _assign_ports(body, [
-        Port("entry",
-             Point(0, 0),
-             _opp[direction]),
-        Port("exit",
-             Point(um_to_dbu(tx * L), um_to_dbu(ty * L)),
-             _fwd[direction]),
-    ])
-
-    return CellResult(
-        components=[body],
-        group_name=f"BranchSeg ({direction} L={length:.1f}µm w={taper_width:.1f}µm)",
-        description=(
-            f"Branch segment  {direction}  L={length}µm  width={taper_width}µm  L1"
         ),
     )
 
@@ -1405,8 +1200,8 @@ def build_turn(
 _WIRE_DEFAULTS = dict(
     direction = "+x",   # "+x" | "-x" | "+y" | "-y"
     length    = 5.0,    # wire length  (µm)
-    width     = 0.3,    # wire width   (µm) → cfg.WIRE_WIDTH
-    layer     = 5,      # GDS layer    (int) → LAYER_BIYSK_JUNCTION default
+    width     = 2.0,    # wire width   (µm) → cfg.WIRE_WIDTH
+    layer     = 1,      # GDS layer    (int) → LAYER_BIYSK_JUNCTION default
 )
 
 
@@ -1707,14 +1502,6 @@ CELL_CATALOGUE: List[CellDef] = [
         builder     = build_taper_segment,
     ),
     CellDef(
-        cell_id     = "taper_pad",
-        name        = "Taper Pad",
-        description = "Linear taper wedge (L1) → flat overlap pad (L1)",
-        category    = "Routing",
-        defaults    = _TAPER_PAD_DEFAULTS,
-        builder     = build_taper_pad,
-    ),
-    CellDef(
         cell_id     = "smooth_taper_pad",
         name        = "Smooth Taper Pad",
         description = "Cosine-profile taper wedge (L1) → flat overlap pad (L1)",
@@ -1737,33 +1524,6 @@ CELL_CATALOGUE: List[CellDef] = [
         category    = "Routing",
         defaults    = _T_JCT_DEFAULTS,
         builder     = build_t_junction,
-    ),
-    # ── Undercut ring ─────────────────────────────────────────────────────────
-    # Registered here so the palette and place_cell() can reach it.
-    # bbox_um is expressed as four separate floats (x0, y0, x1, y1) because
-    # CellDef.defaults must be a flat dict of JSON-serialisable scalars
-    # (the MIME drag payload encodes defaults as JSON).  The builder lambda
-    # reassembles them into the tuple that build_undercut_ring expects.
-    CellDef(
-        cell_id     = "undercut_ring",
-        name        = "Undercut Ring",
-        description = "Perimeter undercut ring on L2 — place around any cell group",
-        category    = "Undercut",
-        defaults    = dict(
-            bbox_x0      = 0.0,   # µm — left edge of target bbox
-            bbox_y0      = 0.0,   # µm — bottom edge of target bbox
-            bbox_x1      = 4.0,   # µm — right edge of target bbox
-            bbox_y1      = 4.0,   # µm — top edge of target bbox
-            thickness_um = 0.8,   # µm — ring strip thickness
-        ),
-        builder     = lambda origin, bbox_x0=0.0, bbox_y0=0.0,
-                                     bbox_x1=4.0, bbox_y1=4.0,
-                                     thickness_um=0.8, **_:
-                          build_undercut_ring(
-                              bbox_um=(bbox_x0, bbox_y0, bbox_x1, bbox_y1),
-                              thickness_um=thickness_um,
-                              origin=origin,
-                          ),
     ),
 ]
 

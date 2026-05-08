@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
     QApplication,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QMimeData, QPoint, QByteArray, QPointF, QTimer
-from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QPen, QPainterPath, QDrag, QMouseEvent
+from PyQt6.QtGui import QColor, QFont, QIcon, QPixmap, QPainter, QPen, QPainterPath, QDrag, QMouseEvent, QCursor
 
 from ui.theme import Colors, Fonts, Geometry
 from core.model import GDSComponent, ComponentKind, PortSide, dbu_to_um, um_to_dbu
@@ -160,7 +160,8 @@ def _shape_icon(kind: "ComponentKind", size: int = 36) -> QPixmap:
 class _ParamSpinBox(QDoubleSpinBox):
     """
     QDoubleSpinBox that keeps focus inside the properties panel after the user
-    commits a value with Enter.
+    commits a value with Enter, and ignores mouse-wheel events so accidental
+    scrolling over the panel never silently changes a value.
 
     The default QDoubleSpinBox behaviour on Enter is to confirm the value and
     then return focus to whichever widget had focus before — usually the canvas
@@ -176,6 +177,49 @@ class _ParamSpinBox(QDoubleSpinBox):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
             self.clearFocus()
         super().keyPressEvent(event)
+
+    def wheelEvent(self, event) -> None:
+        # Ignore scroll — propagate to parent so the panel itself can scroll.
+        event.ignore()
+
+
+class _LayerSpinBox(QSpinBox):
+    """QSpinBox that ignores mouse-wheel events (same policy as _ParamSpinBox)."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class _ParamComboBox(QComboBox):
+    """QComboBox that ignores mouse-wheel events so scrolling never silently changes a value."""
+
+    def wheelEvent(self, event) -> None:
+        event.ignore()
+
+
+class _ScrollGuard(QScrollArea):
+    """
+    QScrollArea that sets a short-lived flag while the viewport is scrolling.
+    ComponentItemCard reads this flag in enterEvent/leaveEvent to suppress
+    spurious highlight signals caused by cards drifting under the cursor
+    when the user scrolls the panel.
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._scrolling = False
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(150)   # ms — clear flag after scroll settles
+        self._scroll_timer.timeout.connect(self._clear_scrolling)
+
+    def _clear_scrolling(self) -> None:
+        self._scrolling = False
+
+    def scrollContentsBy(self, dx: int, dy: int) -> None:
+        self._scrolling = True
+        self._scroll_timer.start()   # restart the debounce window
+        super().scrollContentsBy(dx, dy)
 
 
 def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
@@ -816,7 +860,7 @@ class ComponentPalette(QWidget):
         root.addWidget(self._build_header())
 
         # Single scrollable body containing all sections
-        scroll = QScrollArea()
+        scroll = _ScrollGuard()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
         scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
@@ -872,7 +916,7 @@ class ComponentPalette(QWidget):
         lay.setSpacing(4)
         lay.addWidget(SectionLabel("Active Layer"))
 
-        self._layer_combo = QComboBox()
+        self._layer_combo = _ParamComboBox()
         for i in range(8):
             self._layer_combo.addItem(_layer_icon(i), f"Layer {i}", i)
         self._layer_combo.setCurrentIndex(0)
@@ -1129,12 +1173,23 @@ class MemberCard(QWidget):
         self.setMouseTracking(True)
         self._build(comp, design)
 
+    def _is_cursor_inside(self) -> bool:
+        """Return True only if the cursor is genuinely within this card's screen rect."""
+        return self.rect().contains(self.mapFromGlobal(QCursor.pos()))
+
     def enterEvent(self, event) -> None:
+        if not self._is_cursor_inside():
+            super().enterEvent(event)
+            return
         self.setStyleSheet(self._hover_style)
         self.component_hover_requested.emit(self._comp.id)
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        if self._is_cursor_inside():
+            # Cursor is still inside — widget moved under us (scroll), not the cursor
+            super().leaveEvent(event)
+            return
         self.setStyleSheet(self._base_style)
         self.component_hover_requested.emit("")
         super().leaveEvent(event)
@@ -1244,7 +1299,7 @@ class MemberCard(QWidget):
         # Use editingFinished (not valueChanged) so the signal only fires when
         # the user commits the value — not on every arrow-key / keystroke, which
         # was triggering _on_model_changed -> panel rebuild -> focus loss each time.
-        layer_sb = QSpinBox()
+        layer_sb = _LayerSpinBox()
         layer_sb.setRange(0, 63)
         layer_sb.setValue(comp.layer)
         layer_sb.setFocusPolicy(Qt.FocusPolicy.ClickFocus)
@@ -1255,7 +1310,7 @@ class MemberCard(QWidget):
 
         # Kind-specific editable fields
         if comp.kind == ComponentKind.RECTANGLE:
-            w_sb = QDoubleSpinBox()
+            w_sb = _ParamSpinBox()
             w_sb.setRange(0.001, 10_000); w_sb.setDecimals(3)
             w_sb.setSuffix(" µm"); w_sb.setValue(dbu_to_um(comp.width))
             w_sb.editingFinished.connect(
@@ -1264,7 +1319,7 @@ class MemberCard(QWidget):
             )
             spin_row("Width", w_sb)
 
-            h_sb = QDoubleSpinBox()
+            h_sb = _ParamSpinBox()
             h_sb.setRange(0.001, 10_000); h_sb.setDecimals(3)
             h_sb.setSuffix(" µm"); h_sb.setValue(dbu_to_um(comp.height))
             h_sb.editingFinished.connect(
@@ -1274,7 +1329,7 @@ class MemberCard(QWidget):
             spin_row("Height", h_sb)
 
         elif comp.kind == ComponentKind.PATH and comp.path_width:
-            pw_sb = QDoubleSpinBox()
+            pw_sb = _ParamSpinBox()
             pw_sb.setRange(0.001, 1_000); pw_sb.setDecimals(3)
             pw_sb.setSuffix(" µm"); pw_sb.setValue(dbu_to_um(comp.path_width))
             pw_sb.editingFinished.connect(
@@ -1372,7 +1427,7 @@ class PropertiesPanel(QWidget):
         lbl = QLabel("Layer")
         lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
         lbl.setFixedWidth(84)
-        self._layer_spin = QSpinBox()
+        self._layer_spin = _LayerSpinBox()
         self._layer_spin.setRange(0, 63)
         self._layer_spin.setEnabled(False)
         self._layer_spin.setFixedWidth(72)
@@ -1408,7 +1463,7 @@ class PropertiesPanel(QWidget):
 
         cl.addStretch()
 
-        scroll = QScrollArea()
+        scroll = _ScrollGuard()
         scroll.setWidget(content)
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.Shape.NoFrame)
@@ -1431,7 +1486,7 @@ class PropertiesPanel(QWidget):
         lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
         lbl.setFixedWidth(84)
 
-        sb = QDoubleSpinBox()
+        sb = _ParamSpinBox()
         sb.setRange(0.001, 10_000.0)   # µm: 1 nm minimum, 10 mm maximum
         sb.setDecimals(3)
         sb.setSuffix(" µm")
@@ -1490,7 +1545,7 @@ class PropertiesPanel(QWidget):
         uc_lbl = QLabel("offset")
         uc_lbl.setStyleSheet(f"color: {Colors.TEXT_MUTED}; font-size: {Fonts.SIZE_XS}px;")
 
-        spin = QDoubleSpinBox()
+        spin = _ParamSpinBox()
         spin.setRange(0.05, 5.0)
         spin.setSingleStep(0.1)
         spin.setDecimals(2)
@@ -1647,7 +1702,7 @@ class PropertiesPanel(QWidget):
         root.addWidget(self._grp_header)
 
         # Scrollable member cards
-        self._cards_scroll = QScrollArea()
+        self._cards_scroll = _ScrollGuard()
         self._cards_scroll.setWidgetResizable(True)
         self._cards_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._cards_scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
@@ -2035,7 +2090,7 @@ class PropertiesPanel(QWidget):
                 elif isinstance(default, str):
                     options = _STRING_OPTIONS.get(key)
                     if options:
-                        combo = QComboBox()
+                        combo = _ParamComboBox()
                         combo.addItems(options)
                         combo.blockSignals(True)
                         combo.setCurrentText(str(current_val))
@@ -2101,7 +2156,7 @@ class PropertiesPanel(QWidget):
         hl.addWidget(self._multi_subtitle)
         root.addWidget(header)
 
-        self._multi_scroll = QScrollArea()
+        self._multi_scroll = _ScrollGuard()
         self._multi_scroll.setWidgetResizable(True)
         self._multi_scroll.setFrameShape(QFrame.Shape.NoFrame)
         self._multi_scroll.setStyleSheet(f"background: {Colors.BG_SURFACE};")
