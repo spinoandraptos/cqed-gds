@@ -356,6 +356,9 @@ class _GroupRingItem(QGraphicsPathItem):
         self.setZValue(_RING_Z)
         self._configure_interaction()
         self._apply_style()
+        # Tracks which component IDs contributed to this ring, so the overlay
+        # can check whether a dissolved group was enabled before merging.
+        self.member_ids: Set[str] = set()
 
     def _configure_interaction(self) -> None:
         self.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
@@ -605,14 +608,39 @@ class UndercutOverlay:
         # "off by default" state.  _known_ids tracks every id ever seen, so we
         # only default-exclude ids that are genuinely new — never re-excluding
         # an id the user has explicitly enabled.
+        #
+        # All component IDs are registered here (grouped or not) so the group
+        # registration below can correctly read their exclusion state when
+        # deciding whether to inherit enabled status from members.
         for comp in design.components:
-            if comp.id not in grouped_ids and comp.id not in self._known_ids:
+            if comp.id not in self._known_ids:
                 self._known_ids.add(comp.id)
                 self._excluded_ids.add(comp.id)
+        # Build a map from component ID → was its previous group enabled?
+        # When groups are dissolved into a merged group, the new group ID is
+        # brand-new and all member comp IDs are excluded by default.  We recover
+        # the intended enabled state by checking whether any stale group ring
+        # (about to be pruned) was not excluded and shared members with the new
+        # group.  _GroupRingItem.member_ids is written by _ensure_group_ring.
+        live_group_id_set = {g.id for g in design.groups}
+        enabled_by_prev_group: Set[str] = set()
+        for gid, ring_item in self._group_rings.items():
+            if gid not in live_group_id_set and gid not in self._excluded_ids:
+                enabled_by_prev_group.update(getattr(ring_item, "member_ids", set()))
+
         for group in design.groups:
             if group.id not in self._known_ids:
                 self._known_ids.add(group.id)
-                self._excluded_ids.add(group.id)
+                # Inherit enabled state: visible if any member comp was
+                # explicitly enabled, OR if any dissolved source group that
+                # contained these members was enabled (common when merging
+                # a taper-lead group with other elements).
+                any_member_enabled = any(
+                    mid not in self._excluded_ids or mid in enabled_by_prev_group
+                    for mid in group.member_ids
+                )
+                if not any_member_enabled:
+                    self._excluded_ids.add(group.id)
 
         # ── Per-component rings (ungrouped components only) ───────────────────
         live_comp_ids: Set[str] = set()
@@ -700,20 +728,65 @@ class UndercutOverlay:
         l11_comps = [c for c in all_members if c.layer == LAYER_NARROW_END]
         l1_polys  = [c for c in layer1_comps if c.kind == ComponentKind.POLYGON]
 
-        raw = None
-        if len(l1_polys) == 1 and len(l11_comps) == 1:
-            # Single taper-lead L1 body with its L11 narrow-tip clip — use the
-            # variable-thickness ring that terminates at clip_length/2 inward.
-            raw = _taper_quad_ring(l1_polys[0], self._offset_dbu, l11_comps[0])
+        # Build the ring piece by piece across all L1 polygons.
+        # Each L1 polygon is checked for a paired L11 clip sibling among the
+        # group members (matched by proximity: the L11 whose points overlap the
+        # L1 boundary face).  When found, _taper_quad_ring produces the
+        # correctly-clipped taper ring; otherwise a plain uniform expansion is
+        # used.  Results are unioned so a merged group with multiple taper leads
+        # each preserve their individual L11 constraints.
+        l11_by_id = {c.id: c for c in l11_comps}
 
-        if raw is None:
-            # Fallback: uniform expansion of the union of all L1 members.
-            union = QPainterPath()
-            for comp in layer1_comps:
-                shape = _shape_path_for_comp(comp)
-                if not shape.isEmpty():
-                    union = union.united(shape)
-            raw = _build_ring_path(union, self._offset_dbu)
+        def _find_l11_for(l1_poly):
+            """Return the L11 comp whose points share an edge with l1_poly, or None."""
+            l1_pts = set((p.x, p.y) for p in (l1_poly.points or []))
+            for l11 in l11_comps:
+                l11_pts = set((p.x, p.y) for p in (l11.points or []))
+                if len(l1_pts & l11_pts) >= 2:
+                    return l11
+            return None
+
+        raw = QPainterPath()
+        for l1_poly in l1_polys:
+            l11 = _find_l11_for(l1_poly)
+            piece = _taper_quad_ring(l1_poly, self._offset_dbu, l11)
+            if piece is None:
+                base = _shape_path_for_comp(l1_poly)
+                piece = _build_ring_path(base, self._offset_dbu)
+            if not piece.isEmpty():
+                raw = raw.united(piece)
+
+        # For non-polygon L1 members (rectangles, paths) add their rings too.
+        non_poly_l1 = [c for c in layer1_comps if c.kind != ComponentKind.POLYGON]
+        for comp in non_poly_l1:
+            base = _shape_path_for_comp(comp)
+            piece = _build_ring_path(base, self._offset_dbu)
+            if not piece.isEmpty():
+                raw = raw.united(piece)
+
+        if raw.isEmpty():
+            raw = QPainterPath()
+
+        # ── Clean up inter-lead overlap and interior edges ────────────────────
+        # Pipeline (matches the visual intent):
+        #   1. raw = union of per-lead rings (each L11-clipped) — built above
+        #   2. subtract l1_union so no ring pixel sits on top of any L1 body
+        #   3. build union_ring = _build_ring_path(l1_union) — the ring of the
+        #      unioned footprint, which has a single smooth outer contour and no
+        #      internal seam edges between adjacent leads
+        #   4. intersect raw with union_ring — discard any per-lead ring area
+        #      that falls outside what the union boundary allows, eliminating
+        #      overlap blobs and jarring interior edges in one step
+        l1_union = QPainterPath()
+        for comp in layer1_comps:
+            shape = _shape_path_for_comp(comp)
+            if not shape.isEmpty():
+                l1_union = l1_union.united(shape)
+
+        if not l1_union.isEmpty():
+            raw = raw.subtracted(l1_union)
+            union_ring = _build_ring_path(l1_union, self._offset_dbu)
+            raw = raw.intersected(union_ring)
 
         # ── Merge narrow-undercut L2 flank polygons into the ring ────────────
         # When build_taper_segment emits narrow_undercut=True it adds two L2
@@ -750,6 +823,7 @@ class UndercutOverlay:
 
         masked = self._apply_masks(group.id, raw)
         ring.setPath(masked)
+        ring.member_ids = {c.id for c in all_members}
         ring.setVisible(self._enabled and group.id not in self._excluded_ids)
 
 
@@ -848,14 +922,29 @@ class UndercutOverlay:
         grouped_ids: Set[str] = set()
         for group in design.groups:
             grouped_ids.update(group.member_ids)
+        # Register all component IDs (grouped or not) so the group loop below
+        # can correctly read their exclusion state for inheritance.
         for comp in design.components:
-            if comp.id not in grouped_ids and comp.id not in self._known_ids:
+            if comp.id not in self._known_ids:
                 self._known_ids.add(comp.id)
                 self._excluded_ids.add(comp.id)
+        # Inherit enabled state from dissolved source groups (same logic as
+        # _rebuild_all — see comment there for full explanation).
+        live_group_id_set = {g.id for g in design.groups}
+        enabled_by_prev_group: Set[str] = set()
+        for gid, ring_item in self._group_rings.items():
+            if gid not in live_group_id_set and gid not in self._excluded_ids:
+                enabled_by_prev_group.update(getattr(ring_item, "member_ids", set()))
+
         for group in design.groups:
             if group.id not in self._known_ids:
                 self._known_ids.add(group.id)
-                self._excluded_ids.add(group.id)
+                any_member_enabled = any(
+                    mid not in self._excluded_ids or mid in enabled_by_prev_group
+                    for mid in group.member_ids
+                )
+                if not any_member_enabled:
+                    self._excluded_ids.add(group.id)
 
         if not self._enabled:
             return
