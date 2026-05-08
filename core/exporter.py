@@ -359,6 +359,27 @@ def _l11_tip_half_poly(l11_comp) -> "gdstk.Polygon | None":
     return gdstk.Polygon(pts_um, layer=0, datatype=0)
 
 
+def _l11_full_poly(l11_comp) -> "gdstk.Polygon | None":
+    """
+    Return the complete L11 clip polygon as a gdstk.Polygon (µm, Y-negated).
+
+    This is subtracted from the undercut ring so the ring cannot enter the
+    L11 clip interior at all — only its outward halo (boundary-facing side)
+    is included in the ring.  Mirrors the l11_shape subtraction added to
+    _taper_quad_ring in the visual overlay.
+
+    Returns None if the L11 geometry is degenerate (< 3 points).
+    """
+    pts = l11_comp.points or []
+    unique = list(pts)
+    if len(unique) > 1 and unique[-1] == unique[0]:
+        unique = unique[:-1]
+    if len(unique) < 3:
+        return None
+    pts_um = [(_um(p.x), -_um(p.y)) for p in unique]
+    return gdstk.Polygon(pts_um, layer=0, datatype=0)
+
+
 def export_undercut_rings(
     cell,
     design: DesignScene,
@@ -419,15 +440,26 @@ def export_undercut_rings(
         if not base_polys:
             continue
 
-        # Build tip-half clip rectangles from L11 members.  Each rectangle
-        # covers the half of L11 from the midpoint to the narrow tip,
-        # matching the cap-plane clipping done by _taper_quad_ring visually.
+        # Build clip geometry from L11 members -- two shapes are subtracted
+        # per L11 component, mirroring the two-step logic in _taper_quad_ring:
+        #
+        #   1. tip_half rectangle -- enforces the clip_length/2 constraint;
+        #      the ring stops halfway along the clip and never reaches the tip.
+        #
+        #   2. full L11 body polygon -- removes every pixel of ring that sits
+        #      inside the clip body (boundary face to cap plane region).
+        #      Without this the ring bleeds into the clip interior between the
+        #      shared face and the cap plane.  Subtracting the whole L11 shape
+        #      ensures the ring only sits on the outside boundary of the clip.
         clip_polys: list[gdstk.Polygon] = []
         for comp in members:
             if comp.layer == LAYER_NARROW_END:
                 tip_rect = _l11_tip_half_poly(comp)
                 if tip_rect is not None:
                     clip_polys.append(tip_rect)
+                l11_body = _l11_full_poly(comp)
+                if l11_body is not None:
+                    clip_polys.append(l11_body)
 
         masks_um = overlay.get_masks_um(group.id)
         ring_polys = _build_gdstk_ring(
