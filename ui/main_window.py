@@ -664,7 +664,10 @@ class MainWindow(QMainWindow):
 
             # Snapshot connections on the old anchor BEFORE removal destroys them
             old_anchor_sg = old_sg_comps[0] if old_sg_comps else None
-            conn_snap = self._snapshot_anchor_connections(old_anchor_sg, group=group)
+            conn_snap = self._snapshot_anchor_connections(
+                old_anchor_sg,
+                member_ids_override=sg_comp_ids,  # only this sub-group's own IDs
+            )
 
             cmd = ReplaceSubgroupCellCmd(
                 group_id            = group_id,
@@ -681,6 +684,59 @@ class MainWindow(QMainWindow):
             )
             self._scene.cmd_stack.execute(cmd)
 
+            # ── Snap the rebuilt sub-group to its connected external port ──────────
+            # ReplaceSubgroupCellCmd places the new cell at the old bbox centre, but
+            # the new geometry may have different port offsets (e.g. a larger turn
+            # radius shifts the stem port). Walk every cross-boundary connection on
+            # the new members and translate the whole sub-group so its port lands
+            # flush on the external port it's wired to.
+            new_member_ids = set(updated_sg_entry.get("member_ids", []))
+            snap_dx, snap_dy = 0, 0
+            for new_cid in new_member_ids:
+                new_comp = self._design.get(new_cid)
+                if new_comp is None:
+                    continue
+                for cn in self._design.connections_for(new_cid):
+                    # Find the external end of this connection
+                    if cn.comp_a == new_cid:
+                        my_port_id, ext_cid, ext_port_id = cn.port_a, cn.comp_b, cn.port_b
+                    else:
+                        my_port_id, ext_cid, ext_port_id = cn.port_b, cn.comp_a, cn.port_a
+                    if ext_cid in new_member_ids:
+                        continue  # internal connection — skip
+                    ext_comp = self._design.get(ext_cid)
+                    if ext_comp is None:
+                        continue
+                    my_port = next((p for p in new_comp.ports if p.id == my_port_id), None)
+                    ext_port = next((p for p in ext_comp.ports if p.id == ext_port_id), None)
+                    if my_port is None or ext_port is None:
+                        continue
+                    my_abs = my_port.abs_pos(new_comp.origin)
+                    ext_abs = ext_port.abs_pos(ext_comp.origin)
+                    snap_dx = ext_abs.x - my_abs.x
+                    snap_dy = ext_abs.y - my_abs.y
+                    break  # one connection is enough to fix the alignment
+                if snap_dx or snap_dy:
+                    break
+
+            if snap_dx or snap_dy:
+                snap_cmds = []
+                for new_cid in new_member_ids:
+                    new_comp = self._design.get(new_cid)
+                    if new_comp:
+                        old_orig = Point(new_comp.origin.x, new_comp.origin.y)
+                        new_orig = Point(old_orig.x + snap_dx, old_orig.y + snap_dy)
+                        mc = MoveComponent(new_cid, old_orig, new_orig)
+                        mc.execute(self._design)
+                        snap_cmds.append(mc)
+                        item = self._scene.item_for(new_cid)
+                        if item:
+                            item.sync_from_model()
+                if snap_cmds:
+                    self._scene.cmd_stack.push(
+                        BatchCommand(snap_cmds, "Snap rebuilt cell to connected port")
+                    )
+
             # Nudge connected neighbours to match new port positions and
             # re-establish connections on the new anchor component.
             new_anchor_sg = next(
@@ -696,7 +752,7 @@ class MainWindow(QMainWindow):
             ]
             move_cmds = self._restore_connections_and_nudge(
                 conn_snap, new_anchor_sg,
-                excluded_ids=set(group.member_ids),
+                excluded_ids=set(updated_sg_entry.get("member_ids", [])),
                 new_members=new_sg_members,
             )
             if move_cmds:
@@ -848,7 +904,7 @@ class MainWindow(QMainWindow):
 
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
 
-    def _snapshot_anchor_connections(self, anchor, group=None) -> list:
+    def _snapshot_anchor_connections(self, anchor, group=None, member_ids_override=None) -> list:
         """
         Before a cell is replaced (which destroys all connections to old IDs),
         snapshot every external connection on *anchor* and all other members of
@@ -867,6 +923,12 @@ class MainWindow(QMainWindow):
         non-anchor members are captured too.  Without it only *anchor* is
         walked (backward-compatible).
 
+        Pass *member_ids_override* (a list/set of IDs) to restrict the
+        "intra-group" exclusion to only those IDs instead of the full group
+        membership.  This is needed when the sub-group being rebuilt lives
+        inside a larger merged group — without the override every connection
+        to a sibling cell in the same merged group would be wrongly skipped.
+
         Returns an empty list if anchor is None or has no connections.
         The snapshots survive the replace operation because they are plain dicts
         keyed by neighbour IDs and port names — not live object references.
@@ -874,9 +936,13 @@ class MainWindow(QMainWindow):
         if anchor is None:
             return []
 
-        # Collect every component to inspect (anchor + any other group members)
+        # Collect every component to inspect (anchor + any other sub-group members).
+        # Use member_ids_override when available so that connections to sibling
+        # cells inside the same merged group are NOT wrongly treated as internal.
         member_ids: set[str] = {anchor.id}
-        if group is not None:
+        if member_ids_override is not None:
+            member_ids.update(member_ids_override)
+        elif group is not None:
             member_ids.update(group.member_ids)
 
         snaps = []
@@ -1037,8 +1103,9 @@ class MainWindow(QMainWindow):
             if grp is not None:
                 member_ids_set = set(grp.member_ids)
                 if member_ids_set & excluded_ids:
-                    continue  # group contains rebuilt cell — skip
+                    grp = None  # same group as rebuilt cell — nudge standalone, not as rigid unit
 
+            if grp is not None:
                 # Snapshot all member port positions BEFORE the move so we can
                 # compute per-port displacements for downstream propagation.
                 pre_abs: dict[tuple[str, str], tuple[int, int]] = {}
@@ -1097,6 +1164,21 @@ class MainWindow(QMainWindow):
                             queue.append((nxt, ndx, ndy))
 
             else:
+                # Standalone component (or same-group sibling demoted to standalone).
+                # Also move every companion in the same sub-group that has no ports
+                # of its own (e.g. layer-11 undercut companions) — they are invisible
+                # to the BFS because they have no connections, but must translate
+                # rigidly with their anchor.
+                subgroup_companion_ids: list[str] = []
+                _own_group = self._design.group_of(cid)
+                if _own_group is not None:
+                    for _sg in getattr(_own_group, "_cell_subgroups", []):
+                        if cid in _sg.get("member_ids", []):
+                            for _sid in _sg["member_ids"]:
+                                if _sid != cid and _sid not in visited:
+                                    subgroup_companion_ids.append(_sid)
+                            break
+
                 # Snapshot port positions BEFORE the move.
                 pre_abs_comp: dict[str, tuple[int, int]] = {}
                 for p in comp.ports:
@@ -1112,10 +1194,24 @@ class MainWindow(QMainWindow):
                 if comp_item:
                     comp_item.sync_from_model()
 
+                # Move sub-group companions rigidly with the anchor.
+                for _sid in subgroup_companion_ids:
+                    visited.add(_sid)
+                    _sc = self._design.get(_sid)
+                    if _sc is None:
+                        continue
+                    _old = _sc.origin
+                    _new = Point(_old.x + dx, _old.y + dy)
+                    _mc = MoveComponent(_sid, _old, _new)
+                    _mc.execute(self._design)
+                    move_cmds.append(_mc)
+                    _si = self._scene.item_for(_sid)
+                    if _si:
+                        _si.sync_from_model()
+
                 # Propagate downstream: only enqueue a neighbour if its
                 # connecting port is not already co-located with ours after the
                 # move.  This stops BFS naturally in loops.
-                # Propagate downstream using per-port displacement.
                 port_map = {p.id: p for p in comp.ports}
                 for cn in self._design.connections_for(cid):
                     nxt = cn.comp_b if cn.comp_a == cid else cn.comp_a
@@ -1234,7 +1330,17 @@ class MainWindow(QMainWindow):
         # them as if they were independent neighbours.
         _edited_group = self._design.group_of(comp_id)
         if _edited_group is not None:
-            visited.update(_edited_group.member_ids)
+            # Only pre-mark the edited component's own sub-group siblings as visited —
+            # they are rebuilt together by ReplaceSubgroupCellCmd and must not be nudged.
+            # Members of OTHER sub-groups in the same merged group are independent cells
+            # and must be free to be nudged by the BFS, just like external components.
+            _cell_subgroups = getattr(_edited_group, "_cell_subgroups", [])
+            _edited_subgroup_members = {comp_id}  # fallback: just the edited comp itself
+            for _sg in _cell_subgroups:
+                if comp_id in _sg.get("member_ids", []):
+                    _edited_subgroup_members = set(_sg["member_ids"])
+                    break
+            visited.update(_edited_subgroup_members)
 
         # Seed: collect (neighbour_comp_id, dx, dy) from the edited comp's ports
         from collections import deque
@@ -1273,49 +1379,61 @@ class MainWindow(QMainWindow):
             group = self._design.group_of(nbr_comp_id)
 
             if group is not None:
-                # Collect all live group members (the group may contain stale IDs)
                 members = [
                     self._design.get(cid)
                     for cid in group.member_ids
                     if self._design.get(cid) is not None
                 ]
-                # Don't move a group that contains the edited component itself.
                 member_ids_set = {m.id for m in members}
+
+                # ── Intra-group neighbour (same group as the edited comp) ──────────
+                # Don't treat the whole group as a rigid external body.
+                # Instead find the sub-group that owns this neighbour and move only
+                # that sub-unit as a rigid pair (preserves e.g. layer-11 companions
+                # that have no connections of their own).
+                if member_ids_set & _edited_subgroup_members:
+                    # Find which sub-group entry owns nbr_comp_id
+                    _cell_subgroups = getattr(group, "_cell_subgroups", [])
+                    subgroup_ids: set[str] = {nbr_comp_id}   # fallback: just the one comp
+                    for _sg in _cell_subgroups:
+                        if nbr_comp_id in _sg.get("member_ids", []):
+                            subgroup_ids = set(_sg["member_ids"])
+                            break
+
+                    # Move all sub-group siblings together (skip already-visited ones)
+                    for sid in subgroup_ids:
+                        if sid in visited:
+                            continue
+                        visited.add(sid)
+                        smember = self._design.get(sid)
+                        if smember is None:
+                            continue
+                        if dx != 0 or dy != 0:
+                            old_orig = smember.origin
+                            new_orig = Point(old_orig.x + dx, old_orig.y + dy)
+                            mc = MoveComponent(sid, old_orig, new_orig)
+                            mc.execute(self._design)
+                            move_cmds.append(mc)
+                        s_item = self._scene.item_for(sid)
+                        if s_item:
+                            s_item.sync_from_model()
+
+                    # Propagate further from the moved sub-group's connections
+                    for sid in subgroup_ids:
+                        smember = self._design.get(sid)
+                        if smember is None:
+                            continue
+                        for cn in self._design.connections_for(sid):
+                            next_comp_id = cn.comp_b if cn.comp_a == sid else cn.comp_a
+                            if next_comp_id not in visited:
+                                queue.append((next_comp_id, dx, dy))
+                    continue   # ← skip the external-group rigid-body path below
+
+                # ── External group (different group from the edited comp) ──────────
+                # Original logic: move all members as a rigid body.
+                # Don't move a group that contains the edited component itself.
                 if comp_id in member_ids_set:
                     continue
-
-                # Apply the move to each member (skip zero-delta — no move needed,
-                # but still sync the canvas item so connection indicators refresh).
-                per_member_cmds = []
-                for m in members:
-                    m_item = self._scene.item_for(m.id)
-                    if dx != 0 or dy != 0:
-                        old_orig = m.origin
-                        new_orig = Point(old_orig.x + dx, old_orig.y + dy)
-                        mc = MoveComponent(m.id, old_orig, new_orig)
-                        mc.execute(self._design)
-                        per_member_cmds.append(mc)
-                    if m_item:
-                        m_item.sync_from_model()
-
-                # Keep _cell_origin in sync (MoveGroup does this; replicate it)
-                if hasattr(group, "_cell_origin") and group._cell_origin is not None:
-                    o = group._cell_origin
-                    group._cell_origin = Point(o.x + dx, o.y + dy)
-
-                move_cmds.extend(per_member_cmds)
-
-                # Mark ALL group members visited so they aren't moved again.
-                visited.update(member_ids_set)
-
-                # Propagate further: for every connection on every group member,
-                # check whether the connected component (outside this group)
-                # needs to be pushed by the same (dx, dy).
-                for m in members:
-                    for cn in self._design.connections_for(m.id):
-                        next_comp_id = cn.comp_b if cn.comp_a == m.id else cn.comp_a
-                        if next_comp_id not in visited:
-                            queue.append((next_comp_id, dx, dy))
 
             else:
                 # Standalone component — move only it (skip zero-delta, but always
