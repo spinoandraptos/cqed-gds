@@ -289,6 +289,76 @@ UNDERCUT_RING_DATATYPE = 0
 UNDERCUT_SOURCE_LAYER = 1
 
 
+def _l11_tip_half_poly(l11_comp) -> "gdstk.Polygon | None":
+    """
+    Return a gdstk.Polygon rectangle (in µm, GDS Y-negated) that covers the
+    tip half of an L11 clip component — from the midpoint of L11 to the
+    narrow tip face.  This is subtracted from the undercut ring so the ring
+    cap sits exactly at clip_length/2 inward from the clip boundary, matching
+    the cap-plane clipping applied visually by _taper_quad_ring.
+
+    Returns None if L11 geometry is degenerate.
+    """
+    import math
+
+    pts = l11_comp.points or []
+    unique = list(pts)
+    if len(unique) > 1 and unique[-1] == unique[0]:
+        unique = unique[:-1]
+    if len(unique) != 4:
+        return None
+
+    def _dist(a, b):
+        return math.hypot(b.x - a.x, b.y - a.y)
+
+    edges    = [(i, (i+1)%4, _dist(unique[i], unique[(i+1)%4])) for i in range(4)]
+    by_len   = sorted(edges, key=lambda e: e[2])
+    face     = by_len[:2]   # two shortest = end-faces
+
+    clip_face   = max(face, key=lambda e: e[2])   # wider = clip boundary
+    narrow_face = min(face, key=lambda e: e[2])   # narrower = tip
+
+    ci, cj = clip_face[0],   clip_face[1]
+    ni, nj = narrow_face[0], narrow_face[1]
+    clip_a  = unique[ci];  clip_b  = unique[cj]
+    tip_a   = unique[ni];  tip_b   = unique[nj]
+
+    clip_mid_x = (clip_a.x + clip_b.x) / 2.0
+    clip_mid_y = (clip_a.y + clip_b.y) / 2.0
+    tip_mid_x  = (tip_a.x  + tip_b.x)  / 2.0
+    tip_mid_y  = (tip_a.y  + tip_b.y)  / 2.0
+
+    dx = tip_mid_x - clip_mid_x
+    dy = tip_mid_y - clip_mid_y
+    clip_length = math.hypot(dx, dy)
+    if clip_length == 0:
+        return None
+
+    ux, uy = dx / clip_length, dy / clip_length   # boundary → tip unit vector
+    half = clip_length / 2.0
+
+    # Cap plane passes through clip_a + ux*half, clip_b + ux*half
+    cap_ax = clip_a.x + ux * half;  cap_ay = clip_a.y + uy * half
+    cap_bx = clip_b.x + ux * half;  cap_by = clip_b.y + uy * half
+
+    # Large rectangle on the tip side of the cap plane (DBU coords)
+    LARGE = clip_length * 4.0
+    px_, py_ = -uy, ux   # perpendicular direction
+
+    c0x, c0y = cap_ax + px_*LARGE, cap_ay + py_*LARGE
+    c1x, c1y = cap_ax - px_*LARGE, cap_ay - py_*LARGE
+    c2x, c2y = c1x + ux*LARGE,     c1y + uy*LARGE
+    c3x, c3y = c0x + ux*LARGE,     c0y + uy*LARGE
+
+    # Convert DBU → µm and negate Y for GDS convention
+    def to_um(x, y):
+        return (x / 1000.0, -y / 1000.0)
+
+    pts_um = [to_um(c0x, c0y), to_um(c1x, c1y),
+              to_um(c2x, c2y), to_um(c3x, c3y)]
+    return gdstk.Polygon(pts_um, layer=0, datatype=0)
+
+
 def export_undercut_rings(
     cell,
     design: DesignScene,
@@ -322,13 +392,15 @@ def export_undercut_rings(
     offset_um = overlay.offset_um
     added = 0
 
+    from core.cell_library import LAYER_NARROW_END
+
     grouped_ids: Set[str] = set()
     for group in design.groups:
         grouped_ids.update(group.member_ids)
 
     comp_map = {c.id: c for c in design.components}
 
-    # ── Groups ────────────────────────────────────────────────────────────────
+    # ── Groups ────────────────────────────────────────────────────
     for group in design.groups:
         if overlay.is_excluded(group.id):
             continue
@@ -342,32 +414,45 @@ def export_undercut_rings(
         for comp in members:
             if comp.layer != UNDERCUT_SOURCE_LAYER:
                 continue
-            # layer/datatype=0 here — only geometry matters for ring building.
             base_polys.extend(_comp_to_gdstk_polys(comp, 0, 0))
 
         if not base_polys:
-            continue  # group has no Layer-1 members — skip entirely
+            continue
+
+        # Build tip-half clip rectangles from L11 members.  Each rectangle
+        # covers the half of L11 from the midpoint to the narrow tip,
+        # matching the cap-plane clipping done by _taper_quad_ring visually.
+        clip_polys: list[gdstk.Polygon] = []
+        for comp in members:
+            if comp.layer == LAYER_NARROW_END:
+                tip_rect = _l11_tip_half_poly(comp)
+                if tip_rect is not None:
+                    clip_polys.append(tip_rect)
 
         masks_um = overlay.get_masks_um(group.id)
-        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype,
-                                       masks_um=masks_um)
+        ring_polys = _build_gdstk_ring(
+            base_polys, offset_um, gds_layer, datatype,
+            masks_um=masks_um, clip_polys=clip_polys or None,
+        )
         if ring_polys:
             cell.add(*ring_polys)
             added += len(ring_polys)
 
-    # ── Ungrouped components ──────────────────────────────────────────────────
+    # ── Ungrouped components ───────────────────────────────────────
     for comp in design.components:
         if comp.id in grouped_ids:
             continue
         if overlay.is_excluded(comp.id):
             continue
         if comp.layer != UNDERCUT_SOURCE_LAYER:
-            continue  # only Layer-1 components get a ring
+            continue
 
         base_polys = _comp_to_gdstk_polys(comp, 0, 0)
         masks_um = overlay.get_masks_um(comp.id)
-        ring_polys = _build_gdstk_ring(base_polys, offset_um, gds_layer, datatype,
-                                       masks_um=masks_um)
+        ring_polys = _build_gdstk_ring(
+            base_polys, offset_um, gds_layer, datatype,
+            masks_um=masks_um,
+        )
         if ring_polys:
             cell.add(*ring_polys)
             added += len(ring_polys)
@@ -381,6 +466,7 @@ def _build_gdstk_ring(
     gds_layer: int,
     datatype: int,
     masks_um: list | None = None,
+    clip_polys: list | None = None,
 ) -> list:
     """
     Given a list of gdstk.Polygon objects representing the filled base shape,
@@ -390,6 +476,11 @@ def _build_gdstk_ring(
     in µm (GDS Y convention, already negated) from UndercutOverlay.get_masks_um().
     Each rectangle is subtracted from the ring after it is built, exactly
     matching what the visual eraser removed on screen.
+
+    *clip_polys* is an optional list of gdstk.Polygon objects (e.g. L11 narrow-
+    tip clip shapes) that are subtracted from the ring so the expansion never
+    bleeds into those regions.  This mirrors the QPainterPath subtraction done
+    by _taper_quad_ring in the visual overlay.
     """
     if not base_polys:
         return []
@@ -413,7 +504,15 @@ def _build_gdstk_ring(
     if not ring:
         return []
 
-    # Step 4: subtract each user-drawn mask rectangle.
+    # Step 4: subtract L11 clip polygons so the ring never overlaps the narrow
+    # tip region — mirrors _taper_quad_ring's QPainterPath subtraction.
+    if clip_polys:
+        ring = gdstk.boolean(ring, clip_polys, "not",
+                             layer=gds_layer, datatype=datatype)
+        if not ring:
+            return []
+
+    # Step 5: subtract each user-drawn mask rectangle.
     if masks_um:
         mask_polys = []
         for (x0, y0, x1, y1) in masks_um:

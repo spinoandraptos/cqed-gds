@@ -165,106 +165,25 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     """
     Build the undercut ring for a tapered-lead L1 body polygon.
 
-    The ring uses the standard stroker expansion (offset_dbu) on all sides
-    EXCEPT the narrow-end face, where instead of expanding outward by offset_dbu
-    the outer edge is placed at the midpoint of the L11 clip polygon —
-    i.e. it extends inward by  clip_length / 2  from the clip boundary face.
-
-    This means the undercut ring ends exactly halfway through the L11 clip,
-    matching the physical undercut at the narrow tip.
+    The ring is the standard stroker expansion of the L1 body with the entire
+    L11 clip polygon subtracted out, so the ring stops exactly at the clip
+    boundary face and never overlaps the narrow-tip clip region.
 
     l11_comp : the L11 sibling GDSComponent (optional). When supplied its
-               geometry is used to compute clip_length and the direction toward
-               the narrow tip.  When None, falls back to uniform expansion.
+               shape is subtracted from the ring after expansion.
+               When None, falls back to uniform expansion (caller uses
+               _build_ring_path instead).
 
     Returns a QPainterPath or None (caller falls back to _build_ring_path).
     """
-    import math
-
     if l11_comp is None:
         return None
-
-    # ── Identify the shared clip-boundary face ────────────────────────────────
-    # The L1 body and L11 clip share an edge at the clip boundary.
-    # L11 vertices: two at the clip boundary, two at the narrow tip.
-    # L1  vertices: two at the clip boundary, two at the wide end.
-    #
-    # We find the clip-boundary vertices of L11 (the pair that are shared with L1),
-    # then work out the inward direction (toward the narrow tip) and clip_length.
-
-    l11_pts = l11_comp.points or []
-    unique11 = list(l11_pts)
-    if len(unique11) > 1 and unique11[-1] == unique11[0]:
-        unique11 = unique11[:-1]
-    if len(unique11) != 4:
-        return None
-
-    def _dist(a, b):
-        return math.hypot(b.x - a.x, b.y - a.y)
-
-    # Edges of L11 sorted by length: 2 short (end-faces) + 2 long (flanks)
-    edges11 = [(i, (i+1)%4, _dist(unique11[i], unique11[(i+1)%4])) for i in range(4)]
-    by_len11 = sorted(edges11, key=lambda e: e[2])
-    face11   = by_len11[:2]   # two end-faces
-
-    # The wider face of L11 = clip boundary (shared with L1)
-    # The narrower face of L11 = narrow tip
-    clip_face  = max(face11, key=lambda e: e[2])   # wider = clip boundary
-    narrow_face = min(face11, key=lambda e: e[2])  # narrower = tip
-
-    ci, cj = clip_face[0], clip_face[1]            # clip-boundary vertex indices in L11
-    clip_pt_a = unique11[ci]
-    clip_pt_b = unique11[cj]
-
-    ni, nj = narrow_face[0], narrow_face[1]        # narrow-tip vertex indices in L11
-    tip_pt_a = unique11[ni]
-    tip_pt_b = unique11[nj]
-
-    # Unit vector from clip boundary midpoint toward narrow tip midpoint
-    clip_mid_x = (clip_pt_a.x + clip_pt_b.x) / 2.0
-    clip_mid_y = (clip_pt_a.y + clip_pt_b.y) / 2.0
-    tip_mid_x  = (tip_pt_a.x  + tip_pt_b.x)  / 2.0
-    tip_mid_y  = (tip_pt_a.y  + tip_pt_b.y)  / 2.0
-
-    dx = tip_mid_x - clip_mid_x
-    dy = tip_mid_y - clip_mid_y
-    clip_length = math.hypot(dx, dy)
-    if clip_length == 0:
-        return None
-
-    # Unit vector pointing from clip boundary → narrow tip (inward direction)
-    ux, uy = dx / clip_length, dy / clip_length
-
-    # How far inward the ring extends at the narrow end = half the clip length
-    inward_offset = clip_length / 2.0
-
-    # ── Build the ring as a QPainterPath using the standard stroker for all
-    #    sides except the narrow-end face, which gets a custom inward cap. ──────
-    #
-    # Strategy: build the ring shape as an explicit 6-vertex polygon per flank,
-    # then add a cap across the narrow face.
-    #
-    # The standard ring = outer_shape - inner_shape where outer is L1 expanded
-    # by offset_dbu on all sides.  We instead build a custom outer shape that
-    # matches the standard expansion everywhere EXCEPT the narrow face, where
-    # we substitute the inward-offset cap.
-    #
-    # Simpler equivalent: use the standard stroker-based ring, then SUBTRACT
-    # the region beyond the inward cap (i.e. clip everything on the narrow-tip
-    # side of the cap plane to zero).
-    #
-    # The cap plane passes through:
-    #   clip_pt_a + ux*inward_offset, clip_pt_b + ux*inward_offset
-    # and is perpendicular to the travel axis.
-    #
-    # We define a large clipping rectangle on the narrow-tip side of the cap
-    # and subtract it from the standard ring.
 
     from PyQt6.QtCore import QPointF
     from PyQt6.QtGui import QPainterPath, QPainterPathStroker
     from PyQt6.QtCore import Qt
 
-    # ── Standard ring from L1 body ────────────────────────────────────────────
+    # ── Build the L1 base shape ───────────────────────────────────────────────
     l1_pts = l1_comp.points or []
     unique1 = list(l1_pts)
     if len(unique1) > 1 and unique1[-1] == unique1[0]:
@@ -277,6 +196,7 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
         base.lineTo(p.x, p.y)
     base.closeSubpath()
 
+    # ── Standard ring: expand L1 outward, subtract L1 interior ───────────────
     stroker = QPainterPathStroker()
     stroker.setWidth(2.0 * offset_dbu)
     stroker.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
@@ -285,33 +205,79 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     outer    = expanded.united(base)
     ring     = outer.subtracted(base)
 
-    # ── Clip rectangle: covers the region on the narrow-tip side of the cap ───
-    # The cap line runs through two points offset inward from the clip boundary.
-    cap_ax = clip_pt_a.x + ux * inward_offset
-    cap_ay = clip_pt_a.y + uy * inward_offset
-    cap_bx = clip_pt_b.x + ux * inward_offset
-    cap_by = clip_pt_b.y + uy * inward_offset
+    # ── Clip ring to the midpoint of L11 ─────────────────────────────────────
+    # The ring is allowed to cover the boundary-half of L11 (from the shared
+    # face to clip_length/2 inward), but must stop there.  We achieve this by
+    # subtracting a large rectangle that covers everything on the tip side of
+    # the midpoint cap plane.
+    #
+    # The cap plane is perpendicular to the clip axis and passes through the
+    # midpoint between the clip boundary face and the narrow tip face.
+    import math
 
-    # Build a large rectangle on the narrow-tip side:
-    # extend very far in the ux,uy direction and wide enough to cover the ring.
+    l11_pts = l11_comp.points or []
+    unique11 = list(l11_pts)
+    if len(unique11) > 1 and unique11[-1] == unique11[0]:
+        unique11 = unique11[:-1]
+    if len(unique11) != 4:
+        return ring if not ring.isEmpty() else None
+
+    def _dist(a, b):
+        return math.hypot(b.x - a.x, b.y - a.y)
+
+    edges11  = [(i, (i+1)%4, _dist(unique11[i], unique11[(i+1)%4])) for i in range(4)]
+    by_len11 = sorted(edges11, key=lambda e: e[2])
+    face11   = by_len11[:2]   # two shortest edges = end-faces
+
+    # Wider end-face = clip boundary (shared with L1); narrower = narrow tip
+    clip_face   = max(face11, key=lambda e: e[2])
+    narrow_face = min(face11, key=lambda e: e[2])
+
+    ci, cj = clip_face[0],   clip_face[1]
+    ni, nj = narrow_face[0], narrow_face[1]
+    clip_pt_a = unique11[ci]
+    clip_pt_b = unique11[cj]
+    tip_pt_a  = unique11[ni]
+    tip_pt_b  = unique11[nj]
+
+    clip_mid_x = (clip_pt_a.x + clip_pt_b.x) / 2.0
+    clip_mid_y = (clip_pt_a.y + clip_pt_b.y) / 2.0
+    tip_mid_x  = (tip_pt_a.x  + tip_pt_b.x)  / 2.0
+    tip_mid_y  = (tip_pt_a.y  + tip_pt_b.y)  / 2.0
+
+    dx = tip_mid_x - clip_mid_x
+    dy = tip_mid_y - clip_mid_y
+    clip_length = math.hypot(dx, dy)
+    if clip_length == 0:
+        return ring if not ring.isEmpty() else None
+
+    # Unit vector pointing from clip boundary → narrow tip
+    ux, uy = dx / clip_length, dy / clip_length
+
+    # The cap sits at clip_length/2 inward from the clip boundary
+    half = clip_length / 2.0
+    cap_ax = clip_pt_a.x + ux * half
+    cap_ay = clip_pt_a.y + uy * half
+    cap_bx = clip_pt_b.x + ux * half
+    cap_by = clip_pt_b.y + uy * half
+
+    # Large rectangle covering everything on the tip side of the cap plane
     LARGE = float(offset_dbu * 20)
-    # Perpendicular to travel: uy, -ux (or -uy, ux)
-    px_, py_ = -uy, ux   # one perpendicular direction
+    px_, py_ = -uy, ux   # perpendicular direction
 
-    # Four corners: cap line ± LARGE*perp, then push LARGE in inward direction
-    c0x, c0y = cap_ax + px_*LARGE,         cap_ay + py_*LARGE
-    c1x, c1y = cap_ax - px_*LARGE,         cap_ay - py_*LARGE
-    c2x, c2y = c1x    + ux*LARGE,          c1y    + uy*LARGE
-    c3x, c3y = c0x    + ux*LARGE,          c0y    + uy*LARGE
+    c0x, c0y = cap_ax + px_*LARGE, cap_ay + py_*LARGE
+    c1x, c1y = cap_ax - px_*LARGE, cap_ay - py_*LARGE
+    c2x, c2y = c1x + ux*LARGE,     c1y + uy*LARGE
+    c3x, c3y = c0x + ux*LARGE,     c0y + uy*LARGE
 
-    clip_rect = QPainterPath(QPointF(c0x, c0y))
-    clip_rect.lineTo(c1x, c1y)
-    clip_rect.lineTo(c2x, c2y)
-    clip_rect.lineTo(c3x, c3y)
-    clip_rect.closeSubpath()
+    tip_half = QPainterPath(QPointF(c0x, c0y))
+    tip_half.lineTo(c1x, c1y)
+    tip_half.lineTo(c2x, c2y)
+    tip_half.lineTo(c3x, c3y)
+    tip_half.closeSubpath()
 
-    result = ring.subtracted(clip_rect)
-    return result if not result.isEmpty() else None
+    ring = ring.subtracted(tip_half)
+    return ring if not ring.isEmpty() else None
 
 
 # ── Ring item: single component ───────────────────────────────────────────────
@@ -512,6 +478,40 @@ class UndercutOverlay:
     def has_masks(self, obj_id: str) -> bool:
         """Return True if *obj_id* has at least one mask applied."""
         return bool(self._masks.get(obj_id))
+
+    def get_masks_um(self, obj_id: str) -> list:
+        """
+        Return the eraser masks for *obj_id* as a list of
+        ``(x_min, y_min, x_max, y_max)`` tuples in µm, using the GDS
+        Y-negation convention (Y is flipped relative to scene/DBU coords).
+
+        Each QPainterPath mask is reduced to its axis-aligned bounding
+        rectangle — the same region the visual eraser painted — which is
+        then converted from DBU (nm) to µm and Y-flipped so it lines up
+        with the gdstk geometry written by the exporter.
+
+        Returns an empty list when no masks exist for this object.
+        """
+        masks = self._masks.get(obj_id)
+        if not masks:
+            return []
+
+        result = []
+        for path in masks:
+            br = path.boundingRect()       # QRectF in scene (DBU) coordinates
+            x0_um =  br.left()   / 1000.0
+            x1_um =  br.right()  / 1000.0
+            # Negate Y to match GDS convention used throughout exporter.py
+            y0_um = -br.top()    / 1000.0
+            y1_um = -br.bottom() / 1000.0
+            # Normalise so x_min < x_max and y_min < y_max after the flip
+            result.append((
+                min(x0_um, x1_um),
+                min(y0_um, y1_um),
+                max(x0_um, x1_um),
+                max(y0_um, y1_um),
+            ))
+        return result
 
     def _apply_masks(self, obj_id: str, ring_path: "QPainterPath") -> "QPainterPath":
         """Subtract all stored mask paths from *ring_path* and return the result."""
