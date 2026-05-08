@@ -793,38 +793,53 @@ def build_taper_segment(
         p_shift_pos = (tx * tip_travel + sx + px *  hw_n,   ty * tip_travel + sy + py *  hw_n)
         p_shift_neg = (tx * tip_travel + sx - px *  hw_n,   ty * tip_travel + sy - py *  hw_n)
 
-        # Assemble punched crescent (8 vertices, CCW):
-        # - The tip-face corners of both the shifted and original outlines are
-        #   replaced by the punch-clipped versions (clamped to ±hw_n transverse).
-        # - All other corners (the wide-face side) are unchanged.
-        if narrow_end == "start":
-            # Tip is at entry (index 0/3 in full_pts, index 0/3 in s_pts)
-            punched_pts = [
-                p_shift_pos,   # shifted entry + → clamped
-                s_pts[1],      # shifted exit  +
-                s_pts[2],      # shifted exit  −
-                p_shift_neg,   # shifted entry − → clamped
-                p_orig_neg,    # original entry − → clamped
-                full_pts[2],   # original exit  −
-                full_pts[1],   # original exit  +
-                p_orig_pos,    # original entry + → clamped
-            ]
-        else:
-            # Tip is at exit (index 1/2 in full_pts, index 1/2 in s_pts)
-            punched_pts = [
-                s_pts[0],      # shifted entry +
-                p_shift_pos,   # shifted exit  + → clamped
-                p_shift_neg,   # shifted exit  − → clamped
-                s_pts[3],      # shifted entry −
-                full_pts[3],   # original entry −
-                p_orig_neg,    # original exit  − → clamped
-                p_orig_pos,    # original exit  + → clamped
-                full_pts[0],   # original entry +
-            ]
+        # ── Exact replication of component_model.py boolean result ───────────
+        #
+        # Reference: shifted_union NOT original_union, then punch rectangle.
+        #
+        # For narrow_end="start", direction="+x":
+        #   shift = (-0.8, 0)  (toward the narrow tip at x=0)
+        #   shifted trapezoid: (-0.8, ±entry_hw) → (L-0.8, ±exit_hw)
+        #   original trapezoid: (0, ±entry_hw) → (L, ±exit_hw)
+        #
+        #   shifted NOT original produces THREE pieces:
+        #     1. Top flank strip:    s_entry+ → s_exit+ → o_exit+ → o_entry+
+        #     2. Bottom flank strip: o_entry- → o_exit- → s_exit- → s_entry-
+        #     3. Tip triangle:       s_entry+ → o_entry+ → o_entry- → s_entry-
+        #        (the part of the shifted shape that pokes past the original tip face)
+        #
+        #   Punch rectangle at tip (from tip face outward into the shift):
+        #     (0, -hw_n) → (sx, -hw_n) → (sx, +hw_n) → (0, +hw_n)
+        #     This covers the full tip triangle (hw_n = entry_hw for narrow_end="start")
+        #     so after subtraction the tip triangle is completely removed.
+        #
+        #   Final result: two flank quadrilaterals only.
+        #
+        # For narrow_end="end" the geometry is symmetric (tip at travel=L,
+        # shift is +travel direction).
+        #
+        # We emit each flank as its own _poly component.
 
-        narrow_ucut = _poly(origin, punched_pts, LAYER_UNDERCUT_RING)
-        narrow_ucut._no_auto_ports = True
-        components.append(narrow_ucut)
+        # Corners of the shifted and original trapezoids
+        o_epos = _pt(0, entry_hw, +1)   # original entry +
+        o_eneg = _pt(0, entry_hw, -1)   # original entry −
+        o_xpos = _pt(L, exit_hw,  +1)   # original exit  +
+        o_xneg = _pt(L, exit_hw,  -1)   # original exit  −
+
+        s_epos = (o_epos[0] + sx, o_epos[1] + sy)  # shifted entry +
+        s_eneg = (o_eneg[0] + sx, o_eneg[1] + sy)  # shifted entry −
+        s_xpos = (o_xpos[0] + sx, o_xpos[1] + sy)  # shifted exit  +
+        s_xneg = (o_xneg[0] + sx, o_xneg[1] + sy)  # shifted exit  −
+
+        # Top flank: shifted entry+ → shifted exit+ → orig exit+ → orig entry+
+        top_flank = _poly(origin, [s_epos, s_xpos, o_xpos, o_epos], LAYER_UNDERCUT_RING)
+        top_flank._no_auto_ports = True
+        components.append(top_flank)
+
+        # Bottom flank: orig entry− → orig exit− → shifted exit− → shifted entry−
+        bot_flank = _poly(origin, [o_eneg, o_xneg, s_xneg, s_eneg], LAYER_UNDERCUT_RING)
+        bot_flank._no_auto_ports = True
+        components.append(bot_flank)
 
     # ── Ports on the anchor (taper_body) ──────────────────────────────────
     # Port offsets are relative to taper_body.origin = _poly's dbu_pts[0]
