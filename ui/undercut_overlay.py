@@ -161,6 +161,159 @@ def _build_ring_path(base_path: QPainterPath, offset_dbu: int) -> QPainterPath:
     return ring
 
 
+def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath | None":
+    """
+    Build the undercut ring for a tapered-lead L1 body polygon.
+
+    The ring uses the standard stroker expansion (offset_dbu) on all sides
+    EXCEPT the narrow-end face, where instead of expanding outward by offset_dbu
+    the outer edge is placed at the midpoint of the L11 clip polygon —
+    i.e. it extends inward by  clip_length / 2  from the clip boundary face.
+
+    This means the undercut ring ends exactly halfway through the L11 clip,
+    matching the physical undercut at the narrow tip.
+
+    l11_comp : the L11 sibling GDSComponent (optional). When supplied its
+               geometry is used to compute clip_length and the direction toward
+               the narrow tip.  When None, falls back to uniform expansion.
+
+    Returns a QPainterPath or None (caller falls back to _build_ring_path).
+    """
+    import math
+
+    if l11_comp is None:
+        return None
+
+    # ── Identify the shared clip-boundary face ────────────────────────────────
+    # The L1 body and L11 clip share an edge at the clip boundary.
+    # L11 vertices: two at the clip boundary, two at the narrow tip.
+    # L1  vertices: two at the clip boundary, two at the wide end.
+    #
+    # We find the clip-boundary vertices of L11 (the pair that are shared with L1),
+    # then work out the inward direction (toward the narrow tip) and clip_length.
+
+    l11_pts = l11_comp.points or []
+    unique11 = list(l11_pts)
+    if len(unique11) > 1 and unique11[-1] == unique11[0]:
+        unique11 = unique11[:-1]
+    if len(unique11) != 4:
+        return None
+
+    def _dist(a, b):
+        return math.hypot(b.x - a.x, b.y - a.y)
+
+    # Edges of L11 sorted by length: 2 short (end-faces) + 2 long (flanks)
+    edges11 = [(i, (i+1)%4, _dist(unique11[i], unique11[(i+1)%4])) for i in range(4)]
+    by_len11 = sorted(edges11, key=lambda e: e[2])
+    face11   = by_len11[:2]   # two end-faces
+
+    # The wider face of L11 = clip boundary (shared with L1)
+    # The narrower face of L11 = narrow tip
+    clip_face  = max(face11, key=lambda e: e[2])   # wider = clip boundary
+    narrow_face = min(face11, key=lambda e: e[2])  # narrower = tip
+
+    ci, cj = clip_face[0], clip_face[1]            # clip-boundary vertex indices in L11
+    clip_pt_a = unique11[ci]
+    clip_pt_b = unique11[cj]
+
+    ni, nj = narrow_face[0], narrow_face[1]        # narrow-tip vertex indices in L11
+    tip_pt_a = unique11[ni]
+    tip_pt_b = unique11[nj]
+
+    # Unit vector from clip boundary midpoint toward narrow tip midpoint
+    clip_mid_x = (clip_pt_a.x + clip_pt_b.x) / 2.0
+    clip_mid_y = (clip_pt_a.y + clip_pt_b.y) / 2.0
+    tip_mid_x  = (tip_pt_a.x  + tip_pt_b.x)  / 2.0
+    tip_mid_y  = (tip_pt_a.y  + tip_pt_b.y)  / 2.0
+
+    dx = tip_mid_x - clip_mid_x
+    dy = tip_mid_y - clip_mid_y
+    clip_length = math.hypot(dx, dy)
+    if clip_length == 0:
+        return None
+
+    # Unit vector pointing from clip boundary → narrow tip (inward direction)
+    ux, uy = dx / clip_length, dy / clip_length
+
+    # How far inward the ring extends at the narrow end = half the clip length
+    inward_offset = clip_length / 2.0
+
+    # ── Build the ring as a QPainterPath using the standard stroker for all
+    #    sides except the narrow-end face, which gets a custom inward cap. ──────
+    #
+    # Strategy: build the ring shape as an explicit 6-vertex polygon per flank,
+    # then add a cap across the narrow face.
+    #
+    # The standard ring = outer_shape - inner_shape where outer is L1 expanded
+    # by offset_dbu on all sides.  We instead build a custom outer shape that
+    # matches the standard expansion everywhere EXCEPT the narrow face, where
+    # we substitute the inward-offset cap.
+    #
+    # Simpler equivalent: use the standard stroker-based ring, then SUBTRACT
+    # the region beyond the inward cap (i.e. clip everything on the narrow-tip
+    # side of the cap plane to zero).
+    #
+    # The cap plane passes through:
+    #   clip_pt_a + ux*inward_offset, clip_pt_b + ux*inward_offset
+    # and is perpendicular to the travel axis.
+    #
+    # We define a large clipping rectangle on the narrow-tip side of the cap
+    # and subtract it from the standard ring.
+
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPainterPath, QPainterPathStroker
+    from PyQt6.QtCore import Qt
+
+    # ── Standard ring from L1 body ────────────────────────────────────────────
+    l1_pts = l1_comp.points or []
+    unique1 = list(l1_pts)
+    if len(unique1) > 1 and unique1[-1] == unique1[0]:
+        unique1 = unique1[:-1]
+    if len(unique1) != 4:
+        return None
+
+    base = QPainterPath(QPointF(unique1[0].x, unique1[0].y))
+    for p in unique1[1:]:
+        base.lineTo(p.x, p.y)
+    base.closeSubpath()
+
+    stroker = QPainterPathStroker()
+    stroker.setWidth(2.0 * offset_dbu)
+    stroker.setJoinStyle(Qt.PenJoinStyle.MiterJoin)
+    stroker.setCapStyle(Qt.PenCapStyle.FlatCap)
+    expanded = stroker.createStroke(base)
+    outer    = expanded.united(base)
+    ring     = outer.subtracted(base)
+
+    # ── Clip rectangle: covers the region on the narrow-tip side of the cap ───
+    # The cap line runs through two points offset inward from the clip boundary.
+    cap_ax = clip_pt_a.x + ux * inward_offset
+    cap_ay = clip_pt_a.y + uy * inward_offset
+    cap_bx = clip_pt_b.x + ux * inward_offset
+    cap_by = clip_pt_b.y + uy * inward_offset
+
+    # Build a large rectangle on the narrow-tip side:
+    # extend very far in the ux,uy direction and wide enough to cover the ring.
+    LARGE = float(offset_dbu * 20)
+    # Perpendicular to travel: uy, -ux (or -uy, ux)
+    px_, py_ = -uy, ux   # one perpendicular direction
+
+    # Four corners: cap line ± LARGE*perp, then push LARGE in inward direction
+    c0x, c0y = cap_ax + px_*LARGE,         cap_ay + py_*LARGE
+    c1x, c1y = cap_ax - px_*LARGE,         cap_ay - py_*LARGE
+    c2x, c2y = c1x    + ux*LARGE,          c1y    + uy*LARGE
+    c3x, c3y = c0x    + ux*LARGE,          c0y    + uy*LARGE
+
+    clip_rect = QPainterPath(QPointF(c0x, c0y))
+    clip_rect.lineTo(c1x, c1y)
+    clip_rect.lineTo(c2x, c2y)
+    clip_rect.lineTo(c3x, c3y)
+    clip_rect.closeSubpath()
+
+    result = ring.subtracted(clip_rect)
+    return result if not result.isEmpty() else None
+
+
 # ── Ring item: single component ───────────────────────────────────────────────
 
 class _ComponentRingItem(QGraphicsPathItem):
@@ -295,6 +448,12 @@ class UndercutOverlay:
         # the ring geometry before display, allowing arbitrary "eraser" regions
         # to be cut out of a ring without touching the model.
         self._masks: Dict[str, list] = {}
+
+        # IDs of L2 narrow-undercut flank components that have been absorbed
+        # into their group's unified ring path.  While absorbed their
+        # ComponentItem is hidden so only the merged orange ring is visible.
+        # Cleared / restored whenever the overlay is disabled or a group is removed.
+        self._absorbed_ids: Set[str] = set()
 
         # scene_changed covers all model mutations (add/remove/move/resize).
         # selectionChanged is intentionally NOT connected — rings are persistent.
@@ -474,8 +633,19 @@ class UndercutOverlay:
         elif ring.parentItem() is not parent_item:
             # Parent changed (e.g. after undo/redo recreated the item).
             ring.setParentItem(parent_item)
-        base   = _shape_path_for_comp(comp)
-        raw    = _build_ring_path(base, self._offset_dbu)
+        base = _shape_path_for_comp(comp)
+        # For tapered-lead polygons on L1 (trapezoids), use a variable-thickness
+        # ring: narrow_width/2 at the narrow end, offset_dbu at the wide end.
+        # We find the narrow width by locating the L11 sibling in the same group.
+        # _taper_quad_ring returns None for non-trapezoid shapes (e.g. regular
+        # polygons on L1), in which case we fall back to the standard uniform ring.
+        if comp.kind == ComponentKind.POLYGON:
+            l11 = self._l11_sibling_for(comp)
+            raw = _taper_quad_ring(comp, self._offset_dbu, l11)
+            if raw is None:
+                raw = _build_ring_path(base, self._offset_dbu)
+        else:
+            raw = _build_ring_path(base, self._offset_dbu)
         masked = self._apply_masks(comp.id, raw)
         ring.setPath(masked)
         ring.setVisible(self._enabled and comp.id not in self._excluded_ids)
@@ -499,16 +669,87 @@ class UndercutOverlay:
             self._scene.addItem(ring)
             self._group_rings[group.id] = ring
 
-        # Build the union shape from Layer-1 members only → raw ring → subtract masks.
-        union = QPainterPath()
-        for comp in layer1_comps:
-            shape = _shape_path_for_comp(comp)
-            if not shape.isEmpty():
-                union = union.united(shape)
-        raw    = _build_ring_path(union, self._offset_dbu)
+        # Build the ring from Layer-1 members.
+        # For taper-lead groups (one L1 polygon + one L11 clip sibling) use
+        # _taper_quad_ring so the narrow-end cap is limited to clip_length/2
+        # instead of the full offset expansion.  Fall back to the uniform union
+        # ring for all other group shapes (multiple L1 members, rectangles, etc.).
+        from core.cell_library import LAYER_NARROW_END, LAYER_UNDERCUT_RING
+        all_members = self._resolve_group_members(group)
+        l11_comps = [c for c in all_members if c.layer == LAYER_NARROW_END]
+        l1_polys  = [c for c in layer1_comps if c.kind == ComponentKind.POLYGON]
+
+        raw = None
+        if len(l1_polys) == 1 and len(l11_comps) == 1:
+            # Single taper-lead L1 body with its L11 narrow-tip clip — use the
+            # variable-thickness ring that terminates at clip_length/2 inward.
+            raw = _taper_quad_ring(l1_polys[0], self._offset_dbu, l11_comps[0])
+
+        if raw is None:
+            # Fallback: uniform expansion of the union of all L1 members.
+            union = QPainterPath()
+            for comp in layer1_comps:
+                shape = _shape_path_for_comp(comp)
+                if not shape.isEmpty():
+                    union = union.united(shape)
+            raw = _build_ring_path(union, self._offset_dbu)
+
+        # ── Merge narrow-undercut L2 flank polygons into the ring ────────────
+        # When build_taper_segment emits narrow_undercut=True it adds two L2
+        # POLYGON components (top + bottom flank) as group members.  When the
+        # overlay is on we absorb their shapes into the unified orange ring and
+        # hide those ComponentItems — no L2 colour bleed, no double outline.
+        # IDs are tracked in _absorbed_ids for clean restoration on disable.
+        l2_flanks = [
+            c for c in all_members
+            if c.layer == LAYER_UNDERCUT_RING and c.kind == ComponentKind.POLYGON
+        ]
+        new_absorbed: Set[str] = set()
+        for flank in l2_flanks:
+            flank_path = _shape_path_for_comp(flank)
+            if not flank_path.isEmpty():
+                raw = raw.united(flank_path)
+            new_absorbed.add(flank.id)
+            item = self._scene._items.get(flank.id)
+            if item is not None:
+                item.setVisible(False)
+
+        # Restore any previously absorbed flanks that are no longer in this
+        # group (e.g. after undo removed narrow_undercut from the cell).
+        group_member_ids = {c.id for c in all_members}
+        stale_absorbed = {cid for cid in self._absorbed_ids
+                          if cid not in group_member_ids}
+        for cid in stale_absorbed:
+            item = self._scene._items.get(cid)
+            if item is not None:
+                item.setVisible(True)
+            self._absorbed_ids.discard(cid)
+
+        self._absorbed_ids.update(new_absorbed)
+
         masked = self._apply_masks(group.id, raw)
         ring.setPath(masked)
         ring.setVisible(self._enabled and group.id not in self._excluded_ids)
+
+
+    def _l11_sibling_for(self, comp):
+        """
+        Return the L11 GDSComponent that belongs to the same group as *comp*,
+        or None if not found.  Used to locate the narrow-tip clip polygon so
+        _taper_quad_ring can compute where to terminate the undercut ring.
+        """
+        from core.cell_library import LAYER_NARROW_END
+        design = self._scene._design
+        group = design.group_of(comp.id)
+        if group is None:
+            return None
+        for cid in group.member_ids:
+            if cid == comp.id:
+                continue
+            sibling = design.get(cid)
+            if sibling is not None and sibling.layer == LAYER_NARROW_END:
+                return sibling
+        return None
 
     def _resolve_group_members(self, group) -> list:
         """Fetch live GDSComponent objects for every member of *group*."""
@@ -533,6 +774,14 @@ class UndercutOverlay:
                 ring.scene().removeItem(ring)
         self._group_rings.clear()
 
+        # Restore visibility of any L2 narrow-undercut flanks that were
+        # absorbed into their group ring while the overlay was active.
+        for cid in self._absorbed_ids:
+            item = self._scene._items.get(cid)
+            if item is not None:
+                item.setVisible(True)
+        self._absorbed_ids.clear()
+
     def _remove_stale_comp_rings(self, live_ids: Set[str]) -> None:
         """Remove rings for components no longer in *live_ids*."""
         stale = [cid for cid in self._comp_rings if cid not in live_ids]
@@ -549,6 +798,17 @@ class UndercutOverlay:
             ring = self._group_rings.pop(gid)
             if ring.scene():
                 ring.scene().removeItem(ring)
+            # Restore any absorbed L2 flank components that belonged to this
+            # now-deleted group so they become visible again (e.g. after undo).
+            design = self._scene._design
+            still_alive = {c.id for c in design.components}
+            released = {cid for cid in self._absorbed_ids if cid not in still_alive or
+                        design.group_of(cid) is None}
+            for cid in released:
+                item = self._scene._items.get(cid)
+                if item is not None:
+                    item.setVisible(True)
+                self._absorbed_ids.discard(cid)
 
     # ── Signal handler ────────────────────────────────────────────────────────
 
