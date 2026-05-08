@@ -31,7 +31,7 @@ from core.commands import (
     ReplaceSubgroupCellCmd, UngroupComponents,
 )
 from core.model import ComponentKind, DesignScene
-from core.serialiser import SerialisationError, load, save
+from core.serialiser import SerialisationError, load, save, load_with_masks
 from ui.canvas_scene import CanvasScene, GroupItem, PlacementMode
 from ui.canvas_view import CanvasView
 from ui.export_dialog import ExportDialog
@@ -683,6 +683,9 @@ class MainWindow(QMainWindow):
                 new_value           = new_value,
             )
             self._scene.cmd_stack.execute(cmd)
+            self._scene._undercut.clear_masks(group_id)
+            if self._scene._undercut.has_masks(group_id):  # check before clearing if you want conditional msg
+                self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}  (undercut masks cleared — ring shape changed)")
 
             # ── Snap the rebuilt sub-group to its connected external port ──────────
             # ReplaceSubgroupCellCmd places the new cell at the old bbox centre, but
@@ -865,6 +868,9 @@ class MainWindow(QMainWindow):
             old_bbox_centre=(old_bbox_cx, old_bbox_cy),
         )
         self._scene.cmd_stack.execute(cmd)
+        self._scene._undercut.clear_masks(group_id)
+        if self._scene._undercut.has_masks(group_id):  # check before clearing if you want conditional msg
+            self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}  (undercut masks cleared — ring shape changed)")
 
         # Re-select the newly created GroupItem so the properties panel stays
         # populated and the user doesn't lose their selection after each edit.
@@ -1817,7 +1823,7 @@ class MainWindow(QMainWindow):
 
     def _do_save(self, path: Path) -> None:
         try:
-            save(self._design, path)
+            save(self._design, path, overlay=self._scene._undercut)
             self._current_file    = path
             self._design.is_dirty = False
             self._update_title()
@@ -1835,18 +1841,32 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            new_design = load(path)
+            new_design, saved_masks = load_with_masks(path)
         except SerialisationError as exc:
             QMessageBox.critical(self, "Open Failed", str(exc))
             return
 
-        self._design              = new_design
-        self._scene._design       = new_design
-        self._scene.cmd_stack     = type(self._scene.cmd_stack)(new_design)
+        self._design          = new_design
+        self._scene._design   = new_design
+        self._scene.cmd_stack = type(self._scene.cmd_stack)(new_design)
         self._scene.cmd_stack.connect_change(self._scene._on_model_changed)
+
+        overlay = self._scene._undercut
+        overlay._masks.clear()
+        overlay._known_ids.clear()
+        overlay._excluded_ids.clear()
+        if saved_masks:
+            from PyQt6.QtCore import QRectF
+            from PyQt6.QtGui import QPainterPath
+            for obj_id, rects in saved_masks.items():
+                for r in rects:
+                    mask_path = QPainterPath()          # ← renamed from path
+                    mask_path.addRect(QRectF(r[0], r[1], r[2], r[3]))
+                    overlay._masks.setdefault(obj_id, []).append(mask_path)
+
         self._scene._on_model_changed()
 
-        self._current_file = Path(path)
+        self._current_file = Path(path)                # ← now safe, path is still the file str
         self._update_title()
         self._flash_status(f"Opened {Path(path).name}")
         self._view.zoom_fit()

@@ -834,11 +834,12 @@ def build_taper_segment(
         # Top flank: shifted entry+ → shifted exit+ → orig exit+ → orig entry+
         top_flank = _poly(origin, [s_epos, s_xpos, o_xpos, o_epos], LAYER_UNDERCUT_RING)
         top_flank._no_auto_ports = True
+        top_flank.is_undercut = True          # ← add
         components.append(top_flank)
 
-        # Bottom flank: orig entry− → orig exit− → shifted exit− → shifted entry−
         bot_flank = _poly(origin, [o_eneg, o_xneg, s_xneg, s_eneg], LAYER_UNDERCUT_RING)
         bot_flank._no_auto_ports = True
+        bot_flank.is_undercut = True          # ← add
         components.append(bot_flank)
 
     # ── Ports on the anchor (taper_body) ──────────────────────────────────
@@ -1652,6 +1653,7 @@ def build_undercut_ring(
     def _add_strip(dx0: float, dy0: float, dx1: float, dy1: float) -> None:
         nonlocal anchor
         comp = _rect(origin, dx0, dy0, dx1, dy1, LAYER_UNDERCUT_RING)
+        comp.is_undercut = True
         if anchor is None:
             comp._no_auto_ports = False   # first strip is anchor
             anchor = comp

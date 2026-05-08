@@ -1268,13 +1268,34 @@ class ReplaceSubgroupCellCmd:
                     "int_port_name": int_port_name,
                 })
 
-        # 1. Remove old sub-group components (purges their connections)
+        # Preserve hand-edited undercut components — they live on L2 and may
+        # have been erased/modified by the user.  Snapshot them before the bulk
+        # remove, then re-add them in place of the new cell's auto-generated
+        # undercut shapes so user edits (erase masks, etc.) survive param edits.
+        preserved_undercut: list = []
+        for cid in self._old_sg_comp_ids:
+            comp = design.get(cid)
+            if comp and getattr(comp, "is_undercut", False):
+                preserved_undercut.append(comp)
+        # NOTE: do NOT discard from old_id_set here — the member_ids replacement
+        # loop in step 3 uses old_id_set to find which slots to overwrite, and
+        # skipping undercut IDs caused them to be emitted twice (once as a
+        # "kept" member and once via new_comp_ids), producing duplicate IDs.
+
+        # 1. Remove ALL old sub-group components (including undercut ones).
+        #    Removing them cleanly before re-adding prevents duplicate entries
+        #    in the design when the same component object is added a second time.
         for cid in self._old_sg_comp_ids:
             design.remove(cid)
 
-        # 2. Add new components
+        # 2. Add new components, but skip the cell's auto-generated undercut
+        #    shapes — the preserved hand-edited undercut components replace them.
         self._new_comp_ids = []
         for comp in self._new_result.components:
+            if not getattr(comp, "is_undercut", False):
+                design.add(comp)
+                self._new_comp_ids.append(comp.id)
+        for comp in preserved_undercut:
             design.add(comp)
             self._new_comp_ids.append(comp.id)
 

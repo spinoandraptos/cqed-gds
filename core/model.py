@@ -26,6 +26,7 @@ from typing import Dict, List, Optional, Callable, Set
 # ── Unit conversion ───────────────────────────────────────────────────────────
 
 DBU_PER_UM = 1_000   # 1 µm = 1000 nm (DBU)
+UNDERCUT_LAYER = 2   # GDS layer for all undercut ring geometry
 
 def um_to_dbu(um: float) -> int:
     return int(round(um * DBU_PER_UM))
@@ -159,6 +160,8 @@ class GDSComponent:
     # When True, rebuild_ports() will never auto-generate default ports.
     # Set on all non-anchor sub-components of a parametric cell.
     _no_auto_ports: bool = False
+
+    is_undercut: bool = False
 
     # ── Derived geometry ──────────────────────────────────────────────────────
 

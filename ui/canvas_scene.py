@@ -1624,6 +1624,8 @@ class CanvasScene(QGraphicsScene):
             mask_path = QPainterPath()
             mask_path.addRect(rect)
             self._undercut.add_mask(self._mask_target_id, mask_path)
+            self._design.is_dirty = True          # ← add this one line
+            self.scene_changed.emit()             # ← triggers title update
         # Stay in MASK_UNDERCUT mode so multiple rectangles can be drawn
         # without re-pressing X each time.  ESC returns to SELECT.
 

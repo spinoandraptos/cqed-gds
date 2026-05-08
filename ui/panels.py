@@ -2020,7 +2020,9 @@ class PropertiesPanel(QWidget):
                     # Must be checked before float because bool is a subclass of int.
                     btn = QPushButton("ON" if current_val else "OFF")
                     btn.setCheckable(True)
+                    btn.blockSignals(True)                # ← add this
                     btn.setChecked(bool(current_val))
+                    btn.blockSignals(False)               # ← add this
                     btn.setFixedWidth(110)
                     btn.setStyleSheet(f"""
                         QPushButton {{

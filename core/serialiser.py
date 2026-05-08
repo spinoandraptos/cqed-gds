@@ -44,10 +44,9 @@ class SerialisationError(Exception):
 
 # ── Encode ────────────────────────────────────────────────────────────────────
 
-def save(design: DesignScene, path: str | Path) -> None:
-    """Serialise *design* to JSON at *path*. Raises SerialisationError on failure."""
+def save(design: DesignScene, path: str | Path, overlay=None) -> None:
     try:
-        data = _encode(design)
+        data = _encode(design, overlay=overlay)
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
     except SerialisationError:
         raise
@@ -55,14 +54,26 @@ def save(design: DesignScene, path: str | Path) -> None:
         raise SerialisationError(f"Save failed: {exc}") from exc
 
 
-def _encode(design: DesignScene) -> dict:
-    return {
+def _encode(design: DesignScene, overlay=None) -> dict:
+    d = {
         "version":     1,
         "name":        design.name,
         "components":  [_encode_comp(c) for c in design.components],
         "connections": [_encode_conn(cn) for cn in design.connections],
-        "groups":      [_encode_group(g) for g in design.groups],  # ← add
+        "groups":      [_encode_group(g) for g in design.groups],
     }
+    if overlay is not None:
+        masks = {}
+        for obj_id, paths in overlay._masks.items():
+            rects = []
+            for path in paths:
+                br = path.boundingRect()
+                rects.append([br.x(), br.y(), br.width(), br.height()])
+            if rects:
+                masks[obj_id] = rects
+        if masks:
+            d["undercut_masks"] = masks
+    return d
 
 def _encode_group(g) -> dict:
     d: dict = {"id": g.id, "name": g.name, "member_ids": list(g.member_ids)}
@@ -95,6 +106,7 @@ def _encode_comp(c: GDSComponent) -> dict:
         "path_width": c.path_width,
         "points":     [[p.x, p.y] for p in c.points] if c.points else None,
         "ports":      [_encode_port(p) for p in c.ports],
+        "is_undercut": c.is_undercut,
     }
 
 
@@ -117,16 +129,29 @@ def _encode_conn(cn: Connection) -> dict:
 
 # ── Decode ────────────────────────────────────────────────────────────────────
 
-def load(path: str | Path) -> DesignScene:
-    """Deserialise a JSON file into a fresh DesignScene. Raises SerialisationError on failure."""
+def load(path: str | Path) -> tuple[DesignScene, dict]:
+    """Returns (design, masks_dict) where masks_dict is obj_id → list of [x,y,w,h]."""
     try:
         data = json.loads(Path(path).read_text(encoding="utf-8"))
-        return _decode(data)
+        design = _decode(data)
+        masks  = data.get("undercut_masks", {})
+        return design, masks
     except SerialisationError:
         raise
     except Exception as exc:
         raise SerialisationError(f"Load failed: {exc}") from exc
 
+def load_with_masks(path: str | Path) -> tuple:
+    """Returns (DesignScene, masks_dict) where masks_dict is obj_id → list of [x,y,w,h]."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+        design = _decode(data)
+        masks  = data.get("undercut_masks", {})
+        return design, masks
+    except SerialisationError:
+        raise
+    except Exception as exc:
+        raise SerialisationError(f"Load failed: {exc}") from exc
 
 def _decode(data: dict) -> DesignScene:
     ver = data.get("version")
@@ -183,6 +208,7 @@ def _decode_comp(d: dict) -> GDSComponent:
             path_width = d.get("path_width"),
             points     = points,
             ports      = ports,
+            is_undercut = d.get("is_undercut", False), 
         )
     except (KeyError, IndexError, TypeError) as exc:
         raise SerialisationError(f"Malformed component record: {exc}") from exc
