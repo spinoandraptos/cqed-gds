@@ -995,7 +995,13 @@ class CanvasScene(QGraphicsScene):
                 self._refresh_indicators(cid)
             return
         _, _, my_comp_id, my_port_id, their_comp_id, their_port_id = snap
-        self.disconnect_component(my_comp_id)
+        # Disconnect only external connections on the snapping component so
+        # internal group connections are not inadvertently severed.
+        group_member_ids = set(group.member_ids)
+        for conn in self._design.connections_for(my_comp_id):
+            other_id = (conn.comp_b if conn.comp_a == my_comp_id else conn.comp_a)
+            if other_id not in group_member_ids:
+                self.cmd_stack.execute(DisconnectPorts(conn))
         if not self._design.are_connected(
             my_comp_id, my_port_id, their_comp_id, their_port_id
         ):
@@ -1398,8 +1404,17 @@ class CanvasScene(QGraphicsScene):
                     comp.move_by(orig.x - comp.origin.x, orig.y - comp.origin.y)
 
             if total_dx or total_dy:
+                # Disconnect only EXTERNAL connections (one end inside the group,
+                # the other outside).  Internal connections between group members
+                # must be preserved — they don't need to be re-snapped after a
+                # move because the relative positions of members don't change.
+                member_id_set = set(group.member_ids)
                 for cid in group.member_ids:
-                    self.disconnect_component(cid)
+                    for conn in self._design.connections_for(cid):
+                        other_id = (conn.comp_b if conn.comp_a == cid
+                                    else conn.comp_a)
+                        if other_id not in member_id_set:
+                            self.cmd_stack.execute(DisconnectPorts(conn))
                 move_cmds.append(MoveGroup(group_id, total_dx, total_dy))
 
         if move_cmds:

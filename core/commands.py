@@ -1275,20 +1275,6 @@ class ReplaceSubgroupCellCmd:
                     "int_port_name": int_port_name,
                 })
 
-        # Preserve hand-edited undercut components — they live on L2 and may
-        # have been erased/modified by the user.  Snapshot them before the bulk
-        # remove, then re-add them in place of the new cell's auto-generated
-        # undercut shapes so user edits (erase masks, etc.) survive param edits.
-        preserved_undercut: list = []
-        for cid in self._old_sg_comp_ids:
-            comp = design.get(cid)
-            if comp and getattr(comp, "is_undercut", False):
-                preserved_undercut.append(comp)
-        # NOTE: do NOT discard from old_id_set here — the member_ids replacement
-        # loop in step 3 uses old_id_set to find which slots to overwrite, and
-        # skipping undercut IDs caused them to be emitted twice (once as a
-        # "kept" member and once via new_comp_ids), producing duplicate IDs.
-
         # 1. Remove ALL old sub-group components (including undercut ones).
         #    Removing them cleanly before re-adding prevents duplicate entries
         #    in the design when the same component object is added a second time.
@@ -1297,31 +1283,15 @@ class ReplaceSubgroupCellCmd:
 
         # 2. Add new components.
         #
-        #    Undercut preservation rule:
-        #      - If the NEW cell generates undercut components AND the OLD cell
-        #        had hand-edited undercut shapes, substitute the preserved copies
-        #        so user edits survive a param change.
-        #      - If the NEW cell generates NO undercut components (narrow_undercut
-        #        was just toggled OFF), do NOT re-add the preserved old flanks;
-        #        they must disappear with the toggle.
-        #      - If the NEW cell generates undercut components but there were no
-        #        old preserved ones (narrow_undercut was just toggled ON), add
-        #        the new auto-generated ones as-is.
-        new_has_undercut = any(getattr(c, "is_undercut", False)
-                               for c in self._new_result.components)
-        use_preserved = new_has_undercut and bool(preserved_undercut)
-
+        #    Undercut flanks (is_undercut=True) must always come from the new
+        #    cell result — their geometry is derived from the taper dimensions
+        #    and must reflect the updated parameters exactly.  Erase masks are
+        #    stored on the group ring (keyed by group_id), not on individual
+        #    flank component IDs, so no object-identity preservation is needed.
         self._new_comp_ids = []
         for comp in self._new_result.components:
-            if getattr(comp, "is_undercut", False) and use_preserved:
-                # Replaced by preserved copies added below — skip the new one.
-                continue
             design.add(comp)
             self._new_comp_ids.append(comp.id)
-        if use_preserved:
-            for comp in preserved_undercut:
-                design.add(comp)
-                self._new_comp_ids.append(comp.id)
 
         # 3. Patch the merged group's member_ids: replace old IDs with new IDs
         #    in-place, preserving the order of all other sub-groups' members.
