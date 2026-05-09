@@ -601,13 +601,16 @@ class MainWindow(QMainWindow):
 
             # Snapshot old subgroup bbox centre BEFORE building the new cell,
             # so we can land the rebuilt+rotated cell in the same place.
+            # Use structural (non-undercut) members only so that toggling
+            # narrow_undercut ON/OFF doesn't skew the reference centre.
             if old_sg_comps:
-                sg_x_min = min(c.bbox.x_min for c in old_sg_comps)
-                sg_y_min = min(c.bbox.y_min for c in old_sg_comps)
-                sg_x_max = max(c.bbox.x_max for c in old_sg_comps)
-                sg_y_max = max(c.bbox.y_max for c in old_sg_comps)
-                old_sg_bbox_cx = (sg_x_min + sg_x_max) // 2
-                old_sg_bbox_cy = (sg_y_min + sg_y_max) // 2
+                _sg_struct = [c for c in old_sg_comps
+                              if not getattr(c, "is_undercut", False)]
+                _sg_bbox_src = _sg_struct if _sg_struct else old_sg_comps
+                old_sg_bbox_cx = (min(c.bbox.x_min for c in _sg_bbox_src) +
+                                  max(c.bbox.x_max for c in _sg_bbox_src)) // 2
+                old_sg_bbox_cy = (min(c.bbox.y_min for c in _sg_bbox_src) +
+                                  max(c.bbox.y_max for c in _sg_bbox_src)) // 2
             else:
                 old_sg_bbox_cx, old_sg_bbox_cy = origin.x, origin.y
 
@@ -621,29 +624,30 @@ class MainWindow(QMainWindow):
             rotation_steps = sg.get("cell_rotation_steps", 0)
             if rotation_steps:
                 from core.commands import _rotate_component_in_place
-                # Rotate around the new cell's OWN bbox centre (it sits near
-                # the origin since we built it at Point(0,0)).  This is the
-                # only pivot that produces the correct orientation regardless
-                # of how cell dimensions changed — the old world-space pivot
-                # (_cell_rotation_cx/cy) is unrelated to the new geometry.
-                xs_min = min(c.bbox.x_min for c in new_result.components)
-                ys_min = min(c.bbox.y_min for c in new_result.components)
-                xs_max = max(c.bbox.x_max for c in new_result.components)
-                ys_max = max(c.bbox.y_max for c in new_result.components)
-                own_cx = (xs_min + xs_max) // 2
-                own_cy = (ys_min + ys_max) // 2
+                # Rotate around the new cell's OWN structural bbox centre.
+                # Use structural (non-undercut) members for the pivot so that
+                # toggling narrow_undercut doesn't shift the rotation centre.
+                _rot_struct = [c for c in new_result.components
+                               if not getattr(c, "is_undercut", False)]
+                _rot_src = _rot_struct if _rot_struct else new_result.components
+                own_cx = (min(c.bbox.x_min for c in _rot_src) +
+                          max(c.bbox.x_max for c in _rot_src)) // 2
+                own_cy = (min(c.bbox.y_min for c in _rot_src) +
+                          max(c.bbox.y_max for c in _rot_src)) // 2
                 for comp in new_result.components:
                     _rotate_component_in_place(comp, own_cx, own_cy, rotation_steps)
 
-            # Translate so the rotated cell's bbox centre lands on the old
-            # subgroup bbox centre.
+            # Translate so the rotated cell's structural bbox centre lands on
+            # the old subgroup bbox centre.  Use structural (non-undercut)
+            # members only on both sides so toggling narrow_undercut never shifts
+            # the cell position.
             comps = new_result.components
-            xs_min = min(c.bbox.x_min for c in comps)
-            ys_min = min(c.bbox.y_min for c in comps)
-            xs_max = max(c.bbox.x_max for c in comps)
-            ys_max = max(c.bbox.y_max for c in comps)
-            new_cx = (xs_min + xs_max) // 2
-            new_cy = (ys_min + ys_max) // 2
+            _new_struct = [c for c in comps if not getattr(c, "is_undercut", False)]
+            _new_bbox_src = _new_struct if _new_struct else comps
+            new_cx = (min(c.bbox.x_min for c in _new_bbox_src) +
+                      max(c.bbox.x_max for c in _new_bbox_src)) // 2
+            new_cy = (min(c.bbox.y_min for c in _new_bbox_src) +
+                      max(c.bbox.y_max for c in _new_bbox_src)) // 2
             dx = old_sg_bbox_cx - new_cx
             dy = old_sg_bbox_cy - new_cy
             if dx or dy:
@@ -828,9 +832,23 @@ class MainWindow(QMainWindow):
                             rotation_steps = stored if stored in (1, 3) else 1
             except Exception:
                 pass
-        bb_live = group.bbox_from(self._design.components)
-        old_bbox_cx = (bb_live.x_min + bb_live.x_max) // 2
-        old_bbox_cy = (bb_live.y_min + bb_live.y_max) // 2
+        # Compute old bbox centre from STRUCTURAL (non-undercut) members only.
+        # This must match the structural-only bbox used in ReplaceCellCmd.execute()
+        # so that toggling narrow_undercut (which adds/removes undercut flanks)
+        # does not shift the cell's position.
+        all_live = [self._design.get(cid) for cid in group.member_ids
+                    if self._design.get(cid)]
+        structural_live = [c for c in all_live if not getattr(c, "is_undercut", False)]
+        _bbox_src = structural_live if structural_live else all_live
+        if _bbox_src:
+            old_bbox_cx = (min(c.bbox.x_min for c in _bbox_src) +
+                           max(c.bbox.x_max for c in _bbox_src)) // 2
+            old_bbox_cy = (min(c.bbox.y_min for c in _bbox_src) +
+                           max(c.bbox.y_max for c in _bbox_src)) // 2
+        else:
+            bb_live = group.bbox_from(self._design.components)
+            old_bbox_cx = (bb_live.x_min + bb_live.x_max) // 2
+            old_bbox_cy = (bb_live.y_min + bb_live.y_max) // 2
 
         # Always build the new cell at origin (0,0) — ReplaceCellCmd will
         # rotate + translate it into the correct position.

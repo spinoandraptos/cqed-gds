@@ -568,17 +568,42 @@ class UndercutOverlay:
         Show or hide the ring for a single component or group ID, independently
         of the global enable flag.  The global toggle must still be ON for any
         ring to be visible; this method only provides a per-object override.
+
+        When a GROUP ring is shown/hidden, absorbed L2 flank ComponentItems are
+        kept in sync: hidden when the ring is showing (flanks merged into ring
+        path), visible when the ring is hidden (flanks render as standalone items).
         """
         if excluded:
             self._excluded_ids.add(obj_id)
         else:
             self._excluded_ids.discard(obj_id)
 
+        ring_visible = self._enabled and not excluded
+
         # Apply immediately to any live ring items.
         if ring := self._comp_rings.get(obj_id):
-            ring.setVisible(self._enabled and not excluded)
+            ring.setVisible(ring_visible)
         if ring := self._group_rings.get(obj_id):
-            ring.setVisible(self._enabled and not excluded)
+            ring.setVisible(ring_visible)
+            # Sync absorbed flank ComponentItems for this group.
+            # When the group ring becomes visible, flanks are hidden into it.
+            # When hidden, flanks must be restored so the geometry is still shown.
+            design = self._scene._design
+            group = design.get_group(obj_id)
+            if group is not None:
+                from core.cell_library import LAYER_UNDERCUT_RING
+                for cid in group.member_ids:
+                    comp = design.get(cid)
+                    if (comp is not None
+                            and comp.layer == LAYER_UNDERCUT_RING
+                            and comp.kind == ComponentKind.POLYGON):
+                        item = self._scene._items.get(cid)
+                        if item is not None:
+                            item.setVisible(not ring_visible)
+                        if ring_visible:
+                            self._absorbed_ids.add(cid)
+                        else:
+                            self._absorbed_ids.discard(cid)
 
     def is_excluded(self, obj_id: str) -> bool:
         """Return True if the ring for this object is individually suppressed."""
@@ -724,12 +749,23 @@ class UndercutOverlay:
         # Uniting after expansion avoids this entirely.
         raw = _build_ring_path(union, self._offset_dbu)
 
+        # Flanks are absorbed (hidden as individual items) into the group ring
+        # path ONLY when the group ring itself will be visible.  If the ring is
+        # excluded (group.id in self._excluded_ids), the flank ComponentItems
+        # must stay visible so the user can still see the narrow undercut geometry.
+        ring_will_show = self._enabled and group.id not in self._excluded_ids
+
         new_absorbed: Set[str] = set()
         for flank in l2_flanks:
-            new_absorbed.add(flank.id)
             item = self._scene._items.get(flank.id)
-            if item is not None:
-                item.setVisible(False)
+            if ring_will_show:
+                new_absorbed.add(flank.id)
+                if item is not None:
+                    item.setVisible(False)
+            else:
+                # Ring hidden — keep the flank item visible so the geometry shows.
+                if item is not None:
+                    item.setVisible(True)
 
         # Restore any previously absorbed flanks that are no longer in this
         # group (e.g. after undo removed narrow_undercut from the cell).

@@ -1090,32 +1090,39 @@ class ReplaceCellCmd:
             members = [design.get(cid) for cid in new_group.member_ids
                        if design.get(cid)]
             if members:
+                # Structural members only (exclude undercut flanks) are used for
+                # all bbox-based alignment.  Undercut shapes extend beyond the
+                # physical geometry and would shift the cell when narrow_undercut
+                # is toggled, since their extra extent skews the bbox centre.
+                structural = [c for c in members if not getattr(c, "is_undercut", False)]
+                _bbox_members = structural if structural else members
+
                 if self._rotation_steps:
-                    # Rotate the new cell around ITS OWN bbox centre.
+                    # Rotate the new cell around ITS OWN structural bbox centre.
                     # The new cell was built at (0,0) with potentially different
                     # geometry than the old cell, so the old pivot (rot_cx/cy)
                     # is an arbitrary world point unrelated to the new geometry.
                     # Rotating around the new cell's own centre is the only
                     # operation that produces the correct visual orientation
                     # regardless of how dimensions changed.
-                    xs_min = min(c.bbox.x_min for c in members)
-                    ys_min = min(c.bbox.y_min for c in members)
-                    xs_max = max(c.bbox.x_max for c in members)
-                    ys_max = max(c.bbox.y_max for c in members)
+                    xs_min = min(c.bbox.x_min for c in _bbox_members)
+                    ys_min = min(c.bbox.y_min for c in _bbox_members)
+                    xs_max = max(c.bbox.x_max for c in _bbox_members)
+                    ys_max = max(c.bbox.y_max for c in _bbox_members)
                     own_cx = (xs_min + xs_max) // 2
                     own_cy = (ys_min + ys_max) // 2
                     for comp in members:
                         _rotate_component_in_place(comp, own_cx, own_cy, self._rotation_steps)
 
-                # Translate so the (rotated) cell's bbox centre lands on the old
-                # bbox centre.  This must run for BOTH rotated and unrotated cells
-                # because the new cell is always built at (0,0) — without this
-                # translation a moved-but-not-rotated cell would snap back to the
-                # origin on every param edit.
-                xs_min = min(c.bbox.x_min for c in members)
-                ys_min = min(c.bbox.y_min for c in members)
-                xs_max = max(c.bbox.x_max for c in members)
-                ys_max = max(c.bbox.y_max for c in members)
+                # Translate so the (rotated) cell's structural bbox centre lands
+                # on the old bbox centre.  This must run for BOTH rotated and
+                # unrotated cells because the new cell is always built at (0,0)
+                # — without this translation a moved-but-not-rotated cell would
+                # snap back to the origin on every param edit.
+                xs_min = min(c.bbox.x_min for c in _bbox_members)
+                ys_min = min(c.bbox.y_min for c in _bbox_members)
+                xs_max = max(c.bbox.x_max for c in _bbox_members)
+                ys_max = max(c.bbox.y_max for c in _bbox_members)
                 new_cx = (xs_min + xs_max) // 2
                 new_cy = (ys_min + ys_max) // 2
 
@@ -1288,16 +1295,33 @@ class ReplaceSubgroupCellCmd:
         for cid in self._old_sg_comp_ids:
             design.remove(cid)
 
-        # 2. Add new components, but skip the cell's auto-generated undercut
-        #    shapes — the preserved hand-edited undercut components replace them.
+        # 2. Add new components.
+        #
+        #    Undercut preservation rule:
+        #      - If the NEW cell generates undercut components AND the OLD cell
+        #        had hand-edited undercut shapes, substitute the preserved copies
+        #        so user edits survive a param change.
+        #      - If the NEW cell generates NO undercut components (narrow_undercut
+        #        was just toggled OFF), do NOT re-add the preserved old flanks;
+        #        they must disappear with the toggle.
+        #      - If the NEW cell generates undercut components but there were no
+        #        old preserved ones (narrow_undercut was just toggled ON), add
+        #        the new auto-generated ones as-is.
+        new_has_undercut = any(getattr(c, "is_undercut", False)
+                               for c in self._new_result.components)
+        use_preserved = new_has_undercut and bool(preserved_undercut)
+
         self._new_comp_ids = []
         for comp in self._new_result.components:
-            if not getattr(comp, "is_undercut", False):
-                design.add(comp)
-                self._new_comp_ids.append(comp.id)
-        for comp in preserved_undercut:
+            if getattr(comp, "is_undercut", False) and use_preserved:
+                # Replaced by preserved copies added below — skip the new one.
+                continue
             design.add(comp)
             self._new_comp_ids.append(comp.id)
+        if use_preserved:
+            for comp in preserved_undercut:
+                design.add(comp)
+                self._new_comp_ids.append(comp.id)
 
         # 3. Patch the merged group's member_ids: replace old IDs with new IDs
         #    in-place, preserving the order of all other sub-groups' members.
