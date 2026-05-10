@@ -1127,6 +1127,27 @@ class GroupSweepDialog(QDialog):
             if port_a and port_b:
                 self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
+        # ── Port-flush snap: close any gap created by the swept cell's changed
+        # dimensions.  The target sub-group is "fixed"; non-target sub-groups
+        # are translated so their ports land flush on the target's ports.
+        # We must run this AFTER connections are stitched above so the
+        # connection records are live and the snap loop can find them.
+        #
+        # Build per-slot target_member_ids from the new_cell_subgroups lists
+        # that were assembled inside the loop — reconstruct them from gc_cmds.
+        for gc in gc_cmds:
+            new_grp = getattr(gc, "_group", None)
+            if new_grp is None:
+                continue
+            # Identify the rebuilt target sub-group members inside this slot.
+            # new_grp._cell_subgroups[sg_idx] holds the slot's target entry.
+            slot_sgs = getattr(new_grp, "_cell_subgroups", [])
+            if sg_idx < len(slot_sgs):
+                slot_target_ids = set(slot_sgs[sg_idx].get("member_ids", []))
+            else:
+                slot_target_ids = set()
+            self._snap_intragroup_connections(gc, slot_target_ids)
+
         # If the source group had its undercut ring enabled (i.e. not excluded),
         # un-exclude every newly generated group so their rings follow suit.
         overlay = getattr(self._scene, "_undercut", None)
@@ -1226,7 +1247,11 @@ class GroupSweepDialog(QDialog):
                 new_group_name = f"{self._group.name}_{linear_idx}"
                 new_member_ids = [id_map[mid] for mid in self._group.member_ids
                                   if mid in id_map]
-                all_cmds.append(GroupComponents(new_member_ids, new_group_name))
+                gc_raw = GroupComponents(new_member_ids, new_group_name)
+                # Annotate with the swept target's clone ID so _snap_intragroup_connections
+                # knows which side is "fixed" when computing port gaps.
+                gc_raw._snap_target_ids = {id_map[target_cid]} if target_cid in id_map else set()
+                all_cmds.append(gc_raw)
 
                 # ── Record internal connections to remap after execute ─────────
                 # Store (orig_comp_a, port_name_a, orig_comp_b, port_name_b)
@@ -1269,6 +1294,39 @@ class GroupSweepDialog(QDialog):
             if port_a and port_b:
                 self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
+        # ── Port-flush snap: close any intra-group gap caused by the swept
+        # target having different dimensions than the original.
+        # In raw mode we treat the swept target component as "fixed" and snap
+        # every other connected member flush onto it.
+        for gc in gc_cmds_raw:
+            new_grp = getattr(gc, "_group", None)
+            if new_grp is None:
+                continue
+            # Identify the swept target clone inside this slot: find the
+            # _cell_subgroups entry whose original source was target_cid.
+            # In raw mode _cell_subgroups entries carry "name": "comp:<id>"
+            # (set by GroupComponents.__init__); the clone has a new ID so
+            # we match by checking which single-member sub-group maps to a
+            # member whose origin sits at (original_origin + dx, dy).
+            # Simpler: just use the id_map to identify the target clone ID
+            # from the last slot processed — but id_map is per-slot and
+            # we've lost the mapping.  Instead, rely on the fact that the
+            # target clone had its ports cleared and rebuilt from the new
+            # bbox, while all others kept deepcopied ports.  We can't detect
+            # that cheaply post-hoc, so we scan _cell_subgroups for a
+            # single-member entry where the member has no _no_auto_ports.
+            #
+            # Cleanest approach: collect the target clone IDs as we build them.
+            # Since we don't have them here, we fall back to a connection-driven
+            # approach: for each internal connection, one side has the rebuilt
+            # geometry (its port positions are correct) and the other may need
+            # moving.  _snap_intragroup_connections will compute the gap from
+            # actual port positions; passing an empty target_member_ids set
+            # means it can't determine directionality, so we pass the set of
+            # cloned target IDs collected during the loop via gc_cmd annotation.
+            slot_target_ids: set[str] = getattr(gc, "_snap_target_ids", set())
+            self._snap_intragroup_connections(gc, slot_target_ids)
+
         # Mirror source group's undercut-ring enabled state onto generated copies.
         overlay = getattr(self._scene, "_undercut", None)
         if overlay is not None and not overlay.is_excluded(self._group.id):
@@ -1278,6 +1336,117 @@ class GroupSweepDialog(QDialog):
                     overlay.set_excluded(new_grp.id, False)
 
         self.accept()
+
+    # ── Intra-group port-flush snap (shared by both modes) ───────────────────
+
+    def _snap_intragroup_connections(
+        self,
+        gc_cmd: "GroupComponents",
+        target_member_ids: "set[str]",
+    ) -> None:
+        """
+        After a swept group copy has been committed to the design, check every
+        internal connection in the new group.  If the two connected ports are
+        not co-located (i.e. there is a spatial gap caused by the swept cell
+        having different dimensions), translate the non-target sub-group so its
+        port lands flush on the target sub-group's port.
+
+        This mirrors the snap correction in _do_cell_param_change (main_window)
+        but operates entirely within a freshly created group copy, so it does
+        not need BFS propagation — there are no external neighbours to nudge;
+        the new group is isolated.
+
+        Parameters
+        ----------
+        gc_cmd : GroupComponents
+            The GroupComponents command for this slot (already executed).
+            Its ._group carries the new group's member_ids.
+        target_member_ids : set[str]
+            The IDs of the rebuilt/swept target sub-group's components
+            inside this slot.  These are the "fixed" side — non-target
+            members are moved to meet them, not the other way around.
+        """
+        from core.commands import MoveComponent, BatchCommand
+
+        new_group = getattr(gc_cmd, "_group", None)
+        if new_group is None:
+            return
+
+        all_member_ids: set[str] = set(new_group.member_ids)
+
+        # For each internal connection, if one side is in target_member_ids
+        # and the other is not, compute the gap and snap the non-target side.
+        # Track which non-target comp IDs we've already moved so we never
+        # shift the same component twice (the first connection fixes it).
+        moved: set[str] = set()
+        snap_cmds = []
+
+        for cn in self._design.connections:
+            # Only internal connections within this new group.
+            if cn.comp_a not in all_member_ids or cn.comp_b not in all_member_ids:
+                continue
+
+            # Identify which end is "target" (fixed) and which is "non-target" (moveable).
+            if cn.comp_a in target_member_ids and cn.comp_b not in target_member_ids:
+                fixed_cid,    fixed_pid    = cn.comp_a, cn.port_a
+                moveable_cid, moveable_pid = cn.comp_b, cn.port_b
+            elif cn.comp_b in target_member_ids and cn.comp_a not in target_member_ids:
+                fixed_cid,    fixed_pid    = cn.comp_b, cn.port_b
+                moveable_cid, moveable_pid = cn.comp_a, cn.port_a
+            else:
+                continue  # both sides same type — nothing to snap
+
+            if moveable_cid in moved:
+                continue
+
+            fixed_comp    = self._design.get(fixed_cid)
+            moveable_comp = self._design.get(moveable_cid)
+            if fixed_comp is None or moveable_comp is None:
+                continue
+
+            fixed_port    = next((p for p in fixed_comp.ports    if p.id == fixed_pid),    None)
+            moveable_port = next((p for p in moveable_comp.ports if p.id == moveable_pid), None)
+            if fixed_port is None or moveable_port is None:
+                continue
+
+            fixed_abs    = fixed_port.abs_pos(fixed_comp.origin)
+            moveable_abs = moveable_port.abs_pos(moveable_comp.origin)
+
+            snap_dx = fixed_abs.x - moveable_abs.x
+            snap_dy = fixed_abs.y - moveable_abs.y
+            if snap_dx == 0 and snap_dy == 0:
+                continue  # already flush
+
+            # Find all companions in the same sub-group as moveable_cid so
+            # they move as a rigid unit (e.g. undercut flanks with no ports).
+            cell_subgroups = getattr(new_group, "_cell_subgroups", [])
+            subgroup_ids: set[str] = {moveable_cid}
+            for sg in cell_subgroups:
+                if moveable_cid in sg.get("member_ids", []):
+                    subgroup_ids = set(sg["member_ids"])
+                    break
+
+            for sid in subgroup_ids:
+                if sid in moved:
+                    continue
+                moved.add(sid)
+                sc = self._design.get(sid)
+                if sc is None:
+                    continue
+                old_orig = sc.origin
+                new_orig = Point(old_orig.x + snap_dx, old_orig.y + snap_dy)
+                mc = MoveComponent(sid, old_orig, new_orig)
+                mc.execute(self._design)
+                snap_cmds.append(mc)
+                s_item = self._scene.item_for(sid)
+                if s_item:
+                    s_item.sync_from_model()
+
+        if snap_cmds:
+            self._cmd_stack.push(
+                BatchCommand(snap_cmds, "Snap swept group copy — flush internal ports")
+            )
+
 
 class CellSweepDialog(QDialog):
     """
