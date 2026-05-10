@@ -28,7 +28,7 @@ from PyQt6.QtWidgets import (
     QDoubleSpinBox, QSpinBox, QDialogButtonBox, QFrame,
     QWidget, QGridLayout, QMessageBox,
 )
-from PyQt6.QtCore import Qt
+from PyQt6.QtCore import Qt, pyqtSignal
 
 from core.model import (
     GDSComponent, ComponentKind, ComponentGroup, DesignScene,
@@ -151,6 +151,11 @@ _KIND_PARAMS = {
 # ── SweepDialog (original — single component) ─────────────────────────────────
 
 class SweepDialog(QDialog):
+
+    # Emitted once per generated copy: (copy_group_id, template_group_id).
+    # SweepDialog sweeps a bare component with no group, so both IDs are "".
+    # The signal is declared for interface uniformity with the group dialogs.
+    sweep_copy_placed = pyqtSignal(str, str)
 
     def __init__(self, comp: GDSComponent, design: DesignScene,
                  cmd_stack, parent=None) -> None:
@@ -417,6 +422,10 @@ class GroupSweepDialog(QDialog):
     parameter picker offers width / height / path_width / layer.
     The swept field is applied with setattr on the clone.
     """
+
+    # Emitted once per generated copy after its group is committed to the design:
+    # (copy_group_id, template_group_id)
+    sweep_copy_placed = pyqtSignal(str, str)
 
     def __init__(self, group: ComponentGroup, design: DesignScene,
                  scene, parent=None) -> None:
@@ -875,6 +884,15 @@ class GroupSweepDialog(QDialog):
         target_member_ids: set = set(target_sg["member_ids"])
 
         all_cmds = []
+        # Connections to re-stitch after execute() using port names.
+        # In cell mode the target cell gets fresh port IDs from place_cell();
+        # non-target clones keep deepcopied port IDs — but we unify both
+        # via name lookup so either case works correctly.
+        pending_conns_cell: list[tuple[str, str | None, str, str | None]] = []
+        # port-name lookup for the original members (built once, outside loop)
+        orig_member_port_names: dict[str, dict[str, str]] = {}
+        for m in self._members:
+            orig_member_port_names[m.id] = {pt.id: pt.name for pt in m.ports}
 
         for row_i in range(rows):
             for col_i in range(cols):
@@ -931,16 +949,24 @@ class GroupSweepDialog(QDialog):
                 # ── Build components for this slot ────────────────────────────
                 slot_comp_ids: list[str] = []
                 new_cell_subgroups: list[dict] = []
+                slot_id_map: dict[str, str] = {}  # old comp_id → new comp_id
 
                 for sg_i, sg in enumerate(self._cell_subgroups):
                     if sg_i == sg_idx:
                         # Rebuild the target cell at the swept value.
-                        # Origin = cell's own scene position + slot offset,
-                        # NOT the group bbox corner (which caused the cell to
-                        # snap to the top-left of the group bounding box).
-                        origin = Point(tgt_ox + dx, tgt_oy + dy)
+                        #
+                        # Build axis-aligned at (0,0) first, then apply the
+                        # stored rotation (if any), then translate so the
+                        # rotated structural bbox centre lands at the same
+                        # relative offset from the group origin as the original.
+                        #
+                        # This mirrors exactly what ReplaceCellCmd.execute()
+                        # does for single-step param edits, ensuring that the
+                        # swept copies preserve the cell's orientation and stay
+                        # spatially aligned with the rest of the group.
+                        rotation_steps = sg.get("cell_rotation_steps", 0)
                         try:
-                            result = place_cell(sg["cell_id"], origin,
+                            result = place_cell(sg["cell_id"], Point(0, 0),
                                                 params=params_for_slot)
                         except (KeyError, ValueError) as exc:
                             QMessageBox.warning(
@@ -948,25 +974,83 @@ class GroupSweepDialog(QDialog):
                                 f"Slot [{row_i},{col_i}]: {exc}"
                             )
                             return
-                        for comp in result.components:
+
+                        # Apply rotation around the new cell's own structural
+                        # bbox centre (exclude undercut flanks from pivot so
+                        # toggling narrow_undercut doesn't shift the rotation
+                        # centre, matching ReplaceCellCmd behaviour).
+                        if rotation_steps:
+                            from core.commands import _rotate_component_in_place
+                            _rot_struct = [c for c in result.components
+                                           if not getattr(c, "is_undercut", False)]
+                            _rot_src = _rot_struct if _rot_struct else result.components
+                            if _rot_src:
+                                own_cx = (min(c.bbox.x_min for c in _rot_src) +
+                                          max(c.bbox.x_max for c in _rot_src)) // 2
+                                own_cy = (min(c.bbox.y_min for c in _rot_src) +
+                                          max(c.bbox.y_max for c in _rot_src)) // 2
+                                for comp in result.components:
+                                    _rotate_component_in_place(comp, own_cx, own_cy,
+                                                               rotation_steps)
+
+                        # Translate so the (rotated) structural bbox centre
+                        # lands at tgt_ox + dx, tgt_oy + dy — the target
+                        # subgroup's scene position plus the slot offset.
+                        # Both sides use the structural-only bbox so undercut
+                        # flanks don't skew the alignment.
+                        _new_struct = [c for c in result.components
+                                       if not getattr(c, "is_undercut", False)]
+                        _new_src = _new_struct if _new_struct else result.components
+                        if _new_src:
+                            new_cx = (min(c.bbox.x_min for c in _new_src) +
+                                      max(c.bbox.x_max for c in _new_src)) // 2
+                            new_cy = (min(c.bbox.y_min for c in _new_src) +
+                                      max(c.bbox.y_max for c in _new_src)) // 2
+                            # Target subgroup's original structural bbox centre
+                            _tgt_struct = [c for c in target_sg_comps
+                                           if not getattr(c, "is_undercut", False)]
+                            _tgt_src = _tgt_struct if _tgt_struct else target_sg_comps
+                            if _tgt_src:
+                                tgt_cx = (min(c.bbox.x_min for c in _tgt_src) +
+                                          max(c.bbox.x_max for c in _tgt_src)) // 2
+                                tgt_cy = (min(c.bbox.y_min for c in _tgt_src) +
+                                          max(c.bbox.y_max for c in _tgt_src)) // 2
+                            else:
+                                tgt_cx, tgt_cy = tgt_ox, tgt_oy
+                            tdx = (tgt_cx + dx) - new_cx
+                            tdy = (tgt_cy + dy) - new_cy
+                            if tdx or tdy:
+                                for comp in result.components:
+                                    comp.move_by(tdx, tdy)
+
+                        for orig_cid, comp in zip(sg["member_ids"], result.components):
                             all_cmds.append(AddComponent(comp))
                             slot_comp_ids.append(comp.id)
+                            slot_id_map[orig_cid] = comp.id
                         new_cell_subgroups.append({
-                            "name":       result.group_name,
-                            "cell_id":    sg["cell_id"],
-                            "cell_params": dict(params_for_slot),
-                            "member_ids": [c.id for c in result.components],
+                            "name":                result.group_name,
+                            "cell_id":             sg["cell_id"],
+                            "cell_params":         dict(params_for_slot),
+                            "cell_rotation_steps": rotation_steps,
+                            "member_ids":          [c.id for c in result.components],
                         })
                     else:
-                        # Deep-copy the other cell's members, translated
+                        # Deep-copy the other cell's members, translated by
+                        # the slot offset (dx, dy) which is relative to grp_ox/oy.
+                        # The copy is translated by (dx, dy) in world space so
+                        # that every non-target sub-group moves by exactly the
+                        # same vector as the group's top-left corner — keeping
+                        # the internal layout intact relative to the target cell.
                         new_member_ids: list[str] = []
                         for cid in sg["member_ids"]:
                             orig_comp = self._design.get(cid)
                             if orig_comp is None:
                                 continue
                             clone = copy.deepcopy(orig_comp)
+                            old_id = clone.id
                             clone.id = uuid.uuid4().hex[:8]
-                            clone.ports = []
+                            # Keep ports from deepcopy — port IDs are stable on
+                            # the clone so connections can be remapped via id_map.
                             clone.origin = Point(orig_comp.origin.x + dx,
                                                  orig_comp.origin.y + dy)
                             if clone.points:
@@ -977,11 +1061,13 @@ class GroupSweepDialog(QDialog):
                             all_cmds.append(AddComponent(clone))
                             slot_comp_ids.append(clone.id)
                             new_member_ids.append(clone.id)
+                            slot_id_map[old_id] = clone.id
                         new_cell_subgroups.append({
-                            "name":       sg["name"],
-                            "cell_id":    sg["cell_id"],
-                            "cell_params": dict(sg["cell_params"]),
-                            "member_ids": new_member_ids,
+                            "name":                sg["name"],
+                            "cell_id":             sg["cell_id"],
+                            "cell_params":         dict(sg["cell_params"]),
+                            "cell_rotation_steps": sg.get("cell_rotation_steps", 0),
+                            "member_ids":          new_member_ids,
                         })
 
                 # ── Create merged group for this slot, preserving sub-group info
@@ -990,6 +1076,21 @@ class GroupSweepDialog(QDialog):
                 # Attach cell subgroup metadata so the copy is itself sweep-able
                 gc._group._cell_subgroups = new_cell_subgroups
                 all_cmds.append(gc)
+
+                # ── Record internal connections to remap after execute ─────────
+                # slot_id_map: original comp_id → clone comp_id.
+                # Port IDs on the target cell's components are fresh (place_cell
+                # generates them); port IDs on non-target deepcopies match the
+                # originals.  Unify both cases by keying on port name so we
+                # always resolve to the live port ID after execute() runs.
+                for cn in self._design.connections:
+                    if cn.comp_a in slot_id_map and cn.comp_b in slot_id_map:
+                        pending_conns_cell.append((
+                            slot_id_map[cn.comp_a],
+                            orig_member_port_names.get(cn.comp_a, {}).get(cn.port_a),
+                            slot_id_map[cn.comp_b],
+                            orig_member_port_names.get(cn.comp_b, {}).get(cn.port_b),
+                        ))
 
         if not all_cmds:
             self.accept()
@@ -1010,6 +1111,21 @@ class GroupSweepDialog(QDialog):
                 f"[{start:.3g}…{start + (total - 1) * step:.3g}] µm",
             )
         )
+
+        # ── Remap connections using live port IDs (post-execute) ───────────────
+        # Now that all AddComponent commands have run, every clone has its
+        # final ports.  Look up port IDs by name so target-cell components
+        # (fresh IDs from place_cell) and deepcopied non-target components
+        # (same IDs as originals) are both handled correctly.
+        for new_a, pname_a, new_b, pname_b in pending_conns_cell:
+            comp_a = self._design.get(new_a)
+            comp_b = self._design.get(new_b)
+            if comp_a is None or comp_b is None:
+                continue
+            port_a = next((pt for pt in comp_a.ports if pt.name == pname_a), None)
+            port_b = next((pt for pt in comp_b.ports if pt.name == pname_b), None)
+            if port_a and port_b:
+                self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
         # If the source group had its undercut ring enabled (i.e. not excluded),
         # un-exclude every newly generated group so their rings follow suit.
@@ -1051,6 +1167,11 @@ class GroupSweepDialog(QDialog):
         orig_target_val = getattr(target_comp, p.key, 0) or 0
 
         all_cmds = []
+        orig_connections = list(self._design.connections)
+
+        # Connections to re-stitch after execute(), keyed by port name so
+        # they survive the port-ID rebuild on the swept target clone.
+        pending_conns: list[tuple[str, str | None, str, str | None]] = []
 
         for row_i in range(rows):
             for col_i in range(cols):
@@ -1078,10 +1199,16 @@ class GroupSweepDialog(QDialog):
                     dy += max(row_hs) + gap
 
                 id_map: dict[str, str] = {}
+                # Build a port-name lookup per original member so we can
+                # re-stitch connections by name after execute() (port IDs on
+                # swept clones change when build_default_ports() runs).
+                orig_port_names: dict[str, dict[str, str]] = {}  # comp_id → {port_id: name}
+                for member in self._members:
+                    orig_port_names[member.id] = {p2.id: p2.name for p2 in member.ports}
+
                 for member in self._members:
                     clone       = copy.deepcopy(member)
                     clone.id    = uuid.uuid4().hex[:8]
-                    clone.ports = []
                     clone.origin = Point(member.origin.x + dx, member.origin.y + dy)
                     if clone.points:
                         clone.points = [
@@ -1089,6 +1216,10 @@ class GroupSweepDialog(QDialog):
                         ]
                     if member.id == target_cid:
                         setattr(clone, p.key, val_dbu)
+                        # Ports from the deepcopy reflect the old geometry;
+                        # clear them so AddComponent.execute() rebuilds them
+                        # against the new bounding box.
+                        clone.ports = []
                     id_map[member.id] = clone.id
                     all_cmds.append(AddComponent(clone))
 
@@ -1096,6 +1227,19 @@ class GroupSweepDialog(QDialog):
                 new_member_ids = [id_map[mid] for mid in self._group.member_ids
                                   if mid in id_map]
                 all_cmds.append(GroupComponents(new_member_ids, new_group_name))
+
+                # ── Record internal connections to remap after execute ─────────
+                # Store (orig_comp_a, port_name_a, orig_comp_b, port_name_b)
+                # so we can look up the new port IDs after the batch runs and
+                # the clones have live, geometry-correct ports.
+                for cn in orig_connections:
+                    if cn.comp_a in id_map and cn.comp_b in id_map:
+                        pending_conns.append((
+                            id_map[cn.comp_a],
+                            orig_port_names.get(cn.comp_a, {}).get(cn.port_a),
+                            id_map[cn.comp_b],
+                            orig_port_names.get(cn.comp_b, {}).get(cn.port_b),
+                        ))
 
         if not all_cmds:
             self.accept()
@@ -1110,6 +1254,20 @@ class GroupSweepDialog(QDialog):
                 f"Group array {cols}×{rows}  sweep {p.label} on {target_cid}",
             )
         )
+
+        # ── Remap connections using live port IDs (post-execute) ───────────────
+        # Now that AddComponent has run, each cloned component has its final
+        # ports (rebuilt from the new geometry for the swept target).  Look up
+        # port IDs by name so both swept and unchanged clones are handled.
+        for new_a, pname_a, new_b, pname_b in pending_conns:
+            comp_a = self._design.get(new_a)
+            comp_b = self._design.get(new_b)
+            if comp_a is None or comp_b is None:
+                continue
+            port_a = next((pt for pt in comp_a.ports if pt.name == pname_a), None)
+            port_b = next((pt for pt in comp_b.ports if pt.name == pname_b), None)
+            if port_a and port_b:
+                self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
         # Mirror source group's undercut-ring enabled state onto generated copies.
         overlay = getattr(self._scene, "_undercut", None)
@@ -1155,6 +1313,10 @@ class CellSweepDialog(QDialog):
     _TEXT   = "#e2e8f0"
     _MUTED  = "#94a3b8"
     _ACCENT = "#38bdf8"
+
+    # Emitted once per generated copy after its group is committed to the design:
+    # (copy_group_id, template_group_id)
+    sweep_copy_placed = pyqtSignal(str, str)
 
     def __init__(self, group, design, scene, parent=None) -> None:
         super().__init__(parent)

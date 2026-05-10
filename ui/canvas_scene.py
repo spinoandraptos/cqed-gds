@@ -1703,7 +1703,14 @@ class CanvasScene(QGraphicsScene):
             return
 
         cb = Clipboard.instance()
-        cb.copy(components, group)
+        # Collect all connections that are fully internal to the copied set so
+        # they can be remapped and restored on paste.
+        comp_ids = {c.id for c in components}
+        intra_connections = [
+            cn for cn in self._design.connections
+            if cn.comp_a in comp_ids and cn.comp_b in comp_ids
+        ]
+        cb.copy(components, group, intra_connections)
         cb.reset_paste_count()
 
     def paste(self) -> None:
@@ -1723,11 +1730,11 @@ class CanvasScene(QGraphicsScene):
             sp = self.views()[0].mapToScene(vr.center())
         target_center = (int(sp.x()), int(sp.y()))
 
-        components, group = cb.paste(
+        components, group, connections = cb.paste(
             base_offset_dbu=PASTE_OFFSET_DBU,
             target_center=target_center,
         )
-        self.cmd_stack.execute(PasteComponents(components, group))
+        self.cmd_stack.execute(PasteComponents(components, group, connections))
 
         self.clearSelection()
         for comp in components:

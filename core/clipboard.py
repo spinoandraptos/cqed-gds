@@ -22,7 +22,7 @@ import copy
 import uuid
 from typing import Optional
 
-from core.model import GDSComponent, ComponentGroup
+from core.model import GDSComponent, ComponentGroup, Connection
 
 
 class Clipboard:
@@ -38,9 +38,10 @@ class Clipboard:
     _instance: Optional["Clipboard"] = None
 
     def __init__(self) -> None:
-        self._entries: list[GDSComponent]       = []
+        self._entries: list[GDSComponent]            = []
         self._group_template: Optional[ComponentGroup] = None
-        self._paste_count: int                  = 0
+        self._connections: list[Connection]          = []
+        self._paste_count: int                       = 0
 
     @classmethod
     def instance(cls) -> "Clipboard":
@@ -51,14 +52,17 @@ class Clipboard:
     # ── Write ─────────────────────────────────────────────────────────────────
 
     def copy(self, components: list[GDSComponent],
-             group: Optional[ComponentGroup] = None) -> None:
+             group: Optional[ComponentGroup] = None,
+             connections: Optional[list[Connection]] = None) -> None:
         """
-        Snapshot components (and optionally their group) into the clipboard.
+        Snapshot components (and optionally their group and intra-group
+        connections) into the clipboard.
         Deep-copies everything so later edits to originals are safe.
         Resets the paste-offset counter so the first paste lands at +1 offset.
         """
         self._entries        = [copy.deepcopy(c) for c in components]
         self._group_template = copy.deepcopy(group)
+        self._connections    = [copy.deepcopy(cn) for cn in (connections or [])]
         self._paste_count    = 0
 
     @property
@@ -87,14 +91,18 @@ class Clipboard:
         Increments internal paste_count — call reset_paste_count() whenever
         the user does something other than paste (move, new copy, etc.).
 
-        Returns (components, group).  group is None if no group was copied.
+        Returns (components, group, connections).
+        group is None if no group was copied.
+        connections contains intra-group bonds with all IDs remapped to the
+        new component/port IDs — ready to pass straight to design.connect().
         """
         if self.is_empty:
-            return [], None
+            return [], None, []
 
         self._paste_count += 1
 
-        id_map: dict[str, str] = {}   # old_id → new_id
+        id_map: dict[str, str] = {}   # old_comp_id → new_comp_id
+        port_map: dict[str, str] = {} # old_port_id  → new_port_id
         pasted: list[GDSComponent] = []
 
         if target_center is not None:
@@ -119,7 +127,9 @@ class Clipboard:
             comp.move_by(base_dx, base_dy)
             # Regenerate port IDs so pasted ports never alias originals
             for port in comp.ports:
+                old_pid = port.id
                 port.id = uuid.uuid4().hex[:6]
+                port_map[old_pid] = port.id
             pasted.append(comp)
 
         new_group: Optional[ComponentGroup] = None
@@ -138,7 +148,28 @@ class Clipboard:
                     sg["member_ids"] = [id_map.get(oid, oid)
                                         for oid in sg["member_ids"]]
 
-        return pasted, new_group
+        # Remap intra-group connections: both component IDs and port IDs have
+        # been regenerated above, so every endpoint must be translated via the
+        # two maps built during the component loop.  Connections that reference
+        # an ID not present in the maps (cross-boundary, external) are dropped —
+        # they can't be meaningfully reconstructed for independent pasted objects.
+        pasted_comp_ids = set(id_map.values())
+        new_connections: list[Connection] = []
+        for cn in self._connections:
+            new_ca = id_map.get(cn.comp_a)
+            new_cb = id_map.get(cn.comp_b)
+            # Only restore connections that are fully internal to the pasted set.
+            if new_ca not in pasted_comp_ids or new_cb not in pasted_comp_ids:
+                continue
+            new_pa = port_map.get(cn.port_a)
+            new_pb = port_map.get(cn.port_b)
+            if new_ca and new_cb and new_pa and new_pb:
+                new_connections.append(Connection(
+                    comp_a=new_ca, port_a=new_pa,
+                    comp_b=new_cb, port_b=new_pb,
+                ))
+
+        return pasted, new_group, new_connections
 
     def reset_paste_count(self) -> None:
         """

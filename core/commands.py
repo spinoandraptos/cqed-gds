@@ -841,8 +841,8 @@ class PasteComponents(Command):
     as a single, fully undoable action.
 
     Mirrors PlaceCellCommand in structure:
-      execute : add all components → add group (if any)
-      undo    : remove group → remove all components (reverse order)
+      execute : add all components → add group (if any) → restore connections
+      undo    : remove connections → remove group → remove all components (reverse order)
 
     Port auto-generation is skipped for components that already have ports
     (they were deep-copied from real shapes that had ports built previously).
@@ -850,9 +850,14 @@ class PasteComponents(Command):
     """
 
     def __init__(self, components: list["GDSComponent"],
-                 group: Optional["ComponentGroup"] = None) -> None:
-        self._components = components
-        self._group      = group
+                 group: Optional["ComponentGroup"] = None,
+                 connections: Optional[list["Connection"]] = None) -> None:
+        self._components   = components
+        self._group        = group
+        self._connections  = connections or []
+        # Connection IDs are assigned by design.connect(); store them here so
+        # undo can call design.disconnect() by ID rather than re-searching.
+        self._conn_ids: list[str] = []
 
     def execute(self, design: DesignScene) -> None:
         for comp in self._components:
@@ -864,8 +869,18 @@ class PasteComponents(Command):
             # _cell_subgroups) automatically from the Clipboard snapshot;
             # no extra work needed here.
             design.add_group(self._group)
+        # Restore intra-group connections using the remapped IDs produced by
+        # Clipboard.paste().  design.connect() is idempotent so this is
+        # safe even if redo somehow runs twice.
+        self._conn_ids = []
+        for cn in self._connections:
+            conn = design.connect(cn.comp_a, cn.port_a, cn.comp_b, cn.port_b)
+            self._conn_ids.append(conn.id)
 
     def undo(self, design: DesignScene) -> None:
+        for conn_id in self._conn_ids:
+            design.disconnect(conn_id)
+        self._conn_ids = []
         if self._group is not None:
             design.remove_group(self._group.id)
         for comp in reversed(self._components):
