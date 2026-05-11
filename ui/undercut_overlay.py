@@ -445,6 +445,11 @@ class UndercutOverlay:
         # Cleared / restored whenever the overlay is disabled or a group is removed.
         self._absorbed_ids: Set[str] = set()
 
+        # group_id → (x_min, y_min) in DBU — the bbox origin recorded the last
+        # time masks were applied for that group.  Used to detect group moves so
+        # stored mask paths can be translated to follow the group.
+        self._group_origins: Dict[str, tuple] = {}
+
         # scene_changed covers all model mutations (add/remove/move/resize).
         # selectionChanged is intentionally NOT connected — rings are persistent.
         scene_ref.scene_changed.connect(self._on_scene_changed)
@@ -489,6 +494,16 @@ class UndercutOverlay:
         The ring is immediately redrawn if the overlay is currently enabled.
         """
         self._masks.setdefault(obj_id, []).append(mask_path)
+        # Record the group's current bbox origin the first time a mask is added
+        # so that future moves can be detected and masks translated accordingly.
+        if obj_id not in self._group_origins:
+            design = self._scene._design
+            group = design.get_group(obj_id)
+            if group is not None:
+                members = self._resolve_group_members(group)
+                if members:
+                    bb = group.bbox_from(members)
+                    self._group_origins[obj_id] = (bb.x_min, bb.y_min)
         if self._enabled:
             self._rebuild_one(obj_id)
 
@@ -546,6 +561,21 @@ class UndercutOverlay:
         for mask in masks:
             result = result.subtracted(mask)
         return result
+
+    def _translate_masks(self, obj_id: str, dx: int, dy: int) -> None:
+        """
+        Shift every stored mask path for *obj_id* by (dx, dy) DBU in-place.
+
+        Called when a group moves so that erase regions follow the geometry
+        they were painted on, preventing the full default ring from reappearing
+        after a drag.
+        """
+        masks = self._masks.get(obj_id)
+        if not masks:
+            return
+        from PyQt6.QtGui import QTransform
+        t = QTransform.fromTranslate(float(dx), float(dy))
+        self._masks[obj_id] = [t.map(m) for m in masks]
 
     def _rebuild_one(self, obj_id: str) -> None:
         """Rebuild the ring for a single comp or group id (used after mask changes)."""
@@ -784,6 +814,22 @@ class UndercutOverlay:
         # Narrow-undercut flanks are non-erasable: they are explicitly placed
         # geometry and must always appear in full even if the user previously
         # painted an erase mask over that area of the group ring.
+        #
+        # Before applying masks, check whether the group has moved since the
+        # masks were last recorded.  If so, translate every stored mask path by
+        # the same delta so the erase regions follow the geometry.  Without this
+        # correction the masks land at their original scene position after a
+        # drag, miss the newly-positioned ring entirely, and the full default
+        # ring reappears.
+        if group.id in self._masks:
+            current_bbox = group.bbox_from(self._resolve_group_members(group))
+            cur_origin = (current_bbox.x_min, current_bbox.y_min)
+            prev_origin = self._group_origins.get(group.id)
+            if prev_origin is not None and prev_origin != cur_origin:
+                dx = cur_origin[0] - prev_origin[0]
+                dy = cur_origin[1] - prev_origin[1]
+                self._translate_masks(group.id, dx, dy)
+            self._group_origins[group.id] = cur_origin
         masked = self._apply_masks(group.id, raw)
         for flank in l2_flanks:
             flank_path = _shape_path_for_comp(flank)
@@ -860,6 +906,7 @@ class UndercutOverlay:
             if item is not None:
                 item.setVisible(True)
         self._absorbed_ids.clear()
+        self._group_origins.clear()
 
     def _remove_stale_comp_rings(self, live_ids: Set[str]) -> None:
         """Remove rings for components no longer in *live_ids*."""
@@ -888,6 +935,9 @@ class UndercutOverlay:
                 if item is not None:
                     item.setVisible(True)
                 self._absorbed_ids.discard(cid)
+            # Discard the stored origin; if the group is re-added the origin
+            # will be re-seeded by the first add_mask call.
+            self._group_origins.pop(gid, None)
 
     # ── Signal handler ────────────────────────────────────────────────────────
 
