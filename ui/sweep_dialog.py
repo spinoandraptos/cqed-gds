@@ -1345,16 +1345,27 @@ class GroupSweepDialog(QDialog):
         target_member_ids: "set[str]",
     ) -> None:
         """
-        After a swept group copy has been committed to the design, check every
-        internal connection in the new group.  If the two connected ports are
-        not co-located (i.e. there is a spatial gap caused by the swept cell
-        having different dimensions), translate the non-target sub-group so its
-        port lands flush on the target sub-group's port.
+        After a swept group copy has been committed to the design, BFS-propagate
+        displacement through every internal connection in the new group so that
+        ALL sub-groups downstream of the swept target land flush — not just the
+        ones directly connected to it.
 
-        This mirrors the snap correction in _do_cell_param_change (main_window)
-        but operates entirely within a freshly created group copy, so it does
-        not need BFS propagation — there are no external neighbours to nudge;
-        the new group is isolated.
+        The original single-pass implementation only closed gaps on connections
+        that had exactly one target-side end.  In a chain  Target → B → C  it
+        moved B flush on Target but left C at its original flat-offset position,
+        still gapped from B's new location.
+
+        The BFS fix:
+          1. Seed the queue with every non-target sub-group that has a direct
+             connection to the target, computing (dx, dy) from the gap between
+             the two connected ports (fixed − moveable).
+          2. For each dequeued sub-group: move the entire rigid sub-group by
+             (dx, dy), snapshot pre-move port positions, then enqueue downstream
+             neighbours with per-port deltas (same technique used in
+             _restore_connections_and_nudge in main_window.py).
+          3. Only consider connections that stay inside all_member_ids — the new
+             group is fully isolated so there are no external neighbours to worry
+             about; the BFS terminates naturally.
 
         Parameters
         ----------
@@ -1362,41 +1373,51 @@ class GroupSweepDialog(QDialog):
             The GroupComponents command for this slot (already executed).
             Its ._group carries the new group's member_ids.
         target_member_ids : set[str]
-            The IDs of the rebuilt/swept target sub-group's components
-            inside this slot.  These are the "fixed" side — non-target
-            members are moved to meet them, not the other way around.
+            The IDs of the rebuilt/swept target sub-group's components.
+            These are "fixed" — non-target sub-groups are moved to meet them.
         """
         from core.commands import MoveComponent, BatchCommand
+        from collections import deque
 
         new_group = getattr(gc_cmd, "_group", None)
         if new_group is None:
             return
 
         all_member_ids: set[str] = set(new_group.member_ids)
+        cell_subgroups = getattr(new_group, "_cell_subgroups", [])
 
-        # For each internal connection, if one side is in target_member_ids
-        # and the other is not, compute the gap and snap the non-target side.
-        # Track which non-target comp IDs we've already moved so we never
-        # shift the same component twice (the first connection fixes it).
-        moved: set[str] = set()
-        snap_cmds = []
+        # Helper: given a comp ID, return the full set of IDs in its sub-group
+        # (so rigid companions like undercut flanks move with the anchor).
+        def _subgroup_ids_for(cid: str) -> set[str]:
+            for sg in cell_subgroups:
+                if cid in sg.get("member_ids", []):
+                    return set(sg["member_ids"])
+            return {cid}
 
+        snap_cmds: list = []
+        # visited is seeded with the target so it is never moved.
+        visited: set[str] = set(target_member_ids)
+
+        # BFS queue: (comp_id_to_move, snap_dx, snap_dy)
+        # dx/dy are the displacement required to bring the comp's connecting
+        # port flush with the port it is wired to.
+        queue: deque[tuple[str, int, int]] = deque()
+
+        # ── Seed: scan direct connections from target to non-target members ──
         for cn in self._design.connections:
-            # Only internal connections within this new group.
             if cn.comp_a not in all_member_ids or cn.comp_b not in all_member_ids:
-                continue
+                continue  # not an internal connection
 
-            # Identify which end is "target" (fixed) and which is "non-target" (moveable).
             if cn.comp_a in target_member_ids and cn.comp_b not in target_member_ids:
-                fixed_cid,    fixed_pid    = cn.comp_a, cn.port_a
+                fixed_cid, fixed_pid     = cn.comp_a, cn.port_a
                 moveable_cid, moveable_pid = cn.comp_b, cn.port_b
             elif cn.comp_b in target_member_ids and cn.comp_a not in target_member_ids:
-                fixed_cid,    fixed_pid    = cn.comp_b, cn.port_b
+                fixed_cid, fixed_pid     = cn.comp_b, cn.port_b
                 moveable_cid, moveable_pid = cn.comp_a, cn.port_a
             else:
-                continue  # both sides same type — nothing to snap
+                continue  # both target or both non-target — skip
 
-            if moveable_cid in moved:
+            if moveable_cid in visited:
                 continue
 
             fixed_comp    = self._design.get(fixed_cid)
@@ -1412,29 +1433,42 @@ class GroupSweepDialog(QDialog):
             fixed_abs    = fixed_port.abs_pos(fixed_comp.origin)
             moveable_abs = moveable_port.abs_pos(moveable_comp.origin)
 
-            snap_dx = fixed_abs.x - moveable_abs.x
-            snap_dy = fixed_abs.y - moveable_abs.y
-            if snap_dx == 0 and snap_dy == 0:
-                continue  # already flush
+            dx = fixed_abs.x - moveable_abs.x
+            dy = fixed_abs.y - moveable_abs.y
+            if dx == 0 and dy == 0:
+                visited.update(_subgroup_ids_for(moveable_cid))
+                continue  # already flush — still mark visited to block re-entry
 
-            # Find all companions in the same sub-group as moveable_cid so
-            # they move as a rigid unit (e.g. undercut flanks with no ports).
-            cell_subgroups = getattr(new_group, "_cell_subgroups", [])
-            subgroup_ids: set[str] = {moveable_cid}
-            for sg in cell_subgroups:
-                if moveable_cid in sg.get("member_ids", []):
-                    subgroup_ids = set(sg["member_ids"])
-                    break
+            queue.append((moveable_cid, dx, dy))
 
-            for sid in subgroup_ids:
-                if sid in moved:
+        # ── BFS ───────────────────────────────────────────────────────────────
+        while queue:
+            cid, dx, dy = queue.popleft()
+            if cid in visited:
+                continue
+
+            # Move the entire rigid sub-group that owns cid.
+            sg_ids = _subgroup_ids_for(cid)
+
+            # Snapshot pre-move port positions for per-port downstream delta.
+            pre_abs: dict[tuple[str, str], tuple[int, int]] = {}
+            for sid in sg_ids:
+                m = self._design.get(sid)
+                if m is None:
                     continue
-                moved.add(sid)
+                for p in m.ports:
+                    ap = p.abs_pos(m.origin)
+                    pre_abs[(sid, p.id)] = (ap.x, ap.y)
+
+            for sid in sg_ids:
+                if sid in visited:
+                    continue
+                visited.add(sid)
                 sc = self._design.get(sid)
                 if sc is None:
                     continue
                 old_orig = sc.origin
-                new_orig = Point(old_orig.x + snap_dx, old_orig.y + snap_dy)
+                new_orig = Point(old_orig.x + dx, old_orig.y + dy)
                 mc = MoveComponent(sid, old_orig, new_orig)
                 mc.execute(self._design)
                 snap_cmds.append(mc)
@@ -1442,9 +1476,33 @@ class GroupSweepDialog(QDialog):
                 if s_item:
                     s_item.sync_from_model()
 
+            # Enqueue downstream neighbours using per-port deltas.
+            for sid in sg_ids:
+                m = self._design.get(sid)
+                if m is None:
+                    continue
+                port_map = {p.id: p for p in m.ports}
+                for cn in self._design.connections_for(sid):
+                    # Only propagate within the group.
+                    nxt = cn.comp_b if cn.comp_a == sid else cn.comp_a
+                    if nxt not in all_member_ids or nxt in visited:
+                        continue
+                    our_port_id = cn.port_a if cn.comp_a == sid else cn.port_b
+                    port = port_map.get(our_port_id)
+                    if port is None:
+                        continue
+                    old_x, old_y = pre_abs.get((sid, our_port_id), (None, None))
+                    if old_x is None:
+                        continue
+                    new_abs_p = port.abs_pos(m.origin)
+                    ndx = new_abs_p.x - old_x
+                    ndy = new_abs_p.y - old_y
+                    if ndx != 0 or ndy != 0:
+                        queue.append((nxt, ndx, ndy))
+
         if snap_cmds:
             self._cmd_stack.push(
-                BatchCommand(snap_cmds, "Snap swept group copy — flush internal ports")
+                BatchCommand(snap_cmds, "Snap swept group copy — flush internal ports (BFS)")
             )
 
 
