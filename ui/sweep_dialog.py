@@ -894,6 +894,83 @@ class GroupSweepDialog(QDialog):
         for m in self._members:
             orig_member_port_names[m.id] = {pt.id: pt.name for pt in m.ports}
 
+        # ── Narrow-width coupling map ─────────────────────────────────────────
+        # For each non-target sub-group that is a taper cell (taper_segment or
+        # smooth_taper_pad) connected on its "narrow" port to the target cell,
+        # record which param on the TARGET cell drives the taper's narrow_width,
+        # and which sub-group index is the taper.
+        #
+        # Built once from the original group's connections + sub-group metadata.
+        # Used inside the slot loop to update narrow_width before rebuilding the
+        # taper clone — replacing the deep-copy with a place_cell() call that
+        # uses the correct narrow_width for each swept value.
+        #
+        # Structure:  {taper_sg_idx: source_param_name}
+        #   taper_sg_idx    — index into self._cell_subgroups of the taper
+        #   source_param_name — param on the TARGET sg whose value should become
+        #                       the taper's narrow_width (e.g. "lead_width")
+        _TAPER_CELL_IDS = {"taper_segment", "smooth_taper_pad"}
+
+        # Build a comp_id → sg_idx map for fast lookup
+        _comp_to_sg_idx: dict[str, int] = {}
+        for _si, _sg in enumerate(self._cell_subgroups):
+            for _cid in _sg.get("member_ids", []):
+                _comp_to_sg_idx[_cid] = _si
+
+        # Identify which param name on the target sg expresses its wire width.
+        # We read this from the catalogue defaults — same logic as _width_from_params.
+        _TARGET_WIRE_PARAM: str | None = None
+        _tgt_cell_id = target_sg.get("cell_id", "")
+        if _tgt_cell_id == "manhattan_jj":
+            _TARGET_WIRE_PARAM = "lead_width"
+        elif _tgt_cell_id == "byisk_jj":
+            _TARGET_WIRE_PARAM = "wire_width"
+        elif _tgt_cell_id == "wire":
+            _TARGET_WIRE_PARAM = "width"
+        elif _tgt_cell_id in ("turn", "branch_segment", "t_junction"):
+            _TARGET_WIRE_PARAM = "taper_width"
+        elif _tgt_cell_id in _TAPER_CELL_IDS:
+            # If the swept cell is itself a taper, the swept key might be
+            # narrow_width — we propagate it directly; handled separately below.
+            _TARGET_WIRE_PARAM = key if key == "narrow_width" else "taper_width"
+
+        # Only build the coupling map if the swept parameter IS the wire-width
+        # param on the target (or a param that changes the width at its ports).
+        _narrow_width_couplings: dict[int, str] = {}  # taper_sg_idx → source_param
+        if _TARGET_WIRE_PARAM is not None and key == _TARGET_WIRE_PARAM:
+            # Walk every internal connection in the original group.
+            # For connections between a target member and a non-target taper's
+            # "narrow" port, record the coupling.
+            for _cn in self._design.connections:
+                # Must be internal to this group
+                if _cn.comp_a not in _comp_to_sg_idx or _cn.comp_b not in _comp_to_sg_idx:
+                    continue
+
+                # Identify target side vs taper side
+                if _cn.comp_a in target_member_ids and _cn.comp_b not in target_member_ids:
+                    _taper_cid, _taper_pid = _cn.comp_b, _cn.port_b
+                elif _cn.comp_b in target_member_ids and _cn.comp_a not in target_member_ids:
+                    _taper_cid, _taper_pid = _cn.comp_a, _cn.port_a
+                else:
+                    continue
+
+                _taper_sg_i = _comp_to_sg_idx.get(_taper_cid)
+                if _taper_sg_i is None:
+                    continue
+                _taper_sg_def = self._cell_subgroups[_taper_sg_i]
+                if _taper_sg_def.get("cell_id") not in _TAPER_CELL_IDS:
+                    continue
+
+                # Check the port name on the taper component
+                _taper_comp = self._design.get(_taper_cid)
+                if _taper_comp is None:
+                    continue
+                _taper_port = next((p for p in _taper_comp.ports if p.id == _taper_pid), None)
+                if _taper_port is None or _taper_port.name != "narrow":
+                    continue
+
+                _narrow_width_couplings[_taper_sg_i] = _TARGET_WIRE_PARAM
+
         for row_i in range(rows):
             for col_i in range(cols):
                 if row_i == 0 and col_i == 0:
@@ -1035,40 +1112,159 @@ class GroupSweepDialog(QDialog):
                             "member_ids":          [c.id for c in result.components],
                         })
                     else:
-                        # Deep-copy the other cell's members, translated by
-                        # the slot offset (dx, dy) which is relative to grp_ox/oy.
-                        # The copy is translated by (dx, dy) in world space so
-                        # that every non-target sub-group moves by exactly the
-                        # same vector as the group's top-left corner — keeping
-                        # the internal layout intact relative to the target cell.
-                        new_member_ids: list[str] = []
-                        for cid in sg["member_ids"]:
-                            orig_comp = self._design.get(cid)
-                            if orig_comp is None:
-                                continue
-                            clone = copy.deepcopy(orig_comp)
-                            old_id = clone.id
-                            clone.id = uuid.uuid4().hex[:8]
-                            # Keep ports from deepcopy — port IDs are stable on
-                            # the clone so connections can be remapped via id_map.
-                            clone.origin = Point(orig_comp.origin.x + dx,
-                                                 orig_comp.origin.y + dy)
-                            if clone.points:
-                                clone.points = [
-                                    Point(pt.x + dx, pt.y + dy)
-                                    for pt in clone.points
-                                ]
-                            all_cmds.append(AddComponent(clone))
-                            slot_comp_ids.append(clone.id)
-                            new_member_ids.append(clone.id)
-                            slot_id_map[old_id] = clone.id
-                        new_cell_subgroups.append({
-                            "name":                sg["name"],
-                            "cell_id":             sg["cell_id"],
-                            "cell_params":         dict(sg["cell_params"]),
-                            "cell_rotation_steps": sg.get("cell_rotation_steps", 0),
-                            "member_ids":          new_member_ids,
-                        })
+                        # Non-target sub-group.  Two cases:
+                        #
+                        # A) This sub-group is a taper coupled to the swept target
+                        #    (its narrow_width must track the target's wire width).
+                        #    → Rebuild via place_cell() with updated narrow_width,
+                        #      positioned at the same location as the original
+                        #      (plus slot offset), matching the rotation of the
+                        #      original sub-group.
+                        #
+                        # B) All other sub-groups: deep-copy + translate as before.
+                        if sg_i in _narrow_width_couplings:
+                            # ── Case A: rebuild with updated narrow_width ─────
+                            new_narrow_w = round(params_for_slot.get(
+                                _narrow_width_couplings[sg_i], 0.0), 3)
+                            coupled_params = dict(sg["cell_params"])
+                            coupled_params["narrow_width"] = new_narrow_w
+
+                            coupled_rotation = sg.get("cell_rotation_steps", 0)
+                            try:
+                                coupled_result = place_cell(
+                                    sg["cell_id"], Point(0, 0), params=coupled_params
+                                )
+                            except (KeyError, ValueError) as exc:
+                                QMessageBox.warning(
+                                    self, "Sweep",
+                                    f"Slot [{row_i},{col_i}] taper rebuild: {exc}"
+                                )
+                                return
+
+                            # Apply same rotation as original sub-group.
+                            if coupled_rotation:
+                                from core.commands import _rotate_component_in_place
+                                _cr_struct = [c for c in coupled_result.components
+                                              if not getattr(c, "is_undercut", False)]
+                                _cr_src = _cr_struct if _cr_struct else coupled_result.components
+                                if _cr_src:
+                                    _cr_cx = (min(c.bbox.x_min for c in _cr_src) +
+                                              max(c.bbox.x_max for c in _cr_src)) // 2
+                                    _cr_cy = (min(c.bbox.y_min for c in _cr_src) +
+                                              max(c.bbox.y_max for c in _cr_src)) // 2
+                                    for comp in coupled_result.components:
+                                        _rotate_component_in_place(comp, _cr_cx, _cr_cy,
+                                                                   coupled_rotation)
+
+                            # Anchor by the "wide" port so the wide-end neighbour
+                            # stays flush when narrow_width changes.
+                            #
+                            # Strategy:
+                            #   1. Find the "wide" port on the ORIGINAL first
+                            #      structural component of this sub-group.
+                            #   2. Find the matching "wide" port on the freshly
+                            #      built (and rotated) result.
+                            #   3. Translate the result so that port lands at the
+                            #      original's wide-port scene position + slot offset.
+                            #   4. Fall back to bbox-centre alignment if either
+                            #      port cannot be found (e.g. non-standard taper).
+                            orig_sg_comps = [self._design.get(cid)
+                                             for cid in sg["member_ids"]
+                                             if self._design.get(cid)]
+                            _orig_struct = [c for c in orig_sg_comps
+                                            if not getattr(c, "is_undercut", False)]
+                            _orig_src = _orig_struct if _orig_struct else orig_sg_comps
+
+                            _new_cr_struct = [c for c in coupled_result.components
+                                              if not getattr(c, "is_undercut", False)]
+                            _new_cr_src = (_new_cr_struct if _new_cr_struct
+                                           else coupled_result.components)
+
+                            if _orig_src and _new_cr_src:
+                                # Try to anchor by wide-port position.
+                                _orig_anchor_comp = _orig_src[0]
+                                _new_anchor_comp  = _new_cr_src[0]
+                                _orig_wide = next(
+                                    (p for p in _orig_anchor_comp.ports if p.name == "wide"),
+                                    None,
+                                )
+                                _new_wide = next(
+                                    (p for p in _new_anchor_comp.ports if p.name == "wide"),
+                                    None,
+                                )
+
+                                if _orig_wide is not None and _new_wide is not None:
+                                    # Anchor: keep the wide end pinned.
+                                    orig_wp = _orig_wide.abs_pos(_orig_anchor_comp.origin)
+                                    new_wp  = _new_wide.abs_pos(_new_anchor_comp.origin)
+                                    cr_tdx  = (orig_wp.x + dx) - new_wp.x
+                                    cr_tdy  = (orig_wp.y + dy) - new_wp.y
+                                else:
+                                    # Fallback: align by structural bbox centre.
+                                    orig_sg_cx = (min(c.bbox.x_min for c in _orig_src) +
+                                                  max(c.bbox.x_max for c in _orig_src)) // 2
+                                    orig_sg_cy = (min(c.bbox.y_min for c in _orig_src) +
+                                                  max(c.bbox.y_max for c in _orig_src)) // 2
+                                    new_cr_cx  = (min(c.bbox.x_min for c in _new_cr_src) +
+                                                  max(c.bbox.x_max for c in _new_cr_src)) // 2
+                                    new_cr_cy  = (min(c.bbox.y_min for c in _new_cr_src) +
+                                                  max(c.bbox.y_max for c in _new_cr_src)) // 2
+                                    cr_tdx = (orig_sg_cx + dx) - new_cr_cx
+                                    cr_tdy = (orig_sg_cy + dy) - new_cr_cy
+
+                                if cr_tdx or cr_tdy:
+                                    for comp in coupled_result.components:
+                                        comp.move_by(cr_tdx, cr_tdy)
+
+                            new_member_ids = []
+                            for orig_cid, comp in zip(sg["member_ids"],
+                                                       coupled_result.components):
+                                all_cmds.append(AddComponent(comp))
+                                slot_comp_ids.append(comp.id)
+                                new_member_ids.append(comp.id)
+                                slot_id_map[orig_cid] = comp.id
+                            new_cell_subgroups.append({
+                                "name":                coupled_result.group_name,
+                                "cell_id":             sg["cell_id"],
+                                "cell_params":         dict(coupled_params),
+                                "cell_rotation_steps": coupled_rotation,
+                                "member_ids":          [c.id for c in coupled_result.components],
+                            })
+
+                        else:
+                            # ── Case B: deep-copy + translate ─────────────────
+                            # The copy is translated by (dx, dy) in world space so
+                            # that every non-target sub-group moves by exactly the
+                            # same vector as the group's top-left corner — keeping
+                            # the internal layout intact relative to the target cell.
+                            new_member_ids = []
+                            for cid in sg["member_ids"]:
+                                orig_comp = self._design.get(cid)
+                                if orig_comp is None:
+                                    continue
+                                clone = copy.deepcopy(orig_comp)
+                                old_id = clone.id
+                                clone.id = uuid.uuid4().hex[:8]
+                                # Keep ports from deepcopy — port IDs are stable on
+                                # the clone so connections can be remapped via id_map.
+                                clone.origin = Point(orig_comp.origin.x + dx,
+                                                     orig_comp.origin.y + dy)
+                                if clone.points:
+                                    clone.points = [
+                                        Point(pt.x + dx, pt.y + dy)
+                                        for pt in clone.points
+                                    ]
+                                all_cmds.append(AddComponent(clone))
+                                slot_comp_ids.append(clone.id)
+                                new_member_ids.append(clone.id)
+                                slot_id_map[old_id] = clone.id
+                            new_cell_subgroups.append({
+                                "name":                sg["name"],
+                                "cell_id":             sg["cell_id"],
+                                "cell_params":         dict(sg["cell_params"]),
+                                "cell_rotation_steps": sg.get("cell_rotation_steps", 0),
+                                "member_ids":          new_member_ids,
+                            })
 
                 # ── Create merged group for this slot, preserving sub-group info
                 new_group_name = f"{self._group.name}_{linear_idx}"
@@ -1113,10 +1309,6 @@ class GroupSweepDialog(QDialog):
         )
 
         # ── Remap connections using live port IDs (post-execute) ───────────────
-        # Now that all AddComponent commands have run, every clone has its
-        # final ports.  Look up port IDs by name so target-cell components
-        # (fresh IDs from place_cell) and deepcopied non-target components
-        # (same IDs as originals) are both handled correctly.
         for new_a, pname_a, new_b, pname_b in pending_conns_cell:
             comp_a = self._design.get(new_a)
             comp_b = self._design.get(new_b)
@@ -1127,25 +1319,14 @@ class GroupSweepDialog(QDialog):
             if port_a and port_b:
                 self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
-        # ── Port-flush snap: close any gap created by the swept cell's changed
-        # dimensions.  The target sub-group is "fixed"; non-target sub-groups
-        # are translated so their ports land flush on the target's ports.
-        # We must run this AFTER connections are stitched above so the
-        # connection records are live and the snap loop can find them.
-        #
-        # Build per-slot target_member_ids from the new_cell_subgroups lists
-        # that were assembled inside the loop — reconstruct them from gc_cmds.
+        # ── BFS snap: close any intra-group port gaps caused by the swept cell's
+        # changed dimensions propagating down the chain.
         for gc in gc_cmds:
             new_grp = getattr(gc, "_group", None)
             if new_grp is None:
                 continue
-            # Identify the rebuilt target sub-group members inside this slot.
-            # new_grp._cell_subgroups[sg_idx] holds the slot's target entry.
             slot_sgs = getattr(new_grp, "_cell_subgroups", [])
-            if sg_idx < len(slot_sgs):
-                slot_target_ids = set(slot_sgs[sg_idx].get("member_ids", []))
-            else:
-                slot_target_ids = set()
+            slot_target_ids = set(slot_sgs[sg_idx].get("member_ids", [])) if sg_idx < len(slot_sgs) else set()
             self._snap_intragroup_connections(gc, slot_target_ids)
 
         # If the source group had its undercut ring enabled (i.e. not excluded),
@@ -1248,8 +1429,6 @@ class GroupSweepDialog(QDialog):
                 new_member_ids = [id_map[mid] for mid in self._group.member_ids
                                   if mid in id_map]
                 gc_raw = GroupComponents(new_member_ids, new_group_name)
-                # Annotate with the swept target's clone ID so _snap_intragroup_connections
-                # knows which side is "fixed" when computing port gaps.
                 gc_raw._snap_target_ids = {id_map[target_cid]} if target_cid in id_map else set()
                 all_cmds.append(gc_raw)
 
@@ -1281,9 +1460,6 @@ class GroupSweepDialog(QDialog):
         )
 
         # ── Remap connections using live port IDs (post-execute) ───────────────
-        # Now that AddComponent has run, each cloned component has its final
-        # ports (rebuilt from the new geometry for the swept target).  Look up
-        # port IDs by name so both swept and unchanged clones are handled.
         for new_a, pname_a, new_b, pname_b in pending_conns:
             comp_a = self._design.get(new_a)
             comp_b = self._design.get(new_b)
@@ -1294,36 +1470,8 @@ class GroupSweepDialog(QDialog):
             if port_a and port_b:
                 self._design.connect(new_a, port_a.id, new_b, port_b.id)
 
-        # ── Port-flush snap: close any intra-group gap caused by the swept
-        # target having different dimensions than the original.
-        # In raw mode we treat the swept target component as "fixed" and snap
-        # every other connected member flush onto it.
+        # ── BFS snap: propagate intra-group port gaps down the chain.
         for gc in gc_cmds_raw:
-            new_grp = getattr(gc, "_group", None)
-            if new_grp is None:
-                continue
-            # Identify the swept target clone inside this slot: find the
-            # _cell_subgroups entry whose original source was target_cid.
-            # In raw mode _cell_subgroups entries carry "name": "comp:<id>"
-            # (set by GroupComponents.__init__); the clone has a new ID so
-            # we match by checking which single-member sub-group maps to a
-            # member whose origin sits at (original_origin + dx, dy).
-            # Simpler: just use the id_map to identify the target clone ID
-            # from the last slot processed — but id_map is per-slot and
-            # we've lost the mapping.  Instead, rely on the fact that the
-            # target clone had its ports cleared and rebuilt from the new
-            # bbox, while all others kept deepcopied ports.  We can't detect
-            # that cheaply post-hoc, so we scan _cell_subgroups for a
-            # single-member entry where the member has no _no_auto_ports.
-            #
-            # Cleanest approach: collect the target clone IDs as we build them.
-            # Since we don't have them here, we fall back to a connection-driven
-            # approach: for each internal connection, one side has the rebuilt
-            # geometry (its port positions are correct) and the other may need
-            # moving.  _snap_intragroup_connections will compute the gap from
-            # actual port positions; passing an empty target_member_ids set
-            # means it can't determine directionality, so we pass the set of
-            # cloned target IDs collected during the loop via gc_cmd annotation.
             slot_target_ids: set[str] = getattr(gc, "_snap_target_ids", set())
             self._snap_intragroup_connections(gc, slot_target_ids)
 
@@ -1337,7 +1485,7 @@ class GroupSweepDialog(QDialog):
 
         self.accept()
 
-    # ── Intra-group port-flush snap (shared by both modes) ───────────────────
+    # ── Intra-group port-flush snap (BFS, shared by both modes) ─────────────
 
     def _snap_intragroup_connections(
         self,
@@ -1346,35 +1494,12 @@ class GroupSweepDialog(QDialog):
     ) -> None:
         """
         After a swept group copy has been committed to the design, BFS-propagate
-        displacement through every internal connection in the new group so that
-        ALL sub-groups downstream of the swept target land flush — not just the
-        ones directly connected to it.
+        displacement through every internal connection so ALL sub-groups downstream
+        of the swept target land flush — not just the ones directly connected to it.
 
-        The original single-pass implementation only closed gaps on connections
-        that had exactly one target-side end.  In a chain  Target → B → C  it
-        moved B flush on Target but left C at its original flat-offset position,
-        still gapped from B's new location.
-
-        The BFS fix:
-          1. Seed the queue with every non-target sub-group that has a direct
-             connection to the target, computing (dx, dy) from the gap between
-             the two connected ports (fixed − moveable).
-          2. For each dequeued sub-group: move the entire rigid sub-group by
-             (dx, dy), snapshot pre-move port positions, then enqueue downstream
-             neighbours with per-port deltas (same technique used in
-             _restore_connections_and_nudge in main_window.py).
-          3. Only consider connections that stay inside all_member_ids — the new
-             group is fully isolated so there are no external neighbours to worry
-             about; the BFS terminates naturally.
-
-        Parameters
-        ----------
-        gc_cmd : GroupComponents
-            The GroupComponents command for this slot (already executed).
-            Its ._group carries the new group's member_ids.
-        target_member_ids : set[str]
-            The IDs of the rebuilt/swept target sub-group's components.
-            These are "fixed" — non-target sub-groups are moved to meet them.
+        Seeded from target → non-target connections; propagates per-port deltas
+        (same technique as _restore_connections_and_nudge in main_window.py).
+        Bounded to all_member_ids so no external neighbours are touched.
         """
         from core.commands import MoveComponent, BatchCommand
         from collections import deque
@@ -1386,8 +1511,6 @@ class GroupSweepDialog(QDialog):
         all_member_ids: set[str] = set(new_group.member_ids)
         cell_subgroups = getattr(new_group, "_cell_subgroups", [])
 
-        # Helper: given a comp ID, return the full set of IDs in its sub-group
-        # (so rigid companions like undercut flanks move with the anchor).
         def _subgroup_ids_for(cid: str) -> set[str]:
             for sg in cell_subgroups:
                 if cid in sg.get("member_ids", []):
@@ -1395,62 +1518,46 @@ class GroupSweepDialog(QDialog):
             return {cid}
 
         snap_cmds: list = []
-        # visited is seeded with the target so it is never moved.
         visited: set[str] = set(target_member_ids)
-
-        # BFS queue: (comp_id_to_move, snap_dx, snap_dy)
-        # dx/dy are the displacement required to bring the comp's connecting
-        # port flush with the port it is wired to.
         queue: deque[tuple[str, int, int]] = deque()
 
-        # ── Seed: scan direct connections from target to non-target members ──
+        # Seed from direct target → non-target connections
         for cn in self._design.connections:
             if cn.comp_a not in all_member_ids or cn.comp_b not in all_member_ids:
-                continue  # not an internal connection
-
+                continue
             if cn.comp_a in target_member_ids and cn.comp_b not in target_member_ids:
-                fixed_cid, fixed_pid     = cn.comp_a, cn.port_a
+                fixed_cid, fixed_pid       = cn.comp_a, cn.port_a
                 moveable_cid, moveable_pid = cn.comp_b, cn.port_b
             elif cn.comp_b in target_member_ids and cn.comp_a not in target_member_ids:
-                fixed_cid, fixed_pid     = cn.comp_b, cn.port_b
+                fixed_cid, fixed_pid       = cn.comp_b, cn.port_b
                 moveable_cid, moveable_pid = cn.comp_a, cn.port_a
             else:
-                continue  # both target or both non-target — skip
-
+                continue
             if moveable_cid in visited:
                 continue
-
             fixed_comp    = self._design.get(fixed_cid)
             moveable_comp = self._design.get(moveable_cid)
             if fixed_comp is None or moveable_comp is None:
                 continue
-
             fixed_port    = next((p for p in fixed_comp.ports    if p.id == fixed_pid),    None)
             moveable_port = next((p for p in moveable_comp.ports if p.id == moveable_pid), None)
             if fixed_port is None or moveable_port is None:
                 continue
-
             fixed_abs    = fixed_port.abs_pos(fixed_comp.origin)
             moveable_abs = moveable_port.abs_pos(moveable_comp.origin)
-
             dx = fixed_abs.x - moveable_abs.x
             dy = fixed_abs.y - moveable_abs.y
             if dx == 0 and dy == 0:
                 visited.update(_subgroup_ids_for(moveable_cid))
-                continue  # already flush — still mark visited to block re-entry
-
+                continue
             queue.append((moveable_cid, dx, dy))
 
-        # ── BFS ───────────────────────────────────────────────────────────────
         while queue:
             cid, dx, dy = queue.popleft()
             if cid in visited:
                 continue
-
-            # Move the entire rigid sub-group that owns cid.
             sg_ids = _subgroup_ids_for(cid)
 
-            # Snapshot pre-move port positions for per-port downstream delta.
             pre_abs: dict[tuple[str, str], tuple[int, int]] = {}
             for sid in sg_ids:
                 m = self._design.get(sid)
@@ -1476,14 +1583,12 @@ class GroupSweepDialog(QDialog):
                 if s_item:
                     s_item.sync_from_model()
 
-            # Enqueue downstream neighbours using per-port deltas.
             for sid in sg_ids:
                 m = self._design.get(sid)
                 if m is None:
                     continue
                 port_map = {p.id: p for p in m.ports}
                 for cn in self._design.connections_for(sid):
-                    # Only propagate within the group.
                     nxt = cn.comp_b if cn.comp_a == sid else cn.comp_a
                     if nxt not in all_member_ids or nxt in visited:
                         continue

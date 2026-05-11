@@ -30,7 +30,7 @@ from core.commands import (
     MoveComponent, MoveGroup, RemoveComponent, RemoveGroup, ReplaceCellCmd,
     ReplaceSubgroupCellCmd, UngroupComponents,
 )
-from core.model import ComponentKind, DesignScene
+from core.model import ComponentKind, DesignScene, GDSComponent, Port
 from core.serialiser import SerialisationError, load, save, load_with_masks
 from ui.canvas_scene import CanvasScene, GroupItem, PlacementMode
 from ui.canvas_view import CanvasView
@@ -779,6 +779,14 @@ class MainWindow(QMainWindow):
                 self._scene.group_selected.emit(group_id)
 
             self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
+
+            # Propagate narrow_width to any taper connected on its narrow port
+            # to any member of the updated sub-group.
+            new_sg_ids = set(updated_sg_entry.get("member_ids", []))
+            self._update_taper_narrow_widths(
+                changed_comp_ids=new_sg_ids,
+                skip_group_ids={group_id},
+            )
             return
 
         # ── Case 1: single-cell group (original behaviour, fully preserved) ────
@@ -927,6 +935,231 @@ class MainWindow(QMainWindow):
             self._scene.cmd_stack.push(batch)
 
         self._flash_status(f"Updated {cdef.name}: {param_key} = {new_value}")
+
+        # ── Propagate narrow_width to any taper connected on its narrow port
+        # to any member of the rebuilt cell.  Skip the group we just rebuilt
+        # so we can't cycle back into ourselves.
+        new_group_member_ids_set = set(new_group.member_ids) if new_group else set()
+        self._update_taper_narrow_widths(
+            changed_comp_ids=new_group_member_ids_set,
+            skip_group_ids={group_id} if new_group is None else {new_group.id},
+        )
+
+    # ── Taper narrow-width propagation ───────────────────────────────────────
+
+    def _infer_wire_width_at_port(self, comp: "GDSComponent", port: "Port") -> float | None:
+        """
+        Return the wire width (µm) that *comp* presents on *port*'s face.
+
+        Strategy (in order):
+        1. If the component belongs to a parametric cell group, read directly
+           from the cell's stored params using the standard param-name mapping:
+             wire_width  (byisk_jj)
+             lead_width  (manhattan_jj, wire cell when named so)
+             width       (wire cell)
+             narrow_width on the "narrow" port / taper_width on the "wide" port
+               (taper_segment, smooth_taper_pad)
+             taper_width (turn, branch_segment)
+        2. Fallback: measure the bounding box of the component transverse to
+           the port's face direction.  Works for raw rectangles and polygons
+           with no cell metadata.
+
+        Returns None when the width cannot be determined.
+        """
+        from core.model import dbu_to_um
+        from core.cell_library import CELL_BY_ID
+
+        # ── Parametric cell path ───────────────────────────────────────────────
+        grp = self._design.group_of(comp.id)
+        if grp is not None:
+            cell_id = getattr(grp, "cell_id", None)
+
+            # For merged groups, find the sub-group that owns this component
+            # and use its cell_id / cell_params.
+            if cell_id is None:
+                for sg in getattr(grp, "_cell_subgroups", []):
+                    if comp.id in sg.get("member_ids", []):
+                        cell_id = sg.get("cell_id")
+                        if cell_id:
+                            params = dict(CELL_BY_ID[cell_id].defaults
+                                         if cell_id in CELL_BY_ID else {})
+                            params.update(sg.get("cell_params", {}))
+                            return self._width_from_params(cell_id, port.name, params)
+                        break
+            else:
+                params = dict(CELL_BY_ID[cell_id].defaults
+                              if cell_id in CELL_BY_ID else {})
+                params.update(getattr(grp, "_cell_params", {}))
+                return self._width_from_params(cell_id, port.name, params)
+
+        # ── Geometric fallback ─────────────────────────────────────────────────
+        # Measure the bbox dimension transverse to the port's facing direction.
+        from core.model import PortSide
+        bb = comp.bbox
+        if port.side in (PortSide.EAST, PortSide.WEST):
+            return dbu_to_um(bb.height)   # transverse = Y
+        else:
+            return dbu_to_um(bb.width)    # transverse = X
+
+    @staticmethod
+    def _width_from_params(cell_id: str, port_name: str, params: dict) -> float | None:
+        """
+        Map (cell_id, port_name, params) → wire width in µm.
+
+        Returns None when no mapping is known.
+        """
+        # Taper cells — port-name-dependent
+        if cell_id in ("taper_segment", "smooth_taper_pad"):
+            if port_name == "narrow":
+                return params.get("narrow_width")
+            if port_name == "wide":
+                return params.get("taper_width") or params.get("pad_width")
+
+        # Turn / branch / t_junction — uniform width
+        if cell_id in ("turn", "branch_segment", "t_junction"):
+            return params.get("taper_width")
+
+        # Wire cell
+        if cell_id == "wire":
+            return params.get("width")
+
+        # byisk_jj
+        if cell_id == "byisk_jj":
+            return params.get("wire_width")
+
+        # manhattan_jj
+        if cell_id == "manhattan_jj":
+            return params.get("lead_width")
+
+        return None
+
+    def _update_taper_narrow_widths(
+        self,
+        changed_comp_ids: "set[str]",
+        skip_group_ids:   "set[str]",
+    ) -> None:
+        """
+        After a geometry or param change on *changed_comp_ids*, inspect every
+        connection touching those components.  For each connection where:
+          • one end belongs to *changed_comp_ids*, AND
+          • the other end is a taper cell (taper_segment / smooth_taper_pad)
+            whose port name is "narrow",
+        infer the wire width presented by the changed side and, if it differs
+        from the taper's current narrow_width, fire a param update to rebuild
+        the taper with the matching width.
+
+        *skip_group_ids* prevents the update from cycling back to the cell
+        that just changed.  The set is extended here as each taper is rebuilt,
+        so cascading chains (A → taper → B) terminate correctly.
+        """
+        from core.cell_library import CELL_BY_ID
+
+        # Cells that have a "narrow_width" param addressable as "narrow_width"
+        _TAPER_CELL_IDS = {"taper_segment", "smooth_taper_pad"}
+
+        # Work on a copy so we can extend skip_group_ids safely during iteration.
+        skip = set(skip_group_ids)
+
+        for src_comp_id in list(changed_comp_ids):
+            for cn in self._design.connections_for(src_comp_id):
+                # Identify which end is "source" (changed) and which is "taper"
+                if cn.comp_a == src_comp_id:
+                    src_port_id  = cn.port_a
+                    taper_cid    = cn.comp_b
+                    taper_port_id = cn.port_b
+                else:
+                    src_port_id  = cn.port_b
+                    taper_cid    = cn.comp_a
+                    taper_port_id = cn.port_a
+
+                taper_comp = self._design.get(taper_cid)
+                if taper_comp is None:
+                    continue
+
+                # Check taper port name
+                taper_port = next(
+                    (p for p in taper_comp.ports if p.id == taper_port_id), None
+                )
+                if taper_port is None or taper_port.name != "narrow":
+                    continue
+
+                # Check that taper_comp belongs to a taper cell group
+                taper_grp = self._design.group_of(taper_cid)
+                if taper_grp is None:
+                    continue
+                if taper_grp.id in skip:
+                    continue
+
+                # Resolve cell_id and current params for this taper
+                taper_cell_id: str | None = None
+                taper_params:  dict = {}
+                taper_sg_idx:  int | None = None
+
+                raw_cell_id = getattr(taper_grp, "cell_id", None)
+                if raw_cell_id in _TAPER_CELL_IDS:
+                    taper_cell_id = raw_cell_id
+                    taper_params  = dict(
+                        CELL_BY_ID[taper_cell_id].defaults
+                    )
+                    taper_params.update(getattr(taper_grp, "_cell_params", {}))
+                else:
+                    # Merged group — find the sub-group owning taper_cid
+                    for i, sg in enumerate(getattr(taper_grp, "_cell_subgroups", [])):
+                        if taper_cid in sg.get("member_ids", []) and sg.get("cell_id") in _TAPER_CELL_IDS:
+                            taper_cell_id = sg["cell_id"]
+                            taper_sg_idx  = i
+                            taper_params  = dict(
+                                CELL_BY_ID[taper_cell_id].defaults
+                            )
+                            taper_params.update(sg.get("cell_params", {}))
+                            break
+
+                if taper_cell_id is None:
+                    continue
+
+                # Infer the wire width from the source component's port
+                src_comp = self._design.get(src_comp_id)
+                if src_comp is None:
+                    continue
+                src_port = next(
+                    (p for p in src_comp.ports if p.id == src_port_id), None
+                )
+                if src_port is None:
+                    continue
+
+                target_width = self._infer_wire_width_at_port(src_comp, src_port)
+                if target_width is None:
+                    continue
+
+                current_narrow = taper_params.get("narrow_width")
+                if current_narrow is None:
+                    continue
+
+                # Clamp to 3 decimal places to match spinbox precision; skip if
+                # already matches so we don't trigger a spurious rebuild.
+                target_width = round(target_width, 3)
+                if abs(target_width - current_narrow) < 1e-6:
+                    continue
+
+                # Guard against re-entry: mark this taper group as visited
+                # BEFORE firing the update so recursive connections terminate.
+                skip.add(taper_grp.id)
+
+                # Encode the cell_id with sub-group index if in a merged group,
+                # matching the format _on_cell_param_change_requested expects.
+                if taper_sg_idx is not None:
+                    encoded_cell_id = f"{taper_cell_id}:{taper_sg_idx}"
+                else:
+                    encoded_cell_id = taper_cell_id
+
+                # Fire the param change — this calls ReplaceCellCmd + nudge,
+                # so the taper is rebuilt and repositioned atomically.
+                self._do_cell_param_change(
+                    taper_grp.id,
+                    encoded_cell_id,
+                    "narrow_width",
+                    target_width,
+                )
 
     def _snapshot_anchor_connections(self, anchor, group=None, member_ids_override=None) -> list:
         """
@@ -1499,6 +1732,14 @@ class MainWindow(QMainWindow):
         self._flash_status(
             f"{field.replace('_', ' ').title()} → {value_dbu / 1000:.3f} µm"
             + (f"  · nudged {len(move_cmds)} connected shape(s)" if move_cmds else "")
+        )
+
+        # ── Propagate narrow_width to any connected taper whose narrow port
+        # touches the edited component.  Must run after nudge so the taper's
+        # position is already correct before it gets rebuilt.
+        self._update_taper_narrow_widths(
+            changed_comp_ids={comp_id},
+            skip_group_ids=set(),
         )
 
     @pyqtSlot(float)
