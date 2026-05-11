@@ -75,6 +75,7 @@ from core.model import (
 LAYERS: dict[str, int] = {
     "BRANCH":         1,
     "UNDERCUT_RING":  2,
+    "LEAD":           3,
     "CAP1":           4,
     "BIYSK_JUNCTION": 5,
     "CAP2":           6,
@@ -85,6 +86,7 @@ LAYERS: dict[str, int] = {
 # Backwards-compatible module-level aliases (existing code uses LAYER_* names)
 LAYER_BRANCH          = LAYERS["BRANCH"]
 LAYER_UNDERCUT_RING   = LAYERS["UNDERCUT_RING"]
+LAYER_LEAD            = LAYERS["LEAD"]
 LAYER_CAP1            = LAYERS["CAP1"]
 LAYER_BIYSK_JUNCTION  = LAYERS["BIYSK_JUNCTION"]
 LAYER_CAP2            = LAYERS["CAP2"]
@@ -1466,8 +1468,456 @@ def build_t_junction(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
+# Cell: BF JJ  (bridge-free Josephson junction, from bf_jj.gds)
+# ═════════════════════════════════════════════════════════════════════════════
+#
+# Geometry (all dimensions in µm, parametric defaults match the imported GDS):
+#
+#   Two L-shaped CAP1 arms face each other across a horizontal Biysk junction
+#   bar, forming a bridge-free / figure-8 cross-section:
+#
+#      ┌─L3─┐ ┌──L4 top──┐
+#      │lead│ │   (L6)   │   ← top arm  (above junction bar)
+#      └────┘ └──────────┘
+#      ┌───── L5 bar ─────┐   ← junction bar
+#      ┌──────────┐ ┌─L3─┐
+#      │   (L6)   │ │lead│   ← bottom arm  (below junction bar)
+#      └──L4 bot──┘ └────┘
+#
+#   The two arms are offset horizontally (top arm displaced right, bottom arm
+#   displaced left) so that the L-opening of each arm faces the junction bar
+#   and the solid rim of each L wraps three sides.
+#
+#   Each arm:
+#     L4 outer rect:  cap_width × cap_height  (L-shaped; rim = rim_thick)
+#     L6 inner fill:  cap2_width × cap2_height (fills the L opening)
+#     L3 lead strip:  lead_width × lead_height (on the open side of the arm)
+#
+#   Junction bar (L5):
+#     jj_width × jj_height  (spans the full cell width)
+#
+# Coordinate convention:
+#   Origin = bottom-left corner of the cell bbox (= bottom-left of bot L3 lead).
+#   Y increases upward (the exporter negates Y for GDS — same as every other cell).
+#
+# Parameters (all µm):
+#   jj_width    — full width of the L5 Biysk bar         (default 1.05)
+#   jj_height   — height of the L5 bar                   (default 0.10)
+#   cap_width   — outer width of each L4 arm             (default 0.50)
+#   cap_height  — outer height of each L4 arm            (default 0.90)
+#   rim_thick   — L-frame rim thickness (all three sides) (default 0.10)
+#   lead_width  — width of each L3 lead strip             (default 0.08)
+#
+# Derived (not exposed as params to keep the builder simple):
+#   cap2_width  = cap_width  - rim_thick          (0.40)
+#   cap2_height = cap_height - 2 * rim_thick      (0.70)
+#   lead_height = cap_height                      (0.90)
+#
+# Ports (on the anchor = L5 bar):
+#   "W" — left  midpoint of L5 bar (west face)
+#   "E" — right midpoint of L5 bar (east face)
+
+_BF_JJ_DEFAULTS: dict = dict(
+    jj_width  = 1.05,
+    jj_height = 0.10,
+    cap_width  = 0.50,
+    cap_height = 0.90,
+    rim_thick  = 0.10,
+    lead_width = 0.08,
+)
+
+
+def build_bf_jj(
+    origin: Point,
+    jj_width:   float = _BF_JJ_DEFAULTS["jj_width"],
+    jj_height:  float = _BF_JJ_DEFAULTS["jj_height"],
+    cap_width:  float = _BF_JJ_DEFAULTS["cap_width"],
+    cap_height: float = _BF_JJ_DEFAULTS["cap_height"],
+    rim_thick:  float = _BF_JJ_DEFAULTS["rim_thick"],
+    lead_width: float = _BF_JJ_DEFAULTS["lead_width"],
+) -> CellResult:
+    """
+    bridge-free Josephson junction imported from bf_jj.gds.
+
+    Two mirrored L-shaped CAP1 arms straddle a horizontal Biysk junction bar.
+    Each arm has a CAP2 inner fill and a narrow LEAD strip on its open side.
+    See module docstring for full geometry description.
+    """
+    components: List[GDSComponent] = []
+
+    # ── Derived dimensions ────────────────────────────────────────────────────
+    cap2_w = cap_width  - rim_thick           # L6 inner fill width
+    cap2_h = cap_height - 2.0 * rim_thick     # L6 inner fill height
+    lead_h = cap_height                       # L3 strip height = arm height
+
+    # ── Y coordinates (bottom of cell = y=0) ─────────────────────────────────
+    # bot arm:  y = [0, cap_height]
+    # jj bar:   y = [cap_height, cap_height + jj_height]
+    # top arm:  y = [cap_height + jj_height, 2*cap_height + jj_height]
+    y_bot_arm_bot = 0.0
+    y_bot_arm_top = cap_height
+    y_bar_bot     = cap_height
+    y_bar_top     = cap_height + jj_height
+    y_top_arm_bot = cap_height + jj_height
+    y_top_arm_top = 2.0 * cap_height + jj_height
+
+    # ── X coordinates ─────────────────────────────────────────────────────────
+    # Top arm (L3 lead on LEFT, L4/L6 to its RIGHT, opening faces DOWN):
+    #   L3 top:  x = [x_top_lead, x_top_lead + lead_width]
+    #   L4 top:  x = [x_top_lead + lead_width, x_top_lead + lead_width + cap_width]
+    #   L6 top:  x = [x_top_lead + lead_width + rim_thick, ... + cap2_w]    (left rim = rim_thick)
+    #
+    # Bottom arm (L4/L6 on LEFT, L3 lead on RIGHT, opening faces UP):
+    #   L4 bot:  x = [x_bot_cap, x_bot_cap + cap_width]
+    #   L3 bot:  x = [x_bot_cap + cap_width, x_bot_cap + cap_width + lead_width]
+    #   L6 bot:  x = [x_bot_cap, x_bot_cap + cap2_w]                        (right rim = rim_thick)
+    #
+    # From the GDS (normalised to full-cell origin):
+    #   top L3 x_min = 0.235,  L4 top x_min = 0.315  → lead_width = 0.08
+    #   bot L4 x_min = 0.235,  L3 bot x_max = 0.815  → cap_width = 0.5, lead_width = 0.08
+    #   L5 bar starts at x=0, width=jj_width
+    #
+    # So: x_top_lead = jj_width - lead_width - cap_width   (right-aligns top arm to jj right edge)
+    #     x_bot_cap  = 0                                    (left-aligns bot arm to jj left edge)
+    #   Wait — from GDS: top arm right edge = 0.815, jj right edge = 1.05 → gap = 0.235
+    #   and bot arm left edge = 0.235, jj left edge = 0.0  → offset = 0.235
+    #   These offsets = lead_width + (jj_width - lead_width - cap_width - lead_width - cap_width) / 2
+    #   But with default values: 0.08 + (1.05 - 0.08 - 0.5 - 0.08 - 0.5)/2 = 0.08 + (-0.09)/2 → negative
+    #   Actually the arms overlap under the junction bar by design.  Read directly from GDS:
+    #   x_top_lead = 0.235 (= jj_width - lead_width - cap_width = 1.05 - 0.08 - 0.50 = 0.47? No.)
+    #   Let's compute: top arm x_min (L3) = 0.235, jj_width = 1.05
+    #   → top arm is offset 0.235 from the left edge of the junction bar.
+    #   → x_top_lead = jj_width - cap_width - lead_width = 1.05 - 0.50 - 0.08 = 0.47  ← doesn't match 0.235
+    #
+    # Re-reading: top L3 at x=[0.235,0.315], L4 top at x=[0.315,0.815].
+    # So top arm (L3+L4) spans x=[0.235, 0.815].
+    # Bot arm (L4+L3) spans x=[0.235, 0.815] too (symmetric about cell centre x=0.525).
+    # Their left edges are both at x=0.235, right edges at x=0.815.
+    # The difference between the two arms is which side the L-opening and L3 lead are on:
+    #   top arm: L3 on LEFT (x=0.235..0.315), L4 L-opens DOWN (notch on bottom)
+    #   bot arm: L3 on RIGHT (x=0.735..0.815), L4 L-opens UP  (notch on top)
+    #
+    # So both arms sit in the same horizontal band, offset from cell left by:
+    #   arm_x_offset = (jj_width - lead_width - cap_width) / 2
+    #                = (1.05 - 0.08 - 0.50) / 2 = 0.235  ✓
+
+    arm_x_offset = (jj_width - lead_width - cap_width) / 2.0
+
+    # Top arm — L3 on left, L4 opening faces down (notch on bottom-right)
+    x_top_lead  = arm_x_offset
+    x_top_cap   = arm_x_offset + lead_width
+
+    # Bottom arm — L4 on left, L3 on right, opening faces up (notch on top-left)
+    x_bot_cap   = arm_x_offset
+    x_bot_lead  = arm_x_offset + cap_width
+
+    # ── L5 Biysk junction bar (anchor) ────────────────────────────────────────
+    jj_bar = _rect(origin, 0.0, y_bar_bot, jj_width, y_bar_top, LAYER_BIYSK_JUNCTION)
+    _assign_ports(jj_bar, [
+        Port("W", Point(0, um_to_dbu(y_bar_bot + jj_height / 2.0)), PortSide.WEST),
+        Port("E", Point(um_to_dbu(jj_width), um_to_dbu(y_bar_bot + jj_height / 2.0)), PortSide.EAST),
+    ])
+    components.append(jj_bar)
+
+    # ── Top arm ───────────────────────────────────────────────────────────────
+    # L3 lead: left strip of the top arm
+    top_lead = _rect(origin,
+                     x_top_lead, y_top_arm_bot,
+                     x_top_lead + lead_width, y_top_arm_top,
+                     LAYER_LEAD)
+    top_lead._no_auto_ports = True
+    components.append(top_lead)
+
+    # L4 CAP1 top: L-shape — outer rect with bottom-right notch punched out.
+    # Represented as an 8-vertex polygon (clockwise from bottom-left):
+    #   BL → TL → TR → inner-TR → inner-BR → inner-BL → notch-BL → BR — wait,
+    # easier: trace the actual GDS polygon vertex order (from parsed data,
+    # already normalised and with arm_x_offset applied):
+    #   (x_cap, y_arm_bot) → (x_cap, y_arm_top) → (x_cap+cap_width, y_arm_top)
+    #   → (x_cap+cap_width, y_arm_bot+rim_thick)          ← step in at bottom right
+    #   → (x_cap+rim_thick, y_arm_bot+rim_thick)           ← go left along inner bottom
+    #   → (x_cap+rim_thick, y_arm_top-rim_thick)           ← go up along inner right
+    #   → (x_cap+cap_width, y_arm_top-rim_thick)           ← go right — wait that's wrong
+    # Re-read GDS poly[0] (top arm):
+    #   (0.315,1.0),(0.315,1.9),(0.815,1.9),(0.815,1.8),(0.415,1.8),(0.415,1.1),(0.815,1.1),(0.815,1.0)
+    # Subtract arm_x_offset=0.235 from x, y_bar_top=1.0 from y:
+    #   local x: 0.08,0.08,0.58,0.58,0.18,0.18,0.58,0.58  → cap x offsets from cap left edge
+    #   local y: 0,0.9,0.9,0.8,0.8,0.1,0.1,0          → y within [0, cap_height]
+    # In parametric terms (cap_x = x_top_cap, y0 = y_top_arm_bot):
+    #   (cap_x,          y0),              # BL
+    #   (cap_x,          y0+cap_height),   # TL
+    #   (cap_x+cap_width,y0+cap_height),   # TR
+    #   (cap_x+cap_width,y0+cap_height-rim_thick),  # step down TR
+    #   (cap_x+rim_thick,y0+cap_height-rim_thick),  # go left
+    #   (cap_x+rim_thick,y0+rim_thick),             # go down
+    #   (cap_x+cap_width,y0+rim_thick),             # go right
+    #   (cap_x+cap_width,y0),                       # BR
+    # This is an L opening on the right side (open right + notch bottom-right of inner).
+    # But wait — the notch is open at the BOTTOM (facing the junction bar), not the right.
+    # Let me re-read: the inner cavity is at x=[0.415,0.815] y=[1.1,1.8], i.e.
+    # right=0.815=cap_right, so the cavity is open on the RIGHT.  The rim is on the LEFT
+    # and top and bottom.  This is a C-shape open to the right (= toward cell centre).
+    # In local coords: rim on left (width=rim_thick), top strip (height=rim_thick at top),
+    # bottom strip (height=rim_thick at bottom), cavity open on right side.
+    # Polygon (x_top_cap = 0.08 relative to arm left, cap_height=0.9, rim=0.1):
+    top_l4_pts = [
+        (x_top_cap,              y_top_arm_bot),                       # BL
+        (x_top_cap,              y_top_arm_bot + cap_height),          # TL
+        (x_top_cap + cap_width,  y_top_arm_bot + cap_height),          # TR
+        (x_top_cap + cap_width,  y_top_arm_bot + cap_height - rim_thick),  # step down
+        (x_top_cap + rim_thick,  y_top_arm_bot + cap_height - rim_thick),  # go left
+        (x_top_cap + rim_thick,  y_top_arm_bot + rim_thick),           # go down
+        (x_top_cap + cap_width,  y_top_arm_bot + rim_thick),           # go right
+        (x_top_cap + cap_width,  y_top_arm_bot),                       # BR
+    ]
+    top_cap1 = _poly(origin, top_l4_pts, LAYER_CAP1)
+    top_cap1._no_auto_ports = True
+    components.append(top_cap1)
+
+    # L6 CAP2 top: fills the cavity of the top L4 arm
+    # Cavity: x=[x_top_cap+rim_thick, x_top_cap+cap_width], y=[y_top+rim, y_top+cap-rim]
+    top_cap2 = _rect(origin,
+                     x_top_cap + rim_thick, y_top_arm_bot + rim_thick,
+                     x_top_cap + cap_width, y_top_arm_bot + cap_height - rim_thick,
+                     LAYER_CAP2)
+    top_cap2._no_auto_ports = True
+    components.append(top_cap2)
+
+    # ── Bottom arm ────────────────────────────────────────────────────────────
+    # Bottom arm is the mirror image of the top arm:
+    #   L4 opens toward the junction bar (cavity on RIGHT, open at TOP).
+    #   Wait — GDS poly[1]:
+    #   (0.235,0.0),(0.235,0.1),(0.635,0.1),(0.635,0.8),(0.235,0.8),(0.235,0.9),(0.735,0.9),(0.735,0.0)
+    #   Subtract arm_x_offset=0.235 from x: 0,0,0.4,0.4,0,0,0.5,0.5
+    #   y: 0,0.1,0.1,0.8,0.8,0.9,0.9,0
+    # So the cavity is at x=[0,0.4] y=[0.1,0.8] = LEFT side of the arm.
+    # The rim is on the RIGHT (width=cap_width-cap2_w=0.1) and top/bottom strips.
+    # L3 lead sits to the RIGHT of the L4 arm (x=[0.5,0.58] = cap_width..cap_width+lead_width).
+    # Polygon for bottom L4 (x_bot_cap=arm_x_offset, y0=y_bot_arm_bot=0):
+    bot_l4_pts = [
+        (x_bot_cap,              y_bot_arm_bot),                       # BL
+        (x_bot_cap,              y_bot_arm_bot + rim_thick),           # step up BL
+        (x_bot_cap + cap2_w,     y_bot_arm_bot + rim_thick),           # go right
+        (x_bot_cap + cap2_w,     y_bot_arm_bot + cap_height - rim_thick),  # go up
+        (x_bot_cap,              y_bot_arm_bot + cap_height - rim_thick),  # go left
+        (x_bot_cap,              y_bot_arm_bot + cap_height),          # TL
+        (x_bot_cap + cap_width,  y_bot_arm_bot + cap_height),          # TR
+        (x_bot_cap + cap_width,  y_bot_arm_bot),                       # BR
+    ]
+    bot_cap1 = _poly(origin, bot_l4_pts, LAYER_CAP1)
+    bot_cap1._no_auto_ports = True
+    components.append(bot_cap1)
+
+    # L6 CAP2 bottom: fills cavity of bottom L4 arm (cavity on LEFT)
+    bot_cap2 = _rect(origin,
+                     x_bot_cap, y_bot_arm_bot + rim_thick,
+                     x_bot_cap + cap2_w, y_bot_arm_bot + cap_height - rim_thick,
+                     LAYER_CAP2)
+    bot_cap2._no_auto_ports = True
+    components.append(bot_cap2)
+
+    # L3 lead: right strip of the bottom arm
+    bot_lead = _rect(origin,
+                     x_bot_lead, y_bot_arm_bot,
+                     x_bot_lead + lead_width, y_bot_arm_top,
+                     LAYER_LEAD)
+    bot_lead._no_auto_ports = True
+    components.append(bot_lead)
+
+    return CellResult(
+        components  = components,
+        group_name  = (
+            f"BF JJ (jj={jj_width:.2f}µm cap={cap_width:.2f}×{cap_height:.2f}µm)"
+        ),
+        description = (
+            f"bridge-free JJ — L5 bar {jj_width}×{jj_height}µm  "
+            f"arms {cap_width}×{cap_height}µm  rim={rim_thick}µm  lead={lead_width}µm"
+        ),
+    )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
 # Cell catalogue  (what the palette reads)
 # ═════════════════════════════════════════════════════════════════════════════
+
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: bridge-free (double) Josephson Junction  (→ bf_jj.gds)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — extracted from bf_jj.gds
+_BF_JJ_DEFAULTS = dict(
+    bar_width   = 1.05,   # horizontal JJ bar full width  (L5)
+    bar_height  = 0.1,    # horizontal JJ bar height / also CAP1 arm thickness (L5)
+    lead_width  = 0.08,   # lead wire width (L3)
+    lead_length = 0.9,    # lead wire length (L3), one side
+    lead_offset = 0.25,   # distance from bar centre to each lead centre (µm)
+)
+
+
+def build_bf_jj(
+    origin: Point,
+    bar_width:   float = _BF_JJ_DEFAULTS["bar_width"],
+    bar_height:  float = _BF_JJ_DEFAULTS["bar_height"],
+    lead_width:  float = _BF_JJ_DEFAULTS["lead_width"],
+    lead_length: float = _BF_JJ_DEFAULTS["lead_length"],
+    lead_offset: float = _BF_JJ_DEFAULTS["lead_offset"],
+) -> CellResult:
+    """
+    bridge-free (double) Josephson junction — two junctions sharing one
+    horizontal bar on LAYER_BIYSK_JUNCTION (L5), each with a vertical lead
+    on LAYER_LEAD (L3) wrapped in a C-bracket on LAYER_CAP1 (L4) filled with
+    LAYER_CAP2 (L6).
+
+    Origin is the **bottom-left corner** of the cell bounding box (same
+    convention as _rect / other cells that use bbox-min as anchor).
+
+    Geometry (all coords relative to origin, µm):
+
+        ┌─────────────────────────────┐  y = bar_height + 2*lead_length
+        │   [CAP1 L-bracket upper]    │
+        │  [L3 lead, upper-left]      │
+        ├──────────────── ────────────┤  y = bar_height + lead_length  (bar top)
+        │          [L5 bar]           │
+        ├─────────────────────────────┤  y = lead_length               (bar bottom)
+        │    [L3 lead, lower-right]   │
+        │   [CAP1 L-bracket lower]    │
+        └─────────────────────────────┘  y = 0
+
+    Lead placement:
+        upper lead centre-x = bar_width/2 − lead_offset
+        lower lead centre-x = bar_width/2 + lead_offset
+
+    Ports (on anchor = L5 bar):
+        "left"   — left face of bar, bar mid-height
+        "right"  — right face of bar, bar mid-height
+        "top"    — top of upper lead (the wire exit point)
+        "bottom" — bottom of lower lead (the wire exit point)
+    """
+    bw  = bar_width
+    bh  = bar_height          # also = CAP1 arm thickness
+    lw  = lead_width
+    ll  = lead_length
+    lo  = lead_offset
+
+    # ── Derived key coordinates (relative to origin, µm) ─────────────────────
+    bar_y0  = ll              # bar bottom  (above lower lead)
+    bar_y1  = ll + bh         # bar top     (below upper lead)
+    bar_cx  = bw / 2.0        # bar x-centre
+
+    ul_cx   = bar_cx - lo     # upper lead x-centre
+    ul_x0   = ul_cx - lw / 2.0
+    ul_x1   = ul_cx + lw / 2.0
+    ul_y0   = bar_y1          # upper lead bottom = bar top
+    ul_y1   = bar_y1 + ll     # upper lead top    = cell top
+
+    lr_cx   = bar_cx + lo     # lower lead x-centre
+    lr_x0   = lr_cx - lw / 2.0
+    lr_x1   = lr_cx + lw / 2.0
+    lr_y0   = 0.0             # lower lead bottom = cell bottom
+    lr_y1   = bar_y0          # lower lead top    = bar bottom
+
+    # CAP1 L-bracket arm thickness = bh (matches bar_height in the reference)
+    ca      = bh
+
+    # ── Upper C-bracket on CAP1 (L4) ─────────────────────────────────────────
+    # Outer rect: x=[ul_x1, ul_x1 + cap_w] y=[ul_y0, ul_y1]
+    # where cap_w = lr_x1 - ul_x1  (spans from upper-lead right → lower-lead right)
+    # Open notch on the right between ca and (ll - ca) from bottom:
+    #   left column : x=[ul_x1, ul_x1+ca]         y=[ul_y0, ul_y1]       (full height)
+    #   top bar     : x=[ul_x1, lr_x1]             y=[ul_y1-ca, ul_y1]   (top strip)
+    #   bottom bar  : x=[ul_x1, lr_x1]             y=[ul_y0, ul_y0+ca]   (bottom strip)
+    cap_w_upper = lr_x1 - ul_x1    # full width of the C-bracket
+
+    # Upper CAP1 polygon (8-point C-bracket, open on right)
+    upper_cap1_pts = [
+        (ul_x1,           ul_y0),
+        (ul_x1,           ul_y1),
+        (lr_x1,           ul_y1),
+        (lr_x1,           ul_y1 - ca),
+        (ul_x1 + ca,      ul_y1 - ca),
+        (ul_x1 + ca,      ul_y0 + ca),
+        (lr_x1,           ul_y0 + ca),
+        (lr_x1,           ul_y0),
+    ]
+    upper_cap2_rect = (ul_x1 + ca, ul_y0 + ca, lr_x1, ul_y1 - ca)  # (x0,y0,x1,y1)
+
+    # ── Lower C-bracket on CAP1 (L4) ─────────────────────────────────────────
+    # Mirror of upper: open on the left
+    cap_w_lower = lr_x1 - ul_x0    # from upper-lead left → lower-lead right
+
+    lower_cap1_pts = [
+        (ul_x0,           lr_y0),
+        (ul_x0,           lr_y0 + ca),
+        (lr_x0 - ca,      lr_y0 + ca),
+        (lr_x0 - ca,      lr_y1 - ca),
+        (ul_x0,           lr_y1 - ca),
+        (ul_x0,           lr_y1),
+        (lr_x0,           lr_y1),
+        (lr_x0,           lr_y0),
+    ]
+    lower_cap2_rect = (ul_x0, lr_y0 + ca, lr_x0 - ca, lr_y1 - ca)
+
+    # ── Assemble components ───────────────────────────────────────────────────
+    components: List[GDSComponent] = []
+
+    # 1. L5 bar — anchor
+    bar = _rect(origin, 0.0, bar_y0, bw, bar_y1, LAYER_BIYSK_JUNCTION)
+    components.append(bar)
+
+    # 2. Leads (L3)
+    upper_lead = _rect(origin, ul_x0, ul_y0, ul_x1, ul_y1, LAYER_LEAD)
+    lower_lead = _rect(origin, lr_x0, lr_y0, lr_x1, lr_y1, LAYER_LEAD)
+    components.extend([upper_lead, lower_lead])
+
+    # 3. CAP1 L-brackets (L4)
+    components.append(_poly(origin, upper_cap1_pts, LAYER_CAP1))
+    components.append(_poly(origin, lower_cap1_pts, LAYER_CAP1))
+
+    # 4. CAP2 fills (L6)
+    x0, y0, x1, y1 = upper_cap2_rect
+    components.append(_rect(origin, x0, y0, x1, y1, LAYER_CAP2))
+    x0, y0, x1, y1 = lower_cap2_rect
+    components.append(_rect(origin, x0, y0, x1, y1, LAYER_CAP2))
+
+    # ── Ports on anchor (bar) ─────────────────────────────────────────────────
+    # All offsets relative to bar.origin = (origin.x, origin.y + bar_y0_dbu)
+    # so bar-local: bar spans x=[0,bw], y=[0,bh]
+    # "top" / "bottom" ports refer to the lead wire exits; expressed in
+    # bar-local coords = cell-local coords shifted by -bar_y0 in y.
+    bar_loc_offset_y = bar_y0   # bar.origin is origin + (0, bar_y0)
+
+    def _bar_port(name: str, lx: float, ly_cell: float, side: PortSide) -> Port:
+        """Port position in cell-local µm, converted to bar-local DBU."""
+        return Port(
+            name=name,
+            offset=Point(um_to_dbu(lx), um_to_dbu(ly_cell - bar_loc_offset_y)),
+            side=side,
+        )
+
+    _assign_ports(bar, [
+        _bar_port("left",   0.0,    bar_y0 + bh / 2.0, PortSide.WEST),
+        _bar_port("right",  bw,     bar_y0 + bh / 2.0, PortSide.EAST),
+        _bar_port("top",    bar_cx, ul_y1,              PortSide.NORTH),
+        _bar_port("bottom", bar_cx, lr_y0,              PortSide.SOUTH),
+    ])
+
+    # Sub-components carry no ports
+    for comp in components[1:]:
+        comp._no_auto_ports = True
+
+    return CellResult(
+        components=components,
+        group_name=f"bridge-freeJJ ({bw:.2f}µm bar)",
+        description=(
+            f"bridge-free double-JJ  bar={bw}×{bh} µm  "
+            f"leads={lw}×{ll} µm  offset={lo} µm  L3+L4+L5+L6"
+        ),
+    )
+
+
+# ── Default params dict for catalogue ────────────────────────────────────────
+# (kept separate so place_cell can validate keys)
+
 
 CELL_CATALOGUE: List[CellDef] = [
     CellDef(
@@ -1525,6 +1975,14 @@ CELL_CATALOGUE: List[CellDef] = [
         category    = "Routing",
         defaults    = _T_JCT_DEFAULTS,
         builder     = build_t_junction,
+    ),
+    CellDef(
+        cell_id     = "bf_jj",
+        name        = "Bridge-Free JJ",
+        description = "Bridge-Free JJ",
+        category    = "Junctions",
+        defaults    = _BF_JJ_DEFAULTS,
+        builder     = build_bf_jj,
     ),
 ]
 

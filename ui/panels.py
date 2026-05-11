@@ -230,6 +230,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
     _painters = {
         "byisk_jj":         _icon_byisk_jj,
         "manhattan_jj":     _icon_manhattan_jj,
+        "bf_jj":            _icon_bf_jj,
         "taper_segment":    _icon_taper_segment,
         "taper_pad":        _icon_taper_pad,
         "smooth_taper_pad": _icon_taper_pad,
@@ -411,6 +412,103 @@ def _icon_manhattan_jj(size: int) -> QPixmap:
     down_len = lw * 0.9
     p.setBrush(c_l5); p.setPen(QPen(s_l5, 0.8))
     p.drawRect(int(sq_x), int(down_y), int(sq), int(down_len))
+
+    p.end()
+    return pix
+
+
+def _icon_bf_jj(size: int) -> QPixmap:
+    """
+    Butterfly double-JJ top-view icon.
+
+    Mirrors build_bf_jj default geometry faithfully:
+      - L5 (violet) horizontal bar across the full width, vertically centred
+      - L3 (blue-grey) vertical leads: upper-left and lower-right, offset from centre
+      - L4 (teal) C-bracket polygons wrapping each lead/bar interface
+      - L6 (green) fill rectangles inside each bracket
+
+    Cell aspect ratio: 1.05 wide × 1.9 tall  →  icon is taller than wide;
+    we map the cell into a square canvas with uniform scale and centred offset.
+    """
+    pix, p = _pix(size)
+
+    # ── Cell geometry (µm, same as _BF_JJ_DEFAULTS) ──────────────────────────
+    bw = 1.05; bh = 0.1; lw = 0.08; ll = 0.9; lo = 0.25
+    cell_w = bw
+    cell_h = 2 * ll + bh   # = 1.9
+
+    # ── Scale: fit cell into (size - 2*margin) px, keep aspect ratio ─────────
+    margin = 4
+    avail  = size - 2 * margin
+    scale  = avail / max(cell_w, cell_h)   # px per µm
+    # Centre offsets so the cell sits in the middle of the icon canvas
+    ox = margin + (avail - cell_w * scale) / 2.0
+    oy = margin + (avail - cell_h * scale) / 2.0
+
+    def px(x_um: float) -> float:
+        return ox + x_um * scale
+
+    def py(y_um: float) -> float:
+        # Y-axis: cell y=0 at bottom → screen y at bottom of drawn region
+        return oy + (cell_h - y_um) * scale
+
+    def rect(x0, y0, x1, y1, fill: QColor, stroke: QColor, lw_pen=0.9):
+        p.setBrush(fill)
+        p.setPen(QPen(stroke, lw_pen))
+        p.drawRect(int(px(x0)), int(py(y1)),
+                   max(1, int((x1 - x0) * scale)),
+                   max(1, int((y1 - y0) * scale)))
+
+    def poly(pts_um, fill: QColor, stroke: QColor, lw_pen=0.9):
+        qpts = [QPointF(px(x), py(y)) for x, y in pts_um]
+        _filled_poly(p, qpts, fill, stroke, lw_pen)
+
+    # Derived coordinates
+    bar_y0 = ll; bar_y1 = ll + bh
+    bar_cx = bw / 2.0
+    ul_cx  = bar_cx - lo;  ul_x0 = ul_cx - lw/2; ul_x1 = ul_cx + lw/2
+    lr_cx  = bar_cx + lo;  lr_x0 = lr_cx - lw/2; lr_x1 = lr_cx + lw/2
+    ca = bh   # CAP1 arm thickness
+
+    # Colours
+    c_l5   = QColor("#7c3aed"); c_l5.setAlpha(190)
+    c_l3   = QColor("#4f7ab3"); c_l3.setAlpha(200)   # lead: steel blue
+    c_cap1 = QColor("#0d9488"); c_cap1.setAlpha(200)  # teal
+    c_cap2 = QColor("#16a34a"); c_cap2.setAlpha(200)  # green
+    s_l5   = QColor("#a78bfa")
+    s_l3   = QColor("#93c5fd")
+    s_cap1 = QColor("#5eead4")
+    s_cap2 = QColor("#86efac")
+
+    # ── Draw back-to-front ────────────────────────────────────────────────────
+
+    # L6 CAP2 fills (bottom layer visually)
+    rect(ul_x1 + ca, bar_y1 + ca,    lr_x1,     bar_y1 + ll - ca, c_cap2, s_cap2)
+    rect(ul_x0,      ca,             lr_x0 - ca, ll - ca,          c_cap2, s_cap2)
+
+    # L4 CAP1 C-brackets (polygons)
+    upper_pts = [
+        (ul_x1, bar_y1),     (ul_x1, bar_y1 + ll),
+        (lr_x1, bar_y1 + ll),(lr_x1, bar_y1 + ll - ca),
+        (ul_x1 + ca, bar_y1 + ll - ca),(ul_x1 + ca, bar_y1 + ca),
+        (lr_x1, bar_y1 + ca),(lr_x1, bar_y1),
+    ]
+    poly(upper_pts, c_cap1, s_cap1)
+
+    lower_pts = [
+        (ul_x0, 0.0),       (ul_x0, ca),
+        (lr_x0 - ca, ca),   (lr_x0 - ca, ll - ca),
+        (ul_x0, ll - ca),   (ul_x0, ll),
+        (lr_x0, ll),        (lr_x0, 0.0),
+    ]
+    poly(lower_pts, c_cap1, s_cap1)
+
+    # L3 leads
+    rect(ul_x0, bar_y1, ul_x1, bar_y1 + ll, c_l3, s_l3)
+    rect(lr_x0, 0.0,    lr_x1, ll,           c_l3, s_l3)
+
+    # L5 bar (drawn on top so it's always visible)
+    rect(0.0, bar_y0, bw, bar_y1, c_l5, s_l5, 1.0)
 
     p.end()
     return pix
