@@ -1470,13 +1470,13 @@ def build_t_junction(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: BF JJ  (butterfly Josephson junction, from bf_jj.gds)
+# Cell: BF JJ  (bridge-free Josephson junction, from bf_jj.gds)
 # ═════════════════════════════════════════════════════════════════════════════
 #
 # Geometry (all dimensions in µm, parametric defaults match the imported GDS):
 #
 #   Two L-shaped CAP1 arms face each other across a horizontal Biysk junction
-#   bar, forming a butterfly / figure-8 cross-section:
+#   bar, forming a bridge-free / figure-8 cross-section:
 #
 #      ┌─L3─┐ ┌──L4 top──┐
 #      │lead│ │   (L6)   │   ← top arm  (above junction bar)
@@ -1539,7 +1539,7 @@ def build_bf_jj(
     lead_width: float = _BF_JJ_DEFAULTS["lead_width"],
 ) -> CellResult:
     """
-    Butterfly Josephson junction imported from bf_jj.gds.
+    bridge-free Josephson junction imported from bf_jj.gds.
 
     Two mirrored L-shaped CAP1 arms straddle a horizontal Biysk junction bar.
     Each arm has a CAP2 inner fill and a narrow LEAD strip on its open side.
@@ -1732,7 +1732,7 @@ def build_bf_jj(
             f"BF JJ (jj={jj_width:.2f}µm cap={cap_width:.2f}×{cap_height:.2f}µm)"
         ),
         description = (
-            f"Butterfly JJ — L5 bar {jj_width}×{jj_height}µm  "
+            f"bridge-free JJ — L5 bar {jj_width}×{jj_height}µm  "
             f"arms {cap_width}×{cap_height}µm  rim={rim_thick}µm  lead={lead_width}µm"
         ),
     )
@@ -1743,7 +1743,7 @@ def build_bf_jj(
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: Butterfly (double) Josephson Junction  (→ bf_jj.gds)
+# Cell: bridge-free (double) Josephson Junction  (→ bf_jj.gds)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Default geometry (µm) — extracted from bf_jj.gds
@@ -1765,7 +1765,7 @@ def build_bf_jj(
     lead_offset: float = _BF_JJ_DEFAULTS["lead_offset"],
 ) -> CellResult:
     """
-    Butterfly (double) Josephson junction — two junctions sharing one
+    bridge-free (double) Josephson junction — two junctions sharing one
     horizontal bar on LAYER_BIYSK_JUNCTION (L5), each with a vertical lead
     on LAYER_LEAD (L3) wrapped in a C-bracket on LAYER_CAP1 (L4) filled with
     LAYER_CAP2 (L6).
@@ -1909,9 +1909,9 @@ def build_bf_jj(
 
     return CellResult(
         components=components,
-        group_name=f"ButterflyJJ ({bw:.2f}µm bar)",
+        group_name=f"bridge-freeJJ ({bw:.2f}µm bar)",
         description=(
-            f"Butterfly double-JJ  bar={bw}×{bh} µm  "
+            f"bridge-free double-JJ  bar={bw}×{bh} µm  "
             f"leads={lw}×{ll} µm  offset={lo} µm  L3+L4+L5+L6"
         ),
     )
@@ -2033,8 +2033,8 @@ CELL_CATALOGUE: List[CellDef] = [
     ),
     CellDef(
         cell_id     = "bf_jj",
-        name        = "Butterfly JJ",
-        description = "Butterfly double-JJ: two junctions sharing an L5 bar with L3 leads and L4/L6 cap brackets",
+        name        = "Bridge-Free JJ",
+        description = "bridge-free JJ: a junction sharing an L5 bar with L3 leads and L4/L6 cap brackets",
         category    = "Junctions",
         defaults    = _BF_JJ_DEFAULTS,
         builder     = build_bf_jj,

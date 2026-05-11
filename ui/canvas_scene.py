@@ -48,6 +48,7 @@ from core.model import (
 from ui.theme import Colors
 from ui.undercut_overlay import UndercutOverlay
 from ui.ruler_overlay import RulerItem
+from ui.alignment_guides import AlignmentGuideOverlay
 
 
 # ── Scene constants ────────────────────────────────────────────────────────────
@@ -751,6 +752,9 @@ class CanvasScene(QGraphicsScene):
         self._ruler_item:  Optional[RulerItem] = None
         self._ruler_dragging: bool             = False
 
+        # Alignment guide overlay (Photoshop-style edge/centre snap lines)
+        self._align_guides = AlignmentGuideOverlay(self)
+
     # ── Public placement API ──────────────────────────────────────────────────
 
     @property
@@ -1333,12 +1337,18 @@ class CanvasScene(QGraphicsScene):
                     if other:
                         other.set_port_active(their_port_id, True)
 
+        # ── Alignment guides ──────────────────────────────────────────────────
+        self._align_guides.update_guides(
+            self._orig_comp_positions,
+            self._orig_group_positions,
+        )
+
     def _on_unified_release(self, event) -> None:
         """
         Commit the drag as one BatchCommand so a single Undo reverses everything.
         """
         self.clear_all_port_highlights()
-        has_comps  = bool(self._orig_comp_positions)
+        self._align_guides.clear()
         has_groups = bool(self._orig_group_positions)
 
         if not self._drag_committed or (not has_comps and not has_groups):
