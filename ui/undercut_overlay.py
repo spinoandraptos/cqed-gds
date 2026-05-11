@@ -164,6 +164,102 @@ def _build_ring_path(base_path: QPainterPath, offset_dbu: int) -> QPainterPath:
     return ring
 
 
+def _l11_half_clip_mask(l11_comp, offset_dbu: int) -> "QPainterPath | None":
+    """
+    Return a QPainterPath that, when subtracted from a ring, clips the ring so
+    it ends exactly halfway along the L11 clip polygon's length.
+
+    The mask covers two things in one shot:
+      1. Everything on the narrow-tip side of the L11 midpoint plane
+         (a large rectangle past the midpoint cap).
+      2. The full interior of the L11 polygon itself (so the ring can only
+         wrap around the outside of L11, not fill its interior).
+
+    Both cuts are OR-united into a single mask shape and returned.  The caller
+    subtracts this mask from the ring path.
+
+    This helper is used by both ``_taper_quad_ring`` (individual tapered
+    components) and ``_ensure_group_ring`` (grouped tapered cells) so the
+    half-clip behaviour is identical in both cases.
+
+    Returns None if the L11 polygon is not a valid quadrilateral (caller skips
+    the clip and falls back to the plain ``_subtract_l11_areas`` behaviour).
+    """
+    import math
+    from PyQt6.QtCore import QPointF
+    from PyQt6.QtGui import QPainterPath
+
+    l11_pts = l11_comp.points or []
+    unique11 = list(l11_pts)
+    if len(unique11) > 1 and unique11[-1] == unique11[0]:
+        unique11 = unique11[:-1]
+    if len(unique11) != 4:
+        return None
+
+    def _dist(a, b):
+        return math.hypot(b.x - a.x, b.y - a.y)
+
+    edges11  = [(i, (i + 1) % 4, _dist(unique11[i], unique11[(i + 1) % 4]))
+                for i in range(4)]
+    by_len11 = sorted(edges11, key=lambda e: e[2])
+    face11   = by_len11[:2]   # two shortest edges = end-faces
+
+    # Wider end-face = clip boundary (shared with L1); narrower = narrow tip
+    clip_face   = max(face11, key=lambda e: e[2])
+    narrow_face = min(face11, key=lambda e: e[2])
+
+    ci, cj = clip_face[0],   clip_face[1]
+    ni, nj = narrow_face[0], narrow_face[1]
+    clip_pt_a = unique11[ci]
+    clip_pt_b = unique11[cj]
+    tip_pt_a  = unique11[ni]
+    tip_pt_b  = unique11[nj]
+
+    tip_mid_x = (tip_pt_a.x + tip_pt_b.x) / 2.0
+    tip_mid_y = (tip_pt_a.y + tip_pt_b.y) / 2.0
+
+    dx = tip_mid_x - (clip_pt_a.x + clip_pt_b.x) / 2.0
+    dy = tip_mid_y - (clip_pt_a.y + clip_pt_b.y) / 2.0
+    clip_length = math.hypot(dx, dy)
+    if clip_length == 0:
+        return None
+
+    # Unit vector: clip boundary face → narrow tip
+    ux, uy = dx / clip_length, dy / clip_length
+
+    # Cap plane sits at exactly half the clip length, measured from the clip
+    # boundary face toward the narrow tip.
+    half = clip_length / 2.0
+    cap_ax = clip_pt_a.x + ux * half
+    cap_ay = clip_pt_a.y + uy * half
+    cap_bx = clip_pt_b.x + ux * half
+    cap_by = clip_pt_b.y + uy * half
+
+    # Large rectangle that erases everything on the narrow-tip side of the cap
+    LARGE = float(offset_dbu * 20)
+    px_, py_ = -uy, ux   # perpendicular direction
+
+    c0x, c0y = cap_ax + px_ * LARGE, cap_ay + py_ * LARGE
+    c1x, c1y = cap_ax - px_ * LARGE, cap_ay - py_ * LARGE
+    c2x, c2y = c1x + ux * LARGE,     c1y + uy * LARGE
+    c3x, c3y = c0x + ux * LARGE,     c0y + uy * LARGE
+
+    tip_half = QPainterPath(QPointF(c0x, c0y))
+    tip_half.lineTo(c1x, c1y)
+    tip_half.lineTo(c2x, c2y)
+    tip_half.lineTo(c3x, c3y)
+    tip_half.closeSubpath()
+
+    # Full L11 polygon interior — ring must not enter the clip body at all.
+    l11_shape = QPainterPath(QPointF(unique11[0].x, unique11[0].y))
+    for p in unique11[1:]:
+        l11_shape.lineTo(p.x, p.y)
+    l11_shape.closeSubpath()
+
+    # Union both masks so one subtraction call handles both cuts.
+    return tip_half.united(l11_shape)
+
+
 def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath | None":
     """
     Build the undercut ring for a tapered-lead L1 body polygon.
@@ -172,10 +268,12 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     applied so the ring never enters the L11 clip body:
 
     1. ``tip_half`` — a large rectangle that erases everything on the narrow-tip
-       side of the clip midpoint plane (the existing clip_length/2 constraint).
+       side of the L11 midpoint plane (clip_length/2 from the clip boundary).
     2. ``l11_shape`` — the full L11 polygon itself, subtracted so the ring
        cannot occupy any area inside the clip.  The ring is therefore limited to
-       the halo *around* the L11 boundary, not inside it.
+       the halo *around* the L11 boundary up to its midpoint, never its interior.
+
+    Both cuts are produced by ``_l11_half_clip_mask`` and applied in one step.
 
     Together these ensure the ring:
       • wraps the outer perimeter of the L1 body (wide end + long sides)
@@ -217,90 +315,16 @@ def _taper_quad_ring(l1_comp, offset_dbu: int, l11_comp=None) -> "QPainterPath |
     ring     = outer.subtracted(base)
 
     # ── Clip ring to the midpoint of L11 ─────────────────────────────────────
-    # The ring is allowed to cover the boundary-half of L11 (from the shared
-    # face to clip_length/2 inward), but must stop there.  We achieve this by
-    # subtracting a large rectangle that covers everything on the tip side of
-    # the midpoint cap plane.
-    #
-    # The cap plane is perpendicular to the clip axis and passes through the
-    # midpoint between the clip boundary face and the narrow tip face.
-    import math
+    # _l11_half_clip_mask returns a single mask that covers both:
+    #   • everything past the midpoint cap (tip side)
+    #   • the full L11 interior
+    # Subtracting it in one step is equivalent to the two sequential subtracts
+    # that were here before, but the logic now lives in one shared helper so
+    # _ensure_group_ring can reuse it identically.
+    clip_mask = _l11_half_clip_mask(l11_comp, offset_dbu)
+    if clip_mask is not None:
+        ring = ring.subtracted(clip_mask)
 
-    l11_pts = l11_comp.points or []
-    unique11 = list(l11_pts)
-    if len(unique11) > 1 and unique11[-1] == unique11[0]:
-        unique11 = unique11[:-1]
-    if len(unique11) != 4:
-        return ring if not ring.isEmpty() else None
-
-    def _dist(a, b):
-        return math.hypot(b.x - a.x, b.y - a.y)
-
-    edges11  = [(i, (i+1)%4, _dist(unique11[i], unique11[(i+1)%4])) for i in range(4)]
-    by_len11 = sorted(edges11, key=lambda e: e[2])
-    face11   = by_len11[:2]   # two shortest edges = end-faces
-
-    # Wider end-face = clip boundary (shared with L1); narrower = narrow tip
-    clip_face   = max(face11, key=lambda e: e[2])
-    narrow_face = min(face11, key=lambda e: e[2])
-
-    ci, cj = clip_face[0],   clip_face[1]
-    ni, nj = narrow_face[0], narrow_face[1]
-    clip_pt_a = unique11[ci]
-    clip_pt_b = unique11[cj]
-    tip_pt_a  = unique11[ni]
-    tip_pt_b  = unique11[nj]
-
-    clip_mid_x = (clip_pt_a.x + clip_pt_b.x) / 2.0
-    clip_mid_y = (clip_pt_a.y + clip_pt_b.y) / 2.0
-    tip_mid_x  = (tip_pt_a.x  + tip_pt_b.x)  / 2.0
-    tip_mid_y  = (tip_pt_a.y  + tip_pt_b.y)  / 2.0
-
-    dx = tip_mid_x - clip_mid_x
-    dy = tip_mid_y - clip_mid_y
-    clip_length = math.hypot(dx, dy)
-    if clip_length == 0:
-        return ring if not ring.isEmpty() else None
-
-    # Unit vector pointing from clip boundary → narrow tip
-    ux, uy = dx / clip_length, dy / clip_length
-
-    # The cap sits at clip_length/2 inward from the clip boundary
-    half = clip_length / 2.0
-    cap_ax = clip_pt_a.x + ux * half
-    cap_ay = clip_pt_a.y + uy * half
-    cap_bx = clip_pt_b.x + ux * half
-    cap_by = clip_pt_b.y + uy * half
-
-    # Large rectangle covering everything on the tip side of the cap plane
-    LARGE = float(offset_dbu * 20)
-    px_, py_ = -uy, ux   # perpendicular direction
-
-    c0x, c0y = cap_ax + px_*LARGE, cap_ay + py_*LARGE
-    c1x, c1y = cap_ax - px_*LARGE, cap_ay - py_*LARGE
-    c2x, c2y = c1x + ux*LARGE,     c1y + uy*LARGE
-    c3x, c3y = c0x + ux*LARGE,     c0y + uy*LARGE
-
-    tip_half = QPainterPath(QPointF(c0x, c0y))
-    tip_half.lineTo(c1x, c1y)
-    tip_half.lineTo(c2x, c2y)
-    tip_half.lineTo(c3x, c3y)
-    tip_half.closeSubpath()
-
-    ring = ring.subtracted(tip_half)
-
-    # ── Subtract the full L11 clip polygon ───────────────────────────────────
-    # Even after the midpoint cap cut, the ring still overlaps the half of L11
-    # between the shared boundary face and the cap plane.  Subtracting the
-    # complete L11 shape removes every pixel of ring that sits *inside* the
-    # clip body, so the ring can only occupy the outward halo around L11's
-    # perimeter — never its interior.
-    l11_shape = QPainterPath(QPointF(unique11[0].x, unique11[0].y))
-    for p in unique11[1:]:
-        l11_shape.lineTo(p.x, p.y)
-    l11_shape.closeSubpath()
-
-    ring = ring.subtracted(l11_shape)
     return ring if not ring.isEmpty() else None
 
 
@@ -445,11 +469,6 @@ class UndercutOverlay:
         # Cleared / restored whenever the overlay is disabled or a group is removed.
         self._absorbed_ids: Set[str] = set()
 
-        # group_id → (x_min, y_min) in DBU — the bbox origin recorded the last
-        # time masks were applied for that group.  Used to detect group moves so
-        # stored mask paths can be translated to follow the group.
-        self._group_origins: Dict[str, tuple] = {}
-
         # scene_changed covers all model mutations (add/remove/move/resize).
         # selectionChanged is intentionally NOT connected — rings are persistent.
         scene_ref.scene_changed.connect(self._on_scene_changed)
@@ -494,16 +513,6 @@ class UndercutOverlay:
         The ring is immediately redrawn if the overlay is currently enabled.
         """
         self._masks.setdefault(obj_id, []).append(mask_path)
-        # Record the group's current bbox origin the first time a mask is added
-        # so that future moves can be detected and masks translated accordingly.
-        if obj_id not in self._group_origins:
-            design = self._scene._design
-            group = design.get_group(obj_id)
-            if group is not None:
-                members = self._resolve_group_members(group)
-                if members:
-                    bb = group.bbox_from(members)
-                    self._group_origins[obj_id] = (bb.x_min, bb.y_min)
         if self._enabled:
             self._rebuild_one(obj_id)
 
@@ -561,21 +570,6 @@ class UndercutOverlay:
         for mask in masks:
             result = result.subtracted(mask)
         return result
-
-    def _translate_masks(self, obj_id: str, dx: int, dy: int) -> None:
-        """
-        Shift every stored mask path for *obj_id* by (dx, dy) DBU in-place.
-
-        Called when a group moves so that erase regions follow the geometry
-        they were painted on, preventing the full default ring from reappearing
-        after a drag.
-        """
-        masks = self._masks.get(obj_id)
-        if not masks:
-            return
-        from PyQt6.QtGui import QTransform
-        t = QTransform.fromTranslate(float(dx), float(dy))
-        self._masks[obj_id] = [t.map(m) for m in masks]
 
     def _rebuild_one(self, obj_id: str) -> None:
         """Rebuild the ring for a single comp or group id (used after mask changes)."""
@@ -810,47 +804,68 @@ class UndercutOverlay:
 
         self._absorbed_ids.update(new_absorbed)
 
-        # Apply masks to the base ring only, then unite flanks afterwards.
-        # Narrow-undercut flanks are non-erasable: they are explicitly placed
-        # geometry and must always appear in full even if the user previously
-        # painted an erase mask over that area of the group ring.
-        #
-        # Before applying masks, check whether the group has moved since the
-        # masks were last recorded.  If so, translate every stored mask path by
-        # the same delta so the erase regions follow the geometry.  Without this
-        # correction the masks land at their original scene position after a
-        # drag, miss the newly-positioned ring entirely, and the full default
-        # ring reappears.
-        if group.id in self._masks:
-            current_bbox = group.bbox_from(self._resolve_group_members(group))
-            cur_origin = (current_bbox.x_min, current_bbox.y_min)
-            prev_origin = self._group_origins.get(group.id)
-            if prev_origin is not None and prev_origin != cur_origin:
-                dx = cur_origin[0] - prev_origin[0]
-                dy = cur_origin[1] - prev_origin[1]
-                self._translate_masks(group.id, dx, dy)
-            self._group_origins[group.id] = cur_origin
+        # ── Apply masks and L11 half-clip to the base ring BEFORE flanks ───
+        # Order matters here:
+        #   1. Erase masks  — applied to the base ring only (existing behaviour).
+        #   2. L11 half-clip — applied to the base ring only, before flanks are
+        #      united in.  _l11_half_clip_mask includes the full L11 interior as
+        #      part of its mask, so it must run before the flank union to avoid
+        #      cutting the narrow-undercut flanks (which sit right at the L11
+        #      boundary).  If this subtraction were done after the flank union
+        #      the L11-interior part of the mask would punch a hole through the
+        #      flanks, making them disappear.
+        #   3. Flank union — flanks are non-erasable and L11-immune; they are
+        #      added after all base-ring clipping is complete.
+        #   4. _subtract_l11_areas — safety net for L11 polygons that belong to
+        #      OTHER groups (or are ungrouped).  We skip group-member L11s here
+        #      because they were already handled in step 2; re-subtracting them
+        #      after the flank union would again punch holes in the flanks.
+        from core.cell_library import LAYER_NARROW_END
+        group_l11_ids = {
+            c.id for c in all_members
+            if c.layer == LAYER_NARROW_END and c.kind == ComponentKind.POLYGON
+        }
+
         masked = self._apply_masks(group.id, raw)
+
+        for comp in all_members:
+            if comp.id in group_l11_ids:
+                clip_mask = _l11_half_clip_mask(comp, self._offset_dbu)
+                if clip_mask is not None:
+                    masked = masked.subtracted(clip_mask)
+
+        # Unite narrow-undercut flanks after all base-ring clipping is done.
         for flank in l2_flanks:
             flank_path = _shape_path_for_comp(flank)
             if not flank_path.isEmpty():
                 masked = masked.united(flank_path)
-        masked = self._subtract_l11_areas(masked)
+
+        # Subtract any L11 polygons that are NOT members of this group.
+        masked = self._subtract_l11_areas(masked, skip_ids=group_l11_ids)
         ring.setPath(masked)
         ring.setVisible(self._enabled and group.id not in self._excluded_ids)
 
 
-    def _subtract_l11_areas(self, path: "QPainterPath") -> "QPainterPath":
+    def _subtract_l11_areas(self, path: "QPainterPath",
+                             skip_ids: "set | None" = None) -> "QPainterPath":
         """
         Subtract every L11 (NARROW_END) polygon in the entire design from
         *path* so that no undercut ring — group or individual — ever overlaps
         an L11 clip region.  L11 polygons are the narrow-tip clip bodies for
         tapered leads; the ring should wrap around their outside edge only.
+
+        skip_ids : optional set of component IDs to exclude from subtraction.
+            Used by _ensure_group_ring to skip L11 members that belong to the
+            current group — those have already been handled by _l11_half_clip_mask
+            before the narrow-undercut flanks were united in, so re-subtracting
+            them here would cut holes through the flanks.
         """
         from core.cell_library import LAYER_NARROW_END
         design = self._scene._design
         result = path
         for comp in design.components:
+            if skip_ids and comp.id in skip_ids:
+                continue
             if comp.layer == LAYER_NARROW_END and comp.kind == ComponentKind.POLYGON:
                 l11_shape = _shape_path_for_comp(comp)
                 if not l11_shape.isEmpty():
@@ -906,7 +921,6 @@ class UndercutOverlay:
             if item is not None:
                 item.setVisible(True)
         self._absorbed_ids.clear()
-        self._group_origins.clear()
 
     def _remove_stale_comp_rings(self, live_ids: Set[str]) -> None:
         """Remove rings for components no longer in *live_ids*."""
@@ -935,9 +949,6 @@ class UndercutOverlay:
                 if item is not None:
                     item.setVisible(True)
                 self._absorbed_ids.discard(cid)
-            # Discard the stored origin; if the group is re-added the origin
-            # will be re-seeded by the first add_mask call.
-            self._group_origins.pop(gid, None)
 
     # ── Signal handler ────────────────────────────────────────────────────────
 
