@@ -73,6 +73,7 @@ from core.model import (
 # modules (component_model.py, canvas_scene.py, etc.).
 
 LAYERS: dict[str, int] = {
+    "CHIP":           0,
     "BRANCH":         1,
     "UNDERCUT_RING":  2,
     "LEAD":           3,
@@ -84,6 +85,7 @@ LAYERS: dict[str, int] = {
 }
 
 # Backwards-compatible module-level aliases (existing code uses LAYER_* names)
+LAYER_CHIP            = LAYERS["CHIP"]
 LAYER_BRANCH          = LAYERS["BRANCH"]
 LAYER_UNDERCUT_RING   = LAYERS["UNDERCUT_RING"]
 LAYER_LEAD            = LAYERS["LEAD"]
@@ -1468,13 +1470,13 @@ def build_t_junction(
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: BF JJ  (bridge-free Josephson junction, from bf_jj.gds)
+# Cell: BF JJ  (butterfly Josephson junction, from bf_jj.gds)
 # ═════════════════════════════════════════════════════════════════════════════
 #
 # Geometry (all dimensions in µm, parametric defaults match the imported GDS):
 #
 #   Two L-shaped CAP1 arms face each other across a horizontal Biysk junction
-#   bar, forming a bridge-free / figure-8 cross-section:
+#   bar, forming a butterfly / figure-8 cross-section:
 #
 #      ┌─L3─┐ ┌──L4 top──┐
 #      │lead│ │   (L6)   │   ← top arm  (above junction bar)
@@ -1537,7 +1539,7 @@ def build_bf_jj(
     lead_width: float = _BF_JJ_DEFAULTS["lead_width"],
 ) -> CellResult:
     """
-    bridge-free Josephson junction imported from bf_jj.gds.
+    Butterfly Josephson junction imported from bf_jj.gds.
 
     Two mirrored L-shaped CAP1 arms straddle a horizontal Biysk junction bar.
     Each arm has a CAP2 inner fill and a narrow LEAD strip on its open side.
@@ -1730,7 +1732,7 @@ def build_bf_jj(
             f"BF JJ (jj={jj_width:.2f}µm cap={cap_width:.2f}×{cap_height:.2f}µm)"
         ),
         description = (
-            f"bridge-free JJ — L5 bar {jj_width}×{jj_height}µm  "
+            f"Butterfly JJ — L5 bar {jj_width}×{jj_height}µm  "
             f"arms {cap_width}×{cap_height}µm  rim={rim_thick}µm  lead={lead_width}µm"
         ),
     )
@@ -1741,7 +1743,7 @@ def build_bf_jj(
 # ═════════════════════════════════════════════════════════════════════════════
 
 # ═════════════════════════════════════════════════════════════════════════════
-# Cell: bridge-free (double) Josephson Junction  (→ bf_jj.gds)
+# Cell: Butterfly (double) Josephson Junction  (→ bf_jj.gds)
 # ═════════════════════════════════════════════════════════════════════════════
 
 # Default geometry (µm) — extracted from bf_jj.gds
@@ -1763,7 +1765,7 @@ def build_bf_jj(
     lead_offset: float = _BF_JJ_DEFAULTS["lead_offset"],
 ) -> CellResult:
     """
-    bridge-free (double) Josephson junction — two junctions sharing one
+    Butterfly (double) Josephson junction — two junctions sharing one
     horizontal bar on LAYER_BIYSK_JUNCTION (L5), each with a vertical lead
     on LAYER_LEAD (L3) wrapped in a C-bracket on LAYER_CAP1 (L4) filled with
     LAYER_CAP2 (L6).
@@ -1907,16 +1909,69 @@ def build_bf_jj(
 
     return CellResult(
         components=components,
-        group_name=f"bridge-freeJJ ({bw:.2f}µm bar)",
+        group_name=f"ButterflyJJ ({bw:.2f}µm bar)",
         description=(
-            f"bridge-free double-JJ  bar={bw}×{bh} µm  "
+            f"Butterfly double-JJ  bar={bw}×{bh} µm  "
             f"leads={lw}×{ll} µm  offset={lo} µm  L3+L4+L5+L6"
         ),
     )
 
 
+# ═════════════════════════════════════════════════════════════════════════════
+# Cell: Chip outline  (→ chip.gds)
+# ═════════════════════════════════════════════════════════════════════════════
+
+# Default geometry (µm) — extracted from chip.gds
+_CHIP_DEFAULTS = dict(
+    chip_width  = 3800.0,   # full chip width  (µm)
+    chip_height = 25400.0,  # full chip height (µm)
+)
+
+
+def build_chip(
+    origin: Point,
+    chip_width:  float = _CHIP_DEFAULTS["chip_width"],
+    chip_height: float = _CHIP_DEFAULTS["chip_height"],
+) -> CellResult:
+    """
+    Chip outline rectangle on LAYER_CHIP (L0).
+
+    Origin is the **bottom-left corner** of the chip (bbox-min convention).
+    The rectangle spans (origin) → (origin + chip_width, origin + chip_height).
+
+    This cell is intended as a background canvas: place it first, then
+    position junctions and routing cells on top of it.
+
+    Ports — four edge-centre snap points so other cells can align to the
+    chip boundary:
+        "left"   — mid-point of the left edge
+        "right"  — mid-point of the right edge
+        "top"    — mid-point of the top edge   (screen: low y = top)
+        "bottom" — mid-point of the bottom edge
+    """
+    cw = chip_width
+    ch = chip_height
+
+    outline = _rect(origin, 0.0, 0.0, cw, ch, LAYER_CHIP)
+
+    # Four edge-centre ports (offsets relative to outline.origin = origin)
+    _assign_ports(outline, [
+        _port("left",   0.0,      ch / 2.0, PortSide.WEST),
+        _port("right",  cw,       ch / 2.0, PortSide.EAST),
+        _port("top",    cw / 2.0, ch,       PortSide.NORTH),
+        _port("bottom", cw / 2.0, 0.0,      PortSide.SOUTH),
+    ])
+
+    return CellResult(
+        components=[outline],
+        group_name=f"Chip ({cw/1000:.1f}×{ch/1000:.1f} mm)",
+        description=f"Chip outline  {cw:.0f}×{ch:.0f} µm  ({cw/1000:.2f}×{ch/1000:.2f} mm)  L0",
+    )
+
+
 # ── Default params dict for catalogue ────────────────────────────────────────
-# (kept separate so place_cell can validate keys)
+
+# ── Back-to-back arc turn (T-junction) ───────────────────────────────────────
 
 
 CELL_CATALOGUE: List[CellDef] = [
@@ -1978,11 +2033,19 @@ CELL_CATALOGUE: List[CellDef] = [
     ),
     CellDef(
         cell_id     = "bf_jj",
-        name        = "Bridge-Free JJ",
-        description = "Bridge-Free JJ",
+        name        = "Butterfly JJ",
+        description = "Butterfly double-JJ: two junctions sharing an L5 bar with L3 leads and L4/L6 cap brackets",
         category    = "Junctions",
         defaults    = _BF_JJ_DEFAULTS,
         builder     = build_bf_jj,
+    ),
+    CellDef(
+        cell_id     = "chip",
+        name        = "Chip Outline",
+        description = "Chip substrate outline — place first as the canvas for component layout",
+        category    = "Substrate",
+        defaults    = _CHIP_DEFAULTS,
+        builder     = build_chip,
     ),
 ]
 

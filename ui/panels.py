@@ -231,6 +231,7 @@ def _cell_icon(cell_id: str, size: int = 36) -> QPixmap:
         "byisk_jj":         _icon_byisk_jj,
         "manhattan_jj":     _icon_manhattan_jj,
         "bf_jj":            _icon_bf_jj,
+        "chip":             _icon_chip,
         "taper_segment":    _icon_taper_segment,
         "taper_pad":        _icon_taper_pad,
         "smooth_taper_pad": _icon_taper_pad,
@@ -509,6 +510,58 @@ def _icon_bf_jj(size: int) -> QPixmap:
 
     # L5 bar (drawn on top so it's always visible)
     rect(0.0, bar_y0, bw, bar_y1, c_l5, s_l5, 1.0)
+
+    p.end()
+    return pix
+
+
+def _icon_chip(size: int) -> QPixmap:
+    """
+    Chip outline icon: a tall rectangle (3.8 × 25.4 mm aspect ratio, scaled to
+    fit the icon canvas) on L0 (grey), with a faint grid overlay to suggest a
+    substrate canvas and four small dot markers at the edge centres.
+    """
+    pix, p = _pix(size)
+
+    # Chip aspect: 3.8 wide × 25.4 tall — very tall; scale to fit vertically
+    chip_w_mm = 3.8; chip_h_mm = 25.4
+    margin = 3
+    avail_h = size - 2 * margin
+    avail_w = size - 2 * margin
+    scale   = min(avail_w / chip_w_mm, avail_h / chip_h_mm)
+
+    rw = chip_w_mm * scale
+    rh = chip_h_mm * scale
+    rx = margin + (avail_w - rw) / 2.0
+    ry = margin + (avail_h - rh) / 2.0
+
+    # Chip body fill (dark grey, slightly warm)
+    chip_fill = QColor("#374151"); chip_fill.setAlpha(180)
+    chip_stroke = QColor("#9ca3af")
+
+    p.setBrush(chip_fill)
+    p.setPen(QPen(chip_stroke, 1.2))
+    p.drawRect(int(rx), int(ry), int(rw), int(rh))
+
+    # Faint interior grid (3 vertical × 5 horizontal lines)
+    grid_pen = QPen(QColor("#6b7280")); grid_pen.setWidthF(0.5)
+    grid_pen.setStyle(Qt.PenStyle.DotLine)
+    p.setPen(grid_pen)
+    for i in range(1, 3):
+        x = rx + rw * i / 3.0
+        p.drawLine(QPointF(x, ry + 1), QPointF(x, ry + rh - 1))
+    for i in range(1, 5):
+        y = ry + rh * i / 5.0
+        p.drawLine(QPointF(rx + 1, y), QPointF(rx + rw - 1, y))
+
+    # Edge-centre port dots (cyan, matching snap-point style)
+    dot_col = QColor("#22d3ee"); dot_col.setAlpha(220)
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(dot_col)
+    cx = rx + rw / 2.0; cy = ry + rh / 2.0
+    r  = 1.8
+    for dx, dy in [(cx, ry), (cx, ry + rh), (rx, cy), (rx + rw, cy)]:
+        p.drawEllipse(QPointF(dx, dy), r, r)
 
     p.end()
     return pix
